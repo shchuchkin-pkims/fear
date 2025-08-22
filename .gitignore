@@ -1,0 +1,15 @@
+# Игнорирование папок
+client-console/build/
+gui/build/
+key-exchange/build
+temp/
+
+# Игнорирование файлов
+# build.log
+# fear.exe
+
+# Дополнительные полезные правила (опционально)
+*.log
+*.exe
+*.tmp
+*.temp
