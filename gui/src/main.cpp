@@ -580,12 +580,13 @@ private slots:
     }
 
     void onGenKeys(){
-        QString out = QFileDialog::getSaveFileName(this, "Save genkey full output to...", QString(), "Text files (*.txt);;All files (*)");
-        bool ok = backend->generateKeypair(out);
+        bool ok = backend->generateKeypair((QString)"");   // :toDo Fix workaround: window for file name was deleted but onGenKeys() method is still required
+        // QString out = QFileDialog::getSaveFileName(this, "Save genkey full output to...", QString(), "Text files (*.txt);;All files (*)");
+        // bool ok = backend->generateKeypair(out);
 
-        if(!ok){
-            QMessageBox::warning(this, "Generate Keys", "Failed to generate keypair. Check if fear.exe is in PATH or set CLI path.");
-        }
+        // if(!ok){
+        //     QMessageBox::warning(this, "Generate Keys", "Failed to generate keypair. Check if fear.exe is in PATH or set CLI path.");
+        // }
     }
 
     void onKeyGenerated(const QString &key){

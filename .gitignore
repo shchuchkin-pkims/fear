@@ -8,6 +8,8 @@ temp/
 # build.log
 # fear.exe
 
+Thumbs.db
+
 # Дополнительные полезные правила (опционально)
 *.log
 *.exe
