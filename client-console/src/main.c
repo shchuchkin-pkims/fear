@@ -6,21 +6,44 @@
 #include <string.h>
 #include <sodium.h>
 
+#define PROGRAM_VERSION "0.1.0"
+
+/**
+ * @brief Print usage into console
+ * 
+ * @param prog 
+ */
 static void print_usage(const char *prog) {
     fprintf(stderr,
         "Usage:\n"
+        "  %s --version\n"
         "  %s genkey\n"
         "  %s server [--port N]\n"
         "  %s client --host HOST --port N --room ROOM --key BASE64 [--name NAME]\n"
+        
         "\nNotes:\n"
         "  * Generate a key once per conference with 'genkey'. Share it out-of-band.\n"
         "  * The server sees only metadata (room/name), never plaintext.\n"
         "  * For NAT traversal, port-forward the server's TCP port or host it publicly.\n",
-        prog, prog, prog);
+        prog, prog, prog, prog);
+}
+/**
+ * @brief Program version print into console
+ * 
+ * @return * void 
+ */
+static void print_version() {
+    printf("Program version: %s\n", PROGRAM_VERSION);
+    printf("libsodium version: %s\n", sodium_version_string());
 }
 
 int main(int argc, char **argv) {
     if (argc < 2) { print_usage(argv[0]); return 1; }
+    // --version processing before other commands
+    if (strcmp(argv[1], "--version") == 0) {
+        print_version();
+        return 0;
+    }
     if (strcmp(argv[1], "genkey") == 0) {
         if (sodium_init() < 0) { fprintf(stderr, "libsodium init failed\n"); return 1; }
         uint8_t key[crypto_aead_xchacha20poly1305_ietf_KEYBYTES];
