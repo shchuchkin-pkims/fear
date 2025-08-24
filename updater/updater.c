@@ -27,7 +27,7 @@
   #define PATH_SEP '/'
 #endif
 
-#include <C:/Users/Evgeny/Documents/VS_Code/C/fear/updater/curl-8.15.0_5-win64-mingw/include/curl/curl.h>
+#include <curl/curl.h>
 
 #define CONF_PATH_DEFAULT "updater.conf"
 #define GITHUB_API_TPL "https://api.github.com/repos/%s/%s/releases/latest"

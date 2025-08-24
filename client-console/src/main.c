@@ -6,7 +6,7 @@
 #include <string.h>
 #include <sodium.h>
 
-#define PROGRAM_VERSION "0.0.8"
+#define PROGRAM_VERSION "0.1.0"
 
 /**
  * @brief Print usage into console
