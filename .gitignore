@@ -15,3 +15,6 @@ Thumbs.db
 *.exe
 *.tmp
 *.temp
+
+# Не игнорировать папку с содержимым
+!updater/curl-8.15.0_5-win64-mingw/**

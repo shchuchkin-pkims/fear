@@ -27,6 +27,7 @@
 #include <QStatusBar>
 #include <QMenu>
 #include <QProgressDialog>
+#include <QDesktopServices>
 
 class Backend : public QObject {
     Q_OBJECT
@@ -69,7 +70,7 @@ public:
 
         // Проверяем, существует ли исполняемый файл
         if (cliPath.isEmpty() || !QFile::exists(cliPath)) {
-            QString defaultPath = "fear.exe";
+            QString defaultPath = "./bin/fear.exe";
             if (!QFile::exists(defaultPath)) {
                 emit error("CLI executable not found. Please set the correct path to fear.exe");
                 return false;
@@ -419,6 +420,331 @@ private:
     }
 };
 
+class UpdateDialog : public QDialog {
+    Q_OBJECT
+public:
+    UpdateDialog(QWidget *parent = nullptr, const QString &cliPath = "")
+        : QDialog(parent), m_cliPath(cliPath) {
+        setWindowTitle("Check for Updates");
+        setMinimumSize(600, 500);
+
+        QVBoxLayout *layout = new QVBoxLayout(this);
+
+        // Заголовок
+        QLabel *titleLabel = new QLabel("F.E.A.R. Messenger - Version Information", this);
+        titleLabel->setStyleSheet("font-size: 14px;");
+        layout->addWidget(titleLabel);
+
+        // Текстовое поле для вывода информации о версии
+        m_versionText = new QTextEdit(this);
+        m_versionText->setReadOnly(true);
+        m_versionText->setPlaceholderText("Click 'Check Version' to get version information...");
+        layout->addWidget(m_versionText);
+
+        // Статус
+        m_statusLabel = new QLabel("Ready to check version", this);
+        layout->addWidget(m_statusLabel);
+
+        // Кнопки
+        QHBoxLayout *buttonLayout = new QHBoxLayout();
+
+        m_checkButton = new QPushButton("Check Version", this);
+        m_updateButton = new QPushButton("Update", this);
+        QPushButton *closeButton = new QPushButton("Close", this);
+
+        m_updateButton->setEnabled(false);
+
+        buttonLayout->addWidget(m_checkButton);
+        buttonLayout->addWidget(m_updateButton);
+        buttonLayout->addWidget(closeButton);
+        layout->addLayout(buttonLayout);
+
+        // Подключаем сигналы
+        connect(m_checkButton, &QPushButton::clicked, this, &UpdateDialog::checkVersion);
+        connect(m_updateButton, &QPushButton::clicked, this, &UpdateDialog::runUpdater);
+        connect(closeButton, &QPushButton::clicked, this, &UpdateDialog::accept);
+
+        // Инициализируем процесс
+        m_updaterProcess = nullptr;
+    }
+
+    ~UpdateDialog() {
+        if (m_updaterProcess) {
+            if (m_updaterProcess->state() == QProcess::Running) {
+                m_updaterProcess->kill();
+                m_updaterProcess->waitForFinished(1000);
+            }
+            m_updaterProcess->deleteLater();
+        }
+    }
+
+    void setCliPath(const QString &path) {
+        m_cliPath = path;
+    }
+
+private slots:
+    void checkVersion() {
+        m_statusLabel->setText("Checking version...");
+        m_versionText->setPlainText("Please wait while checking version...");
+        m_updateButton->setEnabled(false);
+        m_checkButton->setEnabled(false);
+
+        // Даем GUI обновиться
+        QApplication::processEvents();
+
+        QString fearPath = m_cliPath;
+        if (fearPath.isEmpty() || !QFile::exists(fearPath)) {
+            fearPath = "./bin/fear.exe";
+            if (!QFile::exists(fearPath)) {
+                fearPath = "fear.exe";
+            }
+        }
+
+        if (!QFile::exists(fearPath)) {
+            m_versionText->setPlainText("Error: fear.exe not found!\n"
+                                        "Searched paths:\n"
+                                        "- " + m_cliPath + "\n"
+                                                      "- ./bin/fear.exe\n"
+                                                      "- fear.exe\n\n"
+                                                      "Please set the correct CLI path in File -> Set CLI path...");
+            m_statusLabel->setText("Error: fear.exe not found");
+            m_checkButton->setEnabled(true);
+            return;
+        }
+
+        QProcess *process = new QProcess(this);
+        process->start(fearPath, QStringList() << "--version");
+
+        if (!process->waitForStarted(3000)) {
+            m_versionText->setPlainText("Error: Failed to start fear.exe process\n"
+                                        "Path: " + fearPath);
+            m_statusLabel->setText("Error: Process failed to start");
+            process->deleteLater();
+            m_checkButton->setEnabled(true);
+            return;
+        }
+
+        if (!process->waitForFinished(10000)) {
+            m_versionText->setPlainText("Error: Process timed out after 10 seconds");
+            m_statusLabel->setText("Error: Process timed out");
+            process->kill();
+            process->waitForFinished(1000);
+            process->deleteLater();
+            m_checkButton->setEnabled(true);
+            return;
+        }
+
+        QString output = QString::fromLocal8Bit(process->readAllStandardOutput());
+        QString error = QString::fromLocal8Bit(process->readAllStandardError());
+
+        if (process->exitCode() != 0) {
+            m_versionText->setPlainText(QString("Error: Process exited with code %1\n\nError output:\n%2\n\nStandard output:\n%3")
+                                            .arg(process->exitCode()).arg(error).arg(output));
+            m_statusLabel->setText("Error: Process failed");
+            process->deleteLater();
+            m_checkButton->setEnabled(true);
+            return;
+        }
+
+        // Парсим версию
+        QString currentVersion = parseVersion(output);
+        m_currentVersion = currentVersion;
+
+        QString versionInfo = QString("Current F.E.A.R. version: %1\n\nFull output:\n%2")
+                                  .arg(currentVersion.isEmpty() ? "Unknown" : currentVersion)
+                                  .arg(output);
+
+        m_versionText->setPlainText(versionInfo);
+
+        // Включаем кнопку обновления
+        m_updateButton->setEnabled(true);
+        m_checkButton->setEnabled(true);
+        m_statusLabel->setText(currentVersion.isEmpty() ? "Version unknown" : "Version: " + currentVersion);
+
+        process->deleteLater();
+    }
+
+    void runUpdater() {
+        QString updaterPath = "./bin/updater.exe";
+        QFileInfo updaterInfo(updaterPath);
+
+        if (!updaterInfo.exists()) {
+            QMessageBox::warning(this, "Update Error",
+                                 "Updater not found at: " + updaterPath +
+                                     "\nPlease download the updater manually from GitHub.");
+            return;
+        }
+
+        // Получаем абсолютный путь к каталогу с updater.exe
+        QString updaterDir = updaterInfo.absolutePath();
+
+        if (QMessageBox::question(this, "Confirm Update",
+                                  "The updater will now start. This may take several minutes.\n"
+                                  "Do you want to continue?") != QMessageBox::Yes) {
+            return;
+        }
+
+        // Отключаем кнопки во время обновления
+        m_updateButton->setEnabled(false);
+        m_checkButton->setEnabled(false);
+        m_statusLabel->setText("Running updater...");
+
+        // Очищаем текстовое поле и показываем вывод updater
+        m_versionText->clear();
+        m_versionText->setPlainText("Starting updater...\n\n");
+
+        // Создаем процесс для updater
+        m_updaterProcess = new QProcess(this);
+        m_updaterProcess->setWorkingDirectory(updaterDir);
+        m_updaterProcess->setProcessChannelMode(QProcess::MergedChannels);
+
+        // Подключаем сигналы для чтения вывода
+        connect(m_updaterProcess, &QProcess::readyRead, this, &UpdateDialog::onUpdaterOutput);
+        connect(m_updaterProcess, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
+                this, &UpdateDialog::onUpdaterFinished);
+
+        // Запускаем процесс
+        m_updaterProcess->start(updaterInfo.absoluteFilePath());
+
+        if (!m_updaterProcess->waitForStarted(3000)) {
+            m_versionText->append("Error: Failed to start updater process");
+            m_statusLabel->setText("Error: Updater failed to start");
+            cleanupUpdaterProcess();
+            return;
+        }
+
+        m_versionText->append("Updater started successfully. Waiting for output...\n");
+    }
+
+    void onUpdaterOutput() {
+        if (!m_updaterProcess) return;
+
+        QByteArray output = m_updaterProcess->readAll();
+        QString text = QString::fromLocal8Bit(output);
+
+        // Добавляем вывод в текстовое поле
+        m_versionText->insertPlainText(text);
+
+        // Прокручиваем вниз
+        QTextCursor cursor = m_versionText->textCursor();
+        cursor.movePosition(QTextCursor::End);
+        m_versionText->setTextCursor(cursor);
+
+        // Обрабатываем вывод
+        QApplication::processEvents();
+    }
+
+    void onUpdaterFinished(int exitCode, QProcess::ExitStatus exitStatus) {
+        Q_UNUSED(exitStatus);
+
+        m_versionText->append(QString("\n\nUpdater finished with exit code: %1").arg(exitCode));
+
+        if (exitCode == 0) {
+            m_versionText->append("Update completed successfully!");
+            m_statusLabel->setText("Update completed");
+
+            // Автоматический перезапуск с подтверждением
+            m_versionText->append("Update completed! The application needs to restart to apply changes.");
+            QApplication::processEvents();
+
+            if (QMessageBox::information(this, "Update Complete",
+                                         "Update completed successfully!\n"
+                                         "The application will now restart to apply the changes.",
+                                         QMessageBox::Ok) == QMessageBox::Ok) {
+                restartApplication();
+            } else {
+                cleanupUpdaterProcess();
+            }
+
+        } else {
+            m_versionText->append("Update failed or was cancelled.");
+            m_statusLabel->setText("Update failed");
+
+            QMessageBox::warning(this, "Update Failed",
+                                 QString("Updater exited with code %1. Please check the output above for details.")
+                                     .arg(exitCode));
+
+            cleanupUpdaterProcess();
+        }
+    }
+
+private:
+    QString m_cliPath;
+    QString m_currentVersion;
+    QTextEdit *m_versionText;
+    QLabel *m_statusLabel;
+    QPushButton *m_checkButton;
+    QPushButton *m_updateButton;
+    QProcess *m_updaterProcess;
+
+    void restartApplication() {
+        qDebug() << "Restarting application...";
+
+        // Получаем путь к текущему исполняемому файлу
+        QString program = QApplication::applicationFilePath();
+        QStringList arguments = QApplication::arguments();
+        QString workingDir = QApplication::applicationDirPath();
+
+        // Убираем возможные дубликаты аргументов
+        if (!arguments.isEmpty() && arguments.first() == program) {
+            arguments.removeFirst();
+        }
+
+        // Запускаем новую копию приложения
+        bool started = QProcess::startDetached(program, arguments, workingDir);
+
+        if (started) {
+            qDebug() << "New instance started successfully, closing current instance";
+            QApplication::quit();
+        } else {
+            qDebug() << "Failed to restart application";
+            QMessageBox::warning(this, "Restart Failed",
+                                 "Failed to restart the application. Please restart it manually.");
+            cleanupUpdaterProcess();
+        }
+    }
+
+    void cleanupUpdaterProcess() {
+        if (m_updaterProcess) {
+            if (m_updaterProcess->state() == QProcess::Running) {
+                m_updaterProcess->kill();
+                m_updaterProcess->waitForFinished(1000);
+            }
+            m_updaterProcess->deleteLater();
+            m_updaterProcess = nullptr;
+        }
+        m_updateButton->setEnabled(true);
+        m_checkButton->setEnabled(true);
+    }
+
+    QString parseVersion(const QString &output) {
+        // Ищем строку с версией программы
+        QRegularExpression re("Program version:\\s*([0-9]+\\.[0-9]+\\.[0-9]+)");
+        QRegularExpressionMatch match = re.match(output);
+
+        if (match.hasMatch()) {
+            return match.captured(1).trimmed();
+        }
+
+        // Альтернативные форматы
+        re.setPattern("version\\s*([0-9]+\\.[0-9]+\\.[0-9]+)");
+        match = re.match(output);
+
+        if (match.hasMatch()) {
+            return match.captured(1).trimmed();
+        }
+
+        re.setPattern("([0-9]+\\.[0-9]+\\.[0-9]+)");
+        match = re.match(output);
+
+        if (match.hasMatch()) {
+            return match.captured(1).trimmed();
+        }
+
+        return QString();
+    }
+};
+
 class MainWindow : public QMainWindow {
     Q_OBJECT
 public:
@@ -455,7 +781,10 @@ public:
         // initial refresh of contacts (non-blocking attempt)
         QTimer::singleShot(100, this, &MainWindow::refreshContacts);
     }
-
+public:
+    QString getCliPath() const {
+        return backend->cliPath;
+    }
 private slots:
     void onCreateServer(){
         bool ok;
@@ -708,15 +1037,34 @@ private:
         keysMenu->addAction(genKeys);
 
         QMenu *helpMenu = menuBar()->addMenu("Help");
+
+        QAction *update = new QAction("Check for Updates", this);
+        connect(update, &QAction::triggered, this, [this](){
+            UpdateDialog dialog(this, backend->cliPath);
+            dialog.exec();
+        });
+        helpMenu->addAction(update);
+
         QAction *about = new QAction("About", this);
         connect(about, &QAction::triggered, this, [this](){
-            QMessageBox::about(this, "About F.E.A.R.",
-                               "F.E.A.R. messenger GUI\n"
-                               "Qt-based frontend for ecrypted anonymous messenger.\n"
-                               "Read more at:.\n"
-                               "https://github.com/shchuchkin-pkims/fear");
+            // Создаем кастомное диалоговое окно
+            QMessageBox msgBox(this);
+            msgBox.setWindowTitle("About F.E.A.R.");
+            msgBox.setText("This is Qt-based frontend GUI for F.E.A.R. messenger.\n"
+                           "F.E.A.R. is a encrypted anonymous messenger with E2EE encryption.\n"
+                           "Read more at project Github page.\n\n"
+                           "Developed by Shchuchkin E. Yu.\n"
+                           "Email: shchuchkin-pkims@yandex.ru\n");
+            msgBox.addButton(QMessageBox::Ok);
+            QPushButton *githubButton = msgBox.addButton("Github page", QMessageBox::ActionRole);
+            msgBox.exec();
+            if (msgBox.clickedButton() == githubButton) {
+                QDesktopServices::openUrl(QUrl("https://github.com/shchuchkin-pkims/fear"));
+            }
         });
+
         helpMenu->addAction(about);
+
     }
 
     void createToolbar(){
