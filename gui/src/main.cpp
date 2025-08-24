@@ -786,6 +786,47 @@ public:
         return backend->cliPath;
     }
 private slots:
+
+    void onKeyExchange() {
+        QString keyExchangePath = QApplication::applicationDirPath() + "/bin/key-exchange.exe";
+        QFileInfo keyExchangeInfo(keyExchangePath);
+
+        if (!keyExchangeInfo.exists()) {
+            keyExchangePath = QApplication::applicationDirPath() + "/key-exchange.exe";
+            keyExchangeInfo.setFile(keyExchangePath);
+
+            if (!keyExchangeInfo.exists()) {
+                QMessageBox::warning(this, "Key Exchange Error",
+                                     "Key exchange utility not found!");
+                return;
+            }
+        }
+
+        // Запускаем через cmd.exe чтобы избежать проблем с консолью
+        QProcess process;
+        process.setWorkingDirectory(keyExchangeInfo.absolutePath());
+
+// Для Windows запускаем через cmd
+#ifdef Q_OS_WIN
+        process.start("cmd.exe", QStringList() << "/c" << "start" << "/wait" << keyExchangeInfo.fileName());
+#else
+        process.start(keyExchangeInfo.absoluteFilePath());
+#endif
+
+        appendChatLine("[Key Exchange] Starting key exchange utility in new window...");
+
+        if (process.waitForStarted(3000)) {
+            // Не ждем завершения - пользователь будет работать в отдельном окне
+            appendChatLine("[Key Exchange] Utility started in separate window");
+            QMessageBox::information(this, "Key Exchange",
+                                     "Key exchange utility started in a separate window.\n"
+                                     "Please follow the instructions in that window.");
+        } else {
+            appendChatLine("[Key Exchange] Failed to start utility");
+            QMessageBox::warning(this, "Key Exchange", "Failed to start key exchange utility.");
+        }
+    }
+
     void onCreateServer(){
         bool ok;
         int defaultPort = appSettings->value("last/port", 7777).toInt();
@@ -1036,8 +1077,11 @@ private:
         connect(genKeys, &QAction::triggered, this, &MainWindow::onGenKeys);
         keysMenu->addAction(genKeys);
 
-        QMenu *helpMenu = menuBar()->addMenu("Help");
+        QAction *keyExchange = new QAction("Key exchange", this);
+        connect(keyExchange, &QAction::triggered, this, &MainWindow::onKeyExchange);
+        keysMenu->addAction(keyExchange);
 
+        QMenu *helpMenu = menuBar()->addMenu("Help");
         QAction *update = new QAction("Check for Updates", this);
         connect(update, &QAction::triggered, this, [this](){
             UpdateDialog dialog(this, backend->cliPath);
