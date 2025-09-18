@@ -28,6 +28,375 @@
 #include <QMenu>
 #include <QProgressDialog>
 #include <QDesktopServices>
+#include <QGroupBox>
+#include <QComboBox>
+#include <QSpinBox>
+
+// Аудио звонки
+class AudioCallManager : public QObject {
+    Q_OBJECT
+public:
+    AudioCallManager(QObject *parent = nullptr) : QObject(parent), callProcess(nullptr) {
+        settings = new QSettings("fear-messenger", "fear-audio", this);
+    }
+
+    ~AudioCallManager() {
+        stopCall();
+    }
+
+    bool generateKey() {
+        QString audioAppPath = findAudioCallApp();
+        if (audioAppPath.isEmpty()) {
+            emit error("Audio call application not found");
+            return false;
+        }
+
+        QProcess process;
+        process.start(audioAppPath, QStringList() << "genkey");
+
+        if (!process.waitForFinished(5000)) {
+            emit error("Key generation timed out");
+            return false;
+        }
+
+        if (process.exitCode() != 0) {
+            emit error("Key generation failed");
+            return false;
+        }
+
+        QString output = QString::fromUtf8(process.readAllStandardOutput()).trimmed();
+        if (output.length() == 64) { // 32 bytes in hex
+            currentKey = output;
+            emit keyGenerated(output);
+            return true;
+        }
+
+        emit error("Invalid key format");
+        return false;
+    }
+
+    bool startCall(const QString &remoteIp, quint16 remotePort, const QString &key, quint16 localPort = 0) {
+        if (key.isEmpty()) {
+            emit error("Key is required to start a call");
+            return false;
+        }
+
+        stopCall();
+
+        QString audioAppPath = findAudioCallApp();
+        if (audioAppPath.isEmpty()) {
+            emit error("Audio call application not found");
+            return false;
+        }
+
+        callProcess = new QProcess(this);
+        connect(callProcess, &QProcess::readyReadStandardOutput, this, &AudioCallManager::onProcessOutput);
+        connect(callProcess, &QProcess::readyReadStandardError, this, &AudioCallManager::onProcessError);
+        connect(callProcess, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished), this, &AudioCallManager::onProcessFinished);
+
+        QStringList args;
+        args << "call" << remoteIp << QString::number(remotePort) << key;
+        if (localPort > 0) {
+            args << QString::number(localPort);
+        }
+
+        callProcess->start(audioAppPath, args);
+
+        if (!callProcess->waitForStarted(3000)) {
+            emit error("Failed to start audio call");
+            delete callProcess;
+            callProcess = nullptr;
+            return false;
+        }
+
+        emit callStarted();
+        return true;
+    }
+
+    bool startListening(quint16 localPort, const QString &key) {
+        if (key.isEmpty()) {
+            emit error("Key is required to start listening");
+            return false;
+        }
+
+        stopCall();
+
+        QString audioAppPath = findAudioCallApp();
+        if (audioAppPath.isEmpty()) {
+            emit error("Audio call application not found");
+            return false;
+        }
+
+        callProcess = new QProcess(this);
+        connect(callProcess, &QProcess::readyReadStandardOutput, this, &AudioCallManager::onProcessOutput);
+        connect(callProcess, &QProcess::readyReadStandardError, this, &AudioCallManager::onProcessError);
+        connect(callProcess, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished), this, &AudioCallManager::onProcessFinished);
+
+        QStringList args;
+        args << "listen" << QString::number(localPort) << key;
+
+        callProcess->start(audioAppPath, args);
+
+        if (!callProcess->waitForStarted(3000)) {
+            emit error("Failed to start audio listening");
+            delete callProcess;
+            callProcess = nullptr;
+            return false;
+        }
+
+        emit listeningStarted();
+        return true;
+    }
+
+    void stopCall() {
+        if (callProcess && callProcess->state() == QProcess::Running) {
+            callProcess->terminate();
+            if (!callProcess->waitForFinished(1000)) {
+                callProcess->kill();
+            }
+        }
+        delete callProcess;
+        callProcess = nullptr;
+
+        emit callStopped();
+    }
+
+    bool isCallActive() const {
+        return callProcess && callProcess->state() == QProcess::Running;
+    }
+
+    QString getCurrentKey() const { return currentKey; }
+
+signals:
+    void keyGenerated(const QString &key);
+    void callStarted();
+    void listeningStarted();
+    void callStopped();
+    void error(const QString &error);
+    void output(const QString &message);
+
+private slots:
+    void onProcessOutput() {
+        if (callProcess) {
+            QString output = QString::fromUtf8(callProcess->readAllStandardOutput());
+            emit this->output(output);
+        }
+    }
+
+    void onProcessError() {
+        if (callProcess) {
+            QString error = QString::fromUtf8(callProcess->readAllStandardError());
+            emit this->error(error);
+        }
+    }
+
+    void onProcessFinished(int exitCode, QProcess::ExitStatus exitStatus) {
+        Q_UNUSED(exitCode);
+        Q_UNUSED(exitStatus);
+        emit callStopped();
+    }
+
+private:
+    QProcess *callProcess;
+    QString currentKey;
+    QSettings *settings;
+
+    QString findAudioCallApp() {
+        // Поиск audio_call_app в разных местах
+        QStringList possiblePaths = {
+            QApplication::applicationDirPath() + "/audio_call_app",
+            QApplication::applicationDirPath() + "/bin/audio_call_app",
+            QApplication::applicationDirPath() + "/../bin/audio_call_app",
+            "audio_call_app",
+            "./audio_call_app"
+        };
+
+#ifdef Q_OS_WIN
+        for (QString &path : possiblePaths) {
+            path += ".exe";
+        }
+#endif
+
+        for (const QString &path : possiblePaths) {
+            if (QFile::exists(path)) {
+                return path;
+            }
+        }
+
+        return QString();
+    }
+};
+
+// Диалог для аудиозвонков
+class AudioCallDialog : public QDialog {
+    Q_OBJECT
+public:
+    AudioCallDialog(AudioCallManager *audioManager, QWidget *parent = nullptr)
+        : QDialog(parent), audioManager(audioManager) {
+        setWindowTitle("Audio Call");
+        setMinimumSize(500, 400);
+
+        setupUI();
+        setupConnections();
+    }
+
+private slots:
+    void onGenerateKey() {
+        if (audioManager->generateKey()) {
+            // Ключ будет установлен через сигнал keyGenerated
+        }
+    }
+
+    void onKeyGenerated(const QString &key) {
+        keyEdit->setText(key);
+        outputText->append("Key generated: " + key);
+    }
+
+    void onStartCall() {
+        QString remoteIp = ipEdit->text();
+        quint16 remotePort = portSpin->value();
+        QString key = keyEdit->text();
+
+        if (remoteIp.isEmpty()) {
+            QMessageBox::warning(this, "Error", "Please enter remote IP");
+            return;
+        }
+
+        if (key.isEmpty()) {
+            QMessageBox::warning(this, "Error", "Please generate or enter a key first");
+            return;
+        }
+
+        if (audioManager->startCall(remoteIp, remotePort, key, localPortSpin->value())) {
+            statusLabel->setText("Call started");
+        }
+    }
+
+    void onStartListening() {
+        QString key = keyEdit->text();
+        if (key.isEmpty()) {
+            QMessageBox::warning(this, "Error", "Please generate or enter a key first");
+            return;
+        }
+
+        if (audioManager->startListening(localPortSpin->value(), key)) {
+            statusLabel->setText("Listening started");
+        }
+    }
+
+    void onStopCall() {
+        audioManager->stopCall();
+        statusLabel->setText("Call stopped");
+    }
+
+    void onCallStarted() {
+        callButton->setEnabled(false);
+        listenButton->setEnabled(false);
+        stopButton->setEnabled(true);
+    }
+
+    void onCallStopped() {
+        callButton->setEnabled(true);
+        listenButton->setEnabled(true);
+        stopButton->setEnabled(false);
+    }
+
+    void onError(const QString &error) {
+        outputText->append("Error: " + error);
+        statusLabel->setText("Error: " + error.left(30));
+    }
+
+    void onOutput(const QString &output) {
+        outputText->append(output);
+    }
+
+private:
+    void setupUI() {
+        QVBoxLayout *layout = new QVBoxLayout(this);
+
+        // Key section
+        QGroupBox *keyGroup = new QGroupBox("Encryption Key", this);
+        QHBoxLayout *keyLayout = new QHBoxLayout(keyGroup);
+        keyEdit = new QLineEdit(keyGroup);
+        keyEdit->setPlaceholderText("32-byte hex key");
+        genKeyButton = new QPushButton("Generate", keyGroup);
+        keyLayout->addWidget(keyEdit);
+        keyLayout->addWidget(genKeyButton);
+        layout->addWidget(keyGroup);
+
+        // Connection section
+        QGroupBox *connGroup = new QGroupBox("Connection", this);
+        QGridLayout *connLayout = new QGridLayout(connGroup);
+
+        connLayout->addWidget(new QLabel("Remote IP:"), 0, 0);
+        ipEdit = new QLineEdit(connGroup);
+        ipEdit->setText("127.0.0.1");
+        connLayout->addWidget(ipEdit, 0, 1);
+
+        connLayout->addWidget(new QLabel("Remote Port:"), 1, 0);
+        portSpin = new QSpinBox(connGroup);
+        portSpin->setRange(1024, 65535);
+        portSpin->setValue(50000);
+        connLayout->addWidget(portSpin, 1, 1);
+
+        connLayout->addWidget(new QLabel("Local Port:"), 2, 0);
+        localPortSpin = new QSpinBox(connGroup);
+        localPortSpin->setRange(1024, 65535);
+        localPortSpin->setValue(50001);
+        connLayout->addWidget(localPortSpin, 2, 1);
+
+        layout->addWidget(connGroup);
+
+        // Buttons
+        QHBoxLayout *buttonLayout = new QHBoxLayout();
+        callButton = new QPushButton("Start Call", this);
+        listenButton = new QPushButton("Start Listening", this);
+        stopButton = new QPushButton("Stop", this);
+        stopButton->setEnabled(false);
+
+        buttonLayout->addWidget(callButton);
+        buttonLayout->addWidget(listenButton);
+        buttonLayout->addWidget(stopButton);
+        layout->addLayout(buttonLayout);
+
+        // Status
+        statusLabel = new QLabel("Ready", this);
+        layout->addWidget(statusLabel);
+
+        // Output
+        outputText = new QTextEdit(this);
+        outputText->setReadOnly(true);
+        layout->addWidget(outputText);
+    }
+
+    void setupConnections() {
+        // Подключаем сигналы от менеджера аудио
+        connect(audioManager, &AudioCallManager::keyGenerated, this, &AudioCallDialog::onKeyGenerated);
+        connect(audioManager, &AudioCallManager::callStarted, this, &AudioCallDialog::onCallStarted);
+        connect(audioManager, &AudioCallManager::listeningStarted, this, &AudioCallDialog::onCallStarted);
+        connect(audioManager, &AudioCallManager::callStopped, this, &AudioCallDialog::onCallStopped);
+        connect(audioManager, &AudioCallManager::error, this, &AudioCallDialog::onError);
+        connect(audioManager, &AudioCallManager::output, this, &AudioCallDialog::onOutput);
+
+        // Подключаем кнопки UI
+        connect(genKeyButton, &QPushButton::clicked, this, &AudioCallDialog::onGenerateKey);
+        connect(callButton, &QPushButton::clicked, this, &AudioCallDialog::onStartCall);
+        connect(listenButton, &QPushButton::clicked, this, &AudioCallDialog::onStartListening);
+        connect(stopButton, &QPushButton::clicked, this, &AudioCallDialog::onStopCall);
+    }
+
+    AudioCallManager *audioManager;
+    QLineEdit *keyEdit;
+    QLineEdit *ipEdit;
+    QSpinBox *portSpin;
+    QSpinBox *localPortSpin;
+    QPushButton *genKeyButton;
+    QPushButton *callButton;
+    QPushButton *listenButton;
+    QPushButton *stopButton;
+    QLabel *statusLabel;
+    QTextEdit *outputText;
+};
 
 class Backend : public QObject {
     Q_OBJECT
@@ -39,6 +408,9 @@ public:
         serverProc = nullptr;
         lastMessageId = 0;
         isConnected = false;
+
+        // Инициализация менеджера аудиозвонков
+        audioManager = new AudioCallManager(this);
     }
 
     ~Backend(){
@@ -56,6 +428,7 @@ public:
 
     QString cliPath;
     bool isConnected;
+    AudioCallManager *audioManager;
 
     void setCliPath(const QString &path){
         cliPath = path;
@@ -787,6 +1160,11 @@ public:
     }
 private slots:
 
+    void onAudioCall() {
+        AudioCallDialog dialog(backend->audioManager, this);
+        dialog.exec();
+    }
+
     void onKeyExchange() {
         QString keyExchangePath = QApplication::applicationDirPath() + "/bin/key-exchange.exe";
         QFileInfo keyExchangeInfo(keyExchangePath);
@@ -1071,6 +1449,12 @@ private:
         QAction *serveAct = new QAction("Create server...", this);
         connect(serveAct, &QAction::triggered, this, &MainWindow::onCreateServer);
         connMenu->addAction(serveAct);
+
+        // Добавляем меню для аудиозвонков
+        QMenu *audioMenu = menuBar()->addMenu("Audio Call");
+        QAction *audioCallAct = new QAction("Start Audio Call", this);
+        connect(audioCallAct, &QAction::triggered, this, &MainWindow::onAudioCall);
+        audioMenu->addAction(audioCallAct);
 
         QMenu *keysMenu = menuBar()->addMenu("Keys");
         QAction *genKeys = new QAction("Generate keypair...", this);
