@@ -1,12 +1,18 @@
 # Игнорирование папок
+.vscode
+audio_call/build/
 client-console/build/
 gui/build/
 key-exchange/build
 temp/
+build/
+
+lib/
 
 # Игнорирование файлов
 # build.log
 # fear.exe
+fear.exe.bak
 
 Thumbs.db
 
@@ -17,4 +23,18 @@ Thumbs.db
 *.temp
 
 # Не игнорировать папку с содержимым
-!updater/curl-8.15.0_5-win64-mingw/**
+#!updater/curl-8.15.0_5-win64-mingw/**
+
+# VS Code Cmake files
+CMakeFiles/
+build.ninja
+cmake_install.cmake
+CMakeCache.txt
+audio_call/CMakeFiles/
+audio_call/cmake_install.cmake
+client-console/CMakeFiles/
+client-console/cmake_install.cmake
+key-exchange/CMakeFiles/
+key-exchange/cmake_install.cmake
+updater/CMakeFiles/
+updater/cmake_install.cmake

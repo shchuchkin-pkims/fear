@@ -202,13 +202,13 @@ private:
     QSettings *settings;
 
     QString findAudioCallApp() {
-        // Поиск audio_call_app в разных местах
+        // Поиск audio_call в разных местах
         QStringList possiblePaths = {
-            QApplication::applicationDirPath() + "/audio_call_app",
-            QApplication::applicationDirPath() + "/bin/audio_call_app",
-            QApplication::applicationDirPath() + "/../bin/audio_call_app",
-            "audio_call_app",
-            "./audio_call_app"
+            QApplication::applicationDirPath() + "/audio_call",
+            QApplication::applicationDirPath() + "/bin/audio_call",
+            QApplication::applicationDirPath() + "/../bin/audio_call",
+            "audio_call",
+            "./audio_call"
         };
 
 #ifdef Q_OS_WIN
