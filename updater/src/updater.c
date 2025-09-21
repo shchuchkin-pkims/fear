@@ -499,6 +499,8 @@ int main(int argc, char **argv) {
     char asset_name[256];
 #ifdef _WIN32
     snprintf(asset_name, sizeof(asset_name), "%s-%s.exe", cfg.asset_prefix, osarch);
+    // :todo Make zip downloadable update from Github releases
+    // snprintf(asset_name, sizeof(asset_name), "%s-%s.zip", cfg.asset_prefix, osarch);
 #else
     snprintf(asset_name, sizeof(asset_name), "%s-%s", cfg.asset_prefix, osarch);
 #endif

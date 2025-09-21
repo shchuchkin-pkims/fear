@@ -1,0 +1,45 @@
+*** External libraries ***
+The project is using external libraries:
+curl-8.15.0_5-win64-mingw
+libsodium-win64
+opus-1.5.2
+portaudio
+
+All libraries can be dowloaded from their Github pages. To compile F.E.A.R. project sources make "lib" folder:
+"\fear\lib"
+and place libraries sources in it like this:
+"\fear\lib\curl-8.15.0_5-win64-mingw"
+"\fear\lib\libsodium-win64"
+"\fear\lib\opus-1.5.2"
+"\fear\lib\portaudio"
+
+*** Compile order ***
+1. For GUI app open "\fear\gui\src\CMakeLists.txt" with Qt Creator and build app or create folder manualy"
+"fear\gui\build"
+and run from it commands:
+"
+cmake -G "MinGW Makefiles" ../src/  
+make
+"
+Then go to compiled app folder and execute command:
+"windeployqt .\fear_gui.exe"
+It will copy all necessary Qt files in folder.
+
+2. To build main project tools make "build" folder:
+"fear\build"
+In this folder run commands:
+"
+cmake -G "MinGW Makefiles" ..
+make
+"
+You will get *.exe files.
+
+3. To make whole project make "bin" folder in GUI build folder. In example
+\fear\gui\gui\build\bin\bin
+And copy to this folder files:
+"
+*.exe
+cacert.pem
+libcurl-x64.dll
+updater.conf
+"
