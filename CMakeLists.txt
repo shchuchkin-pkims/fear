@@ -156,6 +156,6 @@ if(WIN32 AND NOT EXISTS "${LIBS_DIR}")
         "│   └── build/libopus.a\n"
         "└── portaudio/\n"
         "    ├── include/portaudio.h\n"
-        "    └── build_my/libportaudio.a\n"
+        "    └── build/libportaudio.a\n"
     )
 endif()

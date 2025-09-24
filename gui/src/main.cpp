@@ -32,6 +32,191 @@
 #include <QComboBox>
 #include <QSpinBox>
 
+#include <QFormLayout>
+#include <QIcon>
+
+#include "dh.h"
+
+class KeyExchangeDialog : public QDialog {
+    Q_OBJECT
+public:
+    explicit KeyExchangeDialog(QWidget *parent = nullptr) : QDialog(parent) {
+        setWindowTitle("Diffie-Hellman Key Exchange");
+        setMinimumSize(600, 500);
+        srand(time(NULL));
+
+        QVBoxLayout *mainLayout = new QVBoxLayout(this);
+
+        // Parameters
+        QGroupBox *paramsGroup = new QGroupBox("Parameters", this);
+        QFormLayout *paramsLayout = new QFormLayout(paramsGroup);
+        pEdit = new QLineEdit(paramsGroup);
+        gEdit = new QLineEdit(paramsGroup);
+        pubKeyEdit = new QLineEdit(paramsGroup);
+
+        QHBoxLayout *secretLayout = new QHBoxLayout();
+        secretKeyEdit = new QLineEdit(paramsGroup);
+        secretKeyEdit->setEchoMode(QLineEdit::Password);
+        QPushButton *showBtn = new QPushButton("Show", paramsGroup);
+        secretLayout->addWidget(secretKeyEdit);
+        secretLayout->addWidget(showBtn);
+
+        paramsLayout->addRow("Prime p:", pEdit);
+        paramsLayout->addRow("Primitive root g:", gEdit);
+        paramsLayout->addRow("Public key:", pubKeyEdit);
+        paramsLayout->addRow("Secret key (keep safe!):", secretLayout);
+        mainLayout->addWidget(paramsGroup);
+
+        // Data to share
+        QGroupBox *shareGroup = new QGroupBox("Data to share with friend", this);
+        QVBoxLayout *shareLayout = new QVBoxLayout(shareGroup);
+        shareEdit = new QTextEdit(shareGroup);
+        shareEdit->setReadOnly(true);
+        QPushButton *copyBtn = new QPushButton("Copy to clipboard", shareGroup);
+        shareLayout->addWidget(shareEdit);
+        shareLayout->addWidget(copyBtn);
+        mainLayout->addWidget(shareGroup);
+
+        // Encrypted/Decrypted key
+        QGroupBox *encGroup = new QGroupBox("Encryption", this);
+        QFormLayout *encLayout = new QFormLayout(encGroup);
+        origKeyEdit = new QLineEdit(encGroup);
+        friendPubKeyEdit = new QLineEdit(encGroup);
+        encryptedEdit = new QLineEdit(encGroup);
+        decryptedEdit = new QLineEdit(encGroup);
+        encLayout->addRow("Key to send:", origKeyEdit);
+        encLayout->addRow("Friend's public key:", friendPubKeyEdit);
+        encLayout->addRow("Encrypted (hex):", encryptedEdit);
+        encLayout->addRow("Decrypted:", decryptedEdit);
+        mainLayout->addWidget(encGroup);
+
+        // Buttons
+        QHBoxLayout *btnLayout = new QHBoxLayout();
+        QPushButton *genBtn = new QPushButton("Generate parameters", this);
+        QPushButton *genPubBtn = new QPushButton("Generate public key", this);
+        QPushButton *encryptBtn = new QPushButton("Encrypt", this);
+        QPushButton *decryptBtn = new QPushButton("Decrypt", this);
+        QPushButton *closeBtn = new QPushButton("Close", this);
+        btnLayout->addWidget(genBtn);
+        btnLayout->addWidget(genPubBtn);
+        btnLayout->addWidget(encryptBtn);
+        btnLayout->addWidget(decryptBtn);
+        btnLayout->addStretch();
+        btnLayout->addWidget(closeBtn);
+        mainLayout->addLayout(btnLayout);
+
+        // === Connections ===
+        connect(copyBtn, &QPushButton::clicked, this, [this]() {
+            QGuiApplication::clipboard()->setText(shareEdit->toPlainText());
+            QMessageBox::information(this, "Copied", "Shared data copied to clipboard.");
+        });
+        connect(genBtn, &QPushButton::clicked, this, &KeyExchangeDialog::onGenerate);
+        connect(genPubBtn, &QPushButton::clicked, this, &KeyExchangeDialog::onGeneratePublicOnly);
+        connect(encryptBtn, &QPushButton::clicked, this, &KeyExchangeDialog::onEncrypt);
+        connect(decryptBtn, &QPushButton::clicked, this, &KeyExchangeDialog::onDecrypt);
+        connect(closeBtn, &QPushButton::clicked, this, &QDialog::accept);
+
+        // Show/Hide secret key
+        connect(showBtn, &QPushButton::clicked, this, [this, showBtn]() {
+            if (secretKeyEdit->echoMode() == QLineEdit::Password) {
+                secretKeyEdit->setEchoMode(QLineEdit::Normal);
+                showBtn->setText("Hide");
+            } else {
+                secretKeyEdit->setEchoMode(QLineEdit::Password);
+                showBtn->setText("Show");
+            }
+        });
+    }
+
+private slots:
+    void onGenerate() {
+        int p = dh_generate_large_prime(10000, 50000);
+        int g = dh_find_primitive_root(p);
+        int priv = dh_generate_random_number(2, p - 2);
+        long long pub = dh_mod_pow(g, priv, p);
+
+        pEdit->setText(QString::number(p));
+        gEdit->setText(QString::number(g));
+        pubKeyEdit->setText(QString::number(pub));
+        secretKeyEdit->setText(QString::number(priv));
+
+        QString shareData = QString("Prime p = %1\nPrimitive root g = %2\nPublic key = %3").arg(p).arg(g).arg(pub);
+        shareEdit->setPlainText(shareData);
+    }
+
+    void onGeneratePublicOnly() {
+        bool ok;
+        int p = pEdit->text().toInt(&ok);
+        if (!ok || p <= 0) {
+            QMessageBox::warning(this, "Error", "Enter valid prime number p first.");
+            return;
+        }
+        int g = gEdit->text().toInt(&ok);
+        if (!ok || g <= 0) {
+            QMessageBox::warning(this, "Error", "Enter valid primitive root g first.");
+            return;
+        }
+
+        int priv = dh_generate_random_number(2, p - 2);
+        long long pub = dh_mod_pow(g, priv, p);
+
+        pubKeyEdit->setText(QString::number(pub));
+        secretKeyEdit->setText(QString::number(priv));
+
+        QString shareData = QString("Public key = %1").arg(pub);
+        shareEdit->setPlainText(shareData);
+        // QMessageBox::information(this, "Done", "Public key generated. Share it with sender.");
+    }
+
+    void onEncrypt() {
+        bool ok;
+        int p = pEdit->text().toInt(&ok);
+        if (!ok) return;
+        int priv = secretKeyEdit->text().toInt(&ok);
+        if (!ok) return;
+        long long friendPub = friendPubKeyEdit->text().toLongLong(&ok);
+        if (!ok) return;
+
+        long long shared = dh_mod_pow(friendPub, priv, p);
+        QString key = origKeyEdit->text();
+        if (key.isEmpty()) return;
+
+        char enc[256], hex[512];
+        dh_xor_encrypt_decrypt(key.toUtf8().data(), enc, shared, key.length());
+        dh_binary_to_hex(enc, hex, key.length());
+        encryptedEdit->setText(QString(hex));
+
+        QMessageBox::information(this, "Done",
+                                 QString("Encrypted with shared secret: %1").arg(shared));
+    }
+
+    void onDecrypt() {
+        bool ok;
+        int p = pEdit->text().toInt(&ok);
+        if (!ok) return;
+        int priv = secretKeyEdit->text().toInt(&ok);
+        if (!ok) return;
+        long long friendPub = friendPubKeyEdit->text().toLongLong(&ok);
+        if (!ok) return;
+
+        long long shared = dh_mod_pow(friendPub, priv, p);
+        QString hex = encryptedEdit->text();
+        if (hex.isEmpty()) return;
+
+        int len = hex.length() / 2;
+        char bin[256], dec[256];
+        dh_hex_to_binary(hex.toUtf8().data(), bin, hex.length());
+        dh_xor_encrypt_decrypt(bin, dec, shared, len);
+        decryptedEdit->setText(QString(dec));
+    }
+
+private:
+    QLineEdit *pEdit, *gEdit, *pubKeyEdit, *secretKeyEdit;
+    QTextEdit *shareEdit;
+    QLineEdit *origKeyEdit, *friendPubKeyEdit, *encryptedEdit, *decryptedEdit;
+};
+
+
 // Аудио звонки
 class AudioCallManager : public QObject {
     Q_OBJECT
@@ -1166,43 +1351,8 @@ private slots:
     }
 
     void onKeyExchange() {
-        QString keyExchangePath = QApplication::applicationDirPath() + "/bin/key-exchange.exe";
-        QFileInfo keyExchangeInfo(keyExchangePath);
-
-        if (!keyExchangeInfo.exists()) {
-            keyExchangePath = QApplication::applicationDirPath() + "/key-exchange.exe";
-            keyExchangeInfo.setFile(keyExchangePath);
-
-            if (!keyExchangeInfo.exists()) {
-                QMessageBox::warning(this, "Key Exchange Error",
-                                     "Key exchange utility not found!");
-                return;
-            }
-        }
-
-        // Запускаем через cmd.exe чтобы избежать проблем с консолью
-        QProcess process;
-        process.setWorkingDirectory(keyExchangeInfo.absolutePath());
-
-// Для Windows запускаем через cmd
-#ifdef Q_OS_WIN
-        process.start("cmd.exe", QStringList() << "/c" << "start" << "/wait" << keyExchangeInfo.fileName());
-#else
-        process.start(keyExchangeInfo.absoluteFilePath());
-#endif
-
-        appendChatLine("[Key Exchange] Starting key exchange utility in new window...");
-
-        if (process.waitForStarted(3000)) {
-            // Не ждем завершения - пользователь будет работать в отдельном окне
-            appendChatLine("[Key Exchange] Utility started in separate window");
-            QMessageBox::information(this, "Key Exchange",
-                                     "Key exchange utility started in a separate window.\n"
-                                     "Please follow the instructions in that window.");
-        } else {
-            appendChatLine("[Key Exchange] Failed to start utility");
-            QMessageBox::warning(this, "Key Exchange", "Failed to start key exchange utility.");
-        }
+        KeyExchangeDialog dlg(this);
+        dlg.exec();
     }
 
     void onCreateServer(){
@@ -1305,7 +1455,7 @@ private slots:
 
     void onError(const QString &error){
         QMessageBox::warning(this, "Error", error);
-        statusLabel->setText("Error: " + error.left(20) + "..."); // Ограничиваем длину для статусбара
+        statusLabel->setText("Error: " + error.left(20) + "...");
     }
 
     void refreshContacts(){
@@ -1329,12 +1479,6 @@ private slots:
 
     void onGenKeys(){
         bool ok = backend->generateKeypair((QString)"");   // :toDo Fix workaround: window for file name was deleted but onGenKeys() method is still required
-        // QString out = QFileDialog::getSaveFileName(this, "Save genkey full output to...", QString(), "Text files (*.txt);;All files (*)");
-        // bool ok = backend->generateKeypair(out);
-
-        // if(!ok){
-        //     QMessageBox::warning(this, "Generate Keys", "Failed to generate keypair. Check if fear.exe is in PATH or set CLI path.");
-        // }
     }
 
     void onKeyGenerated(const QString &key){
@@ -1362,7 +1506,7 @@ private slots:
 
         connect(copyBtn, &QPushButton::clicked, this, [keyEdit](){
             QGuiApplication::clipboard()->setText(keyEdit->text());
-            QMessageBox::information(nullptr, "Copied", "Key copied to clipboard");
+            // QMessageBox::information(nullptr, "Copied", "Key copied to clipboard");
         });
 
         connect(saveBtn, &QPushButton::clicked, this, [&dlg, key](){
@@ -1433,7 +1577,7 @@ private:
 
     void createMenus(){
         QMenu *fileMenu = menuBar()->addMenu("File");
-        QAction *setCli = new QAction("Set CLI path...", this);
+        QAction *setCli = new QAction("Set CLI path", this);
         connect(setCli, &QAction::triggered, this, &MainWindow::onSetCliPath);
         fileMenu->addAction(setCli);
         fileMenu->addSeparator();
@@ -1450,23 +1594,22 @@ private:
         connect(serveAct, &QAction::triggered, this, &MainWindow::onCreateServer);
         connMenu->addAction(serveAct);
 
-        // Добавляем меню для аудиозвонков
         QMenu *audioMenu = menuBar()->addMenu("Audio Call");
-        QAction *audioCallAct = new QAction("Start Audio Call", this);
+        QAction *audioCallAct = new QAction("Start audio call", this);
         connect(audioCallAct, &QAction::triggered, this, &MainWindow::onAudioCall);
         audioMenu->addAction(audioCallAct);
 
         QMenu *keysMenu = menuBar()->addMenu("Keys");
-        QAction *genKeys = new QAction("Generate keypair...", this);
+        QAction *genKeys = new QAction("Generate keypair", this);
         connect(genKeys, &QAction::triggered, this, &MainWindow::onGenKeys);
         keysMenu->addAction(genKeys);
-
-        QAction *keyExchange = new QAction("Key exchange", this);
-        connect(keyExchange, &QAction::triggered, this, &MainWindow::onKeyExchange);
-        keysMenu->addAction(keyExchange);
+       
+        QAction *keyExchangeAction = new QAction("Key exchange", this);
+        connect(keyExchangeAction, &QAction::triggered, this, &MainWindow::onKeyExchange);
+        keysMenu->addAction(keyExchangeAction);
 
         QMenu *helpMenu = menuBar()->addMenu("Help");
-        QAction *update = new QAction("Check for Updates", this);
+        QAction *update = new QAction("Check for updates", this);
         connect(update, &QAction::triggered, this, [this](){
             UpdateDialog dialog(this, backend->cliPath);
             dialog.exec();

@@ -24,6 +24,7 @@ set(SOURCES main.cpp)
 add_executable(${PROJECT_NAME}
     ${SOURCES}
     ${RESOURCES_FILES}
+    dh.c dh.h
 )
 
 # Указываем, что это графическое приложение (без консоли)

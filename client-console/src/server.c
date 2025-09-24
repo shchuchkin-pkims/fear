@@ -37,36 +37,59 @@ static int read_frame(sock_t fd, uint8_t **out, size_t *outlen) {
     if (recv_all(fd, hdr, 2) < 0) return -1;
     uint16_t room_len = rd_u16(hdr);
     if (room_len > MAX_ROOM) return -1;
-    uint8_t *buf = (uint8_t*)malloc(2 + room_len + 2 + MAX_NAME + 2 + 24 + 4);
+
+    // временный буфер для header-полей (room + name + nonce)
+    size_t bufsize = 2 + room_len + 2 + MAX_NAME + 2 + crypto_aead_xchacha20poly1305_ietf_NPUBBYTES;
+    uint8_t *buf = (uint8_t*)malloc(bufsize);
     if (!buf) return -1;
     memcpy(buf, hdr, 2);
+
+    // read room + name_len
     if (recv_all(fd, buf + 2, room_len + 2) < 0) { free(buf); return -1; }
     uint16_t name_len = rd_u16(buf + 2 + room_len);
     if (name_len > MAX_NAME) { free(buf); return -1; }
-    // Удалена неиспользуемая переменная off
+
+    // read name
     if (recv_all(fd, buf + 2 + room_len + 2, name_len) < 0) { free(buf); return -1; }
-    uint8_t tail[2 + 4];
-    if (recv_all(fd, tail, 2) < 0) { free(buf); return -1; }
-    uint16_t nonce_len = rd_u16(tail);
+
+    // read nonce_len (2 bytes)
+    uint8_t nlbuf[2];
+    if (recv_all(fd, nlbuf, 2) < 0) { free(buf); return -1; }
+    uint16_t nonce_len = rd_u16(nlbuf);
     if (nonce_len != crypto_aead_xchacha20poly1305_ietf_NPUBBYTES) { free(buf); return -1; }
-    // Удалено объявление неиспользуемой переменной nonce
+
+    // read nonce
     if (recv_all(fd, buf + 2 + room_len + 2 + name_len, nonce_len) < 0) { free(buf); return -1; }
+
+    // read type (1 byte)
+    uint8_t type_buf[1];
+    if (recv_all(fd, type_buf, 1) < 0) { free(buf); return -1; }
+    message_type_t msg_type = (message_type_t)type_buf[0];
+
+    // read clen (4 bytes)
     uint8_t clenbuf[4];
     if (recv_all(fd, clenbuf, 4) < 0) { free(buf); return -1; }
     uint32_t clen = rd_u32(clenbuf);
     if (clen > MAX_FRAME) { free(buf); return -1; }
+
+    // read cipher
     uint8_t *cipher = (uint8_t*)malloc(clen);
     if (!cipher) { free(buf); return -1; }
     if (recv_all(fd, cipher, clen) < 0) { free(buf); free(cipher); return -1; }
 
-    size_t total = 2 + room_len + 2 + name_len + 2 + nonce_len + 4 + clen;
+    // Собираем frame в унифицированном формате:
+    // [2 room_len][room][2 name_len][name][2 nonce_len][nonce][1 type][4 clen][clen cipher]
+    size_t total = 2 + room_len + 2 + name_len + 2 + nonce_len + 1 + 4 + clen;
     uint8_t *frame = (uint8_t*)malloc(total);
     if (!frame) { free(buf); free(cipher); return -1; }
     uint8_t *w = frame;
     wr_u16(w, room_len); w += 2; memcpy(w, buf + 2, room_len); w += room_len;
     wr_u16(w, name_len); w += 2; memcpy(w, buf + 2 + room_len + 2, name_len); w += name_len;
     wr_u16(w, nonce_len); w += 2; memcpy(w, buf + 2 + room_len + 2 + name_len, nonce_len); w += nonce_len;
-    wr_u32(w, clen); w += 4; memcpy(w, cipher, clen);
+    *w++ = (uint8_t)msg_type;
+    wr_u32(w, clen); w += 4;
+    memcpy(w, cipher, clen);
+
     *out = frame;
     *outlen = total;
     free(buf);
@@ -74,10 +97,24 @@ static int read_frame(sock_t fd, uint8_t **out, size_t *outlen) {
     return 0;
 }
 
-static void broadcast(client_t *clients, int *nclients, const char *room, const uint8_t *frame, size_t flen, sock_t from) {
+static void broadcast(client_t *clients, int *nclients, const char *room, 
+                     const uint8_t *frame, size_t flen, sock_t from) {
+    // извлекаем room/name/nonce, чтобы найти offset для type
+    if (flen < 2) return;
+    uint16_t room_len = rd_u16(frame);
+    if (2 + room_len + 2 > flen) return;
+    uint16_t name_len = rd_u16(frame + 2 + room_len);
+    if (2 + room_len + 2 + name_len + 2 > flen) return;
+    uint16_t nonce_len = rd_u16(frame + 2 + room_len + 2 + name_len);
+    size_t type_offset = 2 + room_len + 2 + name_len + 2 + nonce_len;
+    if (type_offset + 1 > flen) return;
+    message_type_t msg_type = (message_type_t)frame[type_offset];
+
     for (int i = 0; i < *nclients; i++) {
         if (clients[i].fd == from) continue;
         if (strcmp(clients[i].room, room) != 0) continue;
+
+        // Можно при необходимости добавить логику фильтрации по типу
         if (send_all(clients[i].fd, frame, flen) < 0) {
             close_socket(clients[i].fd);
             clients[i] = clients[*nclients - 1];
@@ -86,6 +123,7 @@ static void broadcast(client_t *clients, int *nclients, const char *room, const 
         }
     }
 }
+
 
 void run_server(uint16_t port) {
 #ifdef _WIN32

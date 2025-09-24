@@ -37,7 +37,7 @@ if(WIN32)
     set(OPUS_LIBRARY_DIR "${OPUS_ROOT}/build")
     
     set(PORTAUDIO_INCLUDE_DIR "${PORTAUDIO_ROOT}/include")
-    set(PORTAUDIO_LIBRARY_DIR "${PORTAUDIO_ROOT}/build_my")
+    set(PORTAUDIO_LIBRARY_DIR "${PORTAUDIO_ROOT}/build")
 
     # Проверка существования библиотек
     if(NOT EXISTS "${SODIUM_INCLUDE_DIR}")

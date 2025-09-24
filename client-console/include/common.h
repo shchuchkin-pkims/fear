@@ -10,6 +10,10 @@
 #define MAX_FRAME (1 << 20)
 #define DEFAULT_PORT 7777
 
+#define MAX_FILENAME 256
+#define FILE_CHUNK_SIZE (16 * 1024) // 16KB chunks
+#define FILE_MAGIC 0x46494C45 // "FILE" in ASCII
+
 #ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -36,5 +40,13 @@ int recv_all(sock_t fd, void *buf, size_t len);
 int send_all(sock_t fd, const void *buf, size_t len);
 char *b64_encode(const uint8_t *buf, size_t len);
 int b64_decode(const char *b64, uint8_t *out, size_t outlen);
+uint32_t crc32(const uint8_t *data, size_t len);
+
+typedef enum {
+    MSG_TYPE_TEXT = 0,
+    MSG_TYPE_FILE_START = 1,
+    MSG_TYPE_FILE_CHUNK = 2,
+    MSG_TYPE_FILE_END = 3
+} message_type_t;
 
 #endif

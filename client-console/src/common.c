@@ -52,3 +52,15 @@ int b64_decode(const char *b64, uint8_t *out, size_t outlen) {
                          sodium_base64_VARIANT_URLSAFE_NO_PADDING) != 0) return -1;
     return (int)real;
 }
+
+// Функция для вычисления CRC32 (упрощенная версия)
+uint32_t crc32(const uint8_t *data, size_t len) {
+    uint32_t crc = 0xFFFFFFFF;
+    for (size_t i = 0; i < len; i++) {
+        crc ^= data[i];
+        for (int j = 0; j < 8; j++) {
+            crc = (crc >> 1) ^ (0xEDB88320 & -(crc & 1));
+        }
+    }
+    return ~crc;
+}
