@@ -71,11 +71,13 @@ typedef int socket_t;
 #define PKT_VER_AUDIO  0x01
 #define PKT_VER_HELLO  0x7F
 
-/* Nonce для XChaCha20-Poly1305 (24 байта): 16 байт префикс + 8 байт seq */
-#define NONCE_PREFIX_LEN 16
-#define AEAD_NONCE_LEN   crypto_aead_xchacha20poly1305_ietf_NPUBBYTES
-#define AEAD_KEY_LEN     crypto_aead_xchacha20poly1305_ietf_KEYBYTES
-#define AEAD_ABYTES      crypto_aead_xchacha20poly1305_ietf_ABYTES
+/* AES-GCM конфигурация */
+#define AES_GCM_NONCE_LEN crypto_aead_aes256gcm_NPUBBYTES  /* 12 байт */
+#define AES_GCM_KEY_LEN   crypto_aead_aes256gcm_KEYBYTES   /* 32 байта */
+#define AES_GCM_ABYTES    crypto_aead_aes256gcm_ABYTES     /* 16 байт */
+
+/* Nonce для AES-GCM (12 байт): 4 байта префикс + 8 байт seq */
+#define NONCE_PREFIX_LEN 4
 
 /* Небольшая задержка */
 #define PLAYOUT_BUFFER_FRAMES 6
@@ -199,7 +201,7 @@ typedef struct AudioCall {
     struct sockaddr_in peer;
     int peer_set;
 
-    uint8_t key[AEAD_KEY_LEN];
+    uint8_t key[AES_GCM_KEY_LEN];
     uint8_t local_nonce_prefix[NONCE_PREFIX_LEN];
     uint8_t remote_nonce_prefix[NONCE_PREFIX_LEN];
     atomic_int remote_prefix_ready;
@@ -257,7 +259,7 @@ static int handle_hello(AudioCall *c, const uint8_t *buf, size_t len) {
 
 /* --------------------------- AEAD-helpers -------------------------------- */
 
-static void make_nonce(uint8_t out[AEAD_NONCE_LEN],
+static void make_nonce(uint8_t out[AES_GCM_NONCE_LEN],
                        const uint8_t prefix[NONCE_PREFIX_LEN],
                        uint64_t seq)
 {
@@ -269,7 +271,7 @@ static void make_nonce(uint8_t out[AEAD_NONCE_LEN],
 static int encrypt_opus(AudioCall *c, const uint8_t *opus, size_t opus_len,
                         uint8_t *out, size_t *out_len, uint64_t seq)
 {
-    uint8_t nonce[AEAD_NONCE_LEN];
+    uint8_t nonce[AES_GCM_NONCE_LEN];
     make_nonce(nonce, c->local_nonce_prefix, seq);
 
     out[0] = PKT_VER_AUDIO;
@@ -277,7 +279,7 @@ static int encrypt_opus(AudioCall *c, const uint8_t *opus, size_t opus_len,
     memcpy(out + 1, &be, sizeof(be));
 
     unsigned long long clen = 0;
-    if (crypto_aead_xchacha20poly1305_ietf_encrypt(
+    if (crypto_aead_aes256gcm_encrypt(
             out + 1 + sizeof(be), &clen,
             opus, opus_len,
             NULL, 0,
@@ -290,7 +292,7 @@ static int encrypt_opus(AudioCall *c, const uint8_t *opus, size_t opus_len,
 static int decrypt_opus(AudioCall *c, const uint8_t *pkt, size_t pkt_len,
                         uint8_t *opus_out, size_t *opus_len)
 {
-    if (pkt_len < 1 + 8 + AEAD_ABYTES) return -1;
+    if (pkt_len < 1 + 8 + AES_GCM_ABYTES) return -1;
     if (pkt[0] != PKT_VER_AUDIO) return -1;
 
     if (!atomic_load(&c->remote_prefix_ready)) return -2;
@@ -299,11 +301,11 @@ static int decrypt_opus(AudioCall *c, const uint8_t *pkt, size_t pkt_len,
     memcpy(&be_seq, pkt + 1, 8);
     uint64_t seq = ntohll_u64(be_seq);
 
-    uint8_t nonce[AEAD_NONCE_LEN];
+    uint8_t nonce[AES_GCM_NONCE_LEN];
     make_nonce(nonce, c->remote_nonce_prefix, seq);
 
     unsigned long long mlen = 0;
-    if (crypto_aead_xchacha20poly1305_ietf_decrypt(
+    if (crypto_aead_aes256gcm_decrypt(
             opus_out, &mlen,
             NULL,
             pkt + 1 + 8, pkt_len - (1 + 8),
@@ -336,7 +338,7 @@ static THREAD_RET th_send_func(void *arg) {
 
     int16_t pcm[AC_FRAME_SAMPLES];
     uint8_t opus[AC_MAX_OPUS_BYTES];
-    uint8_t packet[1 + 8 + AC_MAX_OPUS_BYTES + AEAD_ABYTES];
+    uint8_t packet[1 + 8 + AC_MAX_OPUS_BYTES + AES_GCM_ABYTES];
 
     while (atomic_load(&c->running)) {
         // Если входной поток недоступен, отправляем тишину
@@ -623,7 +625,7 @@ int audio_call_start(AudioCall **out_call,
                      const char *remote_ip, uint16_t remote_port,
                      uint16_t bind_port,
                      int is_caller,
-                     const uint8_t key[AEAD_KEY_LEN])
+                     const uint8_t key[AES_GCM_KEY_LEN])
 {
     if (!out_call || !key) return -1;
     if (net_init_once() != 0) return -1;
@@ -634,7 +636,7 @@ int audio_call_start(AudioCall **out_call,
 
     AudioCall *c = (AudioCall*)calloc(1, sizeof(AudioCall));
     if (!c) return -1;
-    memcpy(c->key, key, AEAD_KEY_LEN);
+    memcpy(c->key, key, AES_GCM_KEY_LEN);
     randombytes_buf(c->local_nonce_prefix, NONCE_PREFIX_LEN);
     atomic_store(&c->remote_prefix_ready, 0);
     atomic_store(&c->seq_tx, 0);
@@ -853,11 +855,9 @@ static THREAD_RET hub_thread(void *arg) {
         }
         /* Регистрация клиента (или обновление таймера) */
         int idx = hub_find_or_add(h, &src);
-        (void)idx;
-        /* Пересылка полученного пакета всем остальным */
+        if (idx < 0) continue; /* нет места */
+        /* Пересылка всем остальным */
         hub_forward(h, rbuf, (size_t)n, &src);
-        /* Периодическая очистка */
-        hub_prune(h);
     }
 #ifdef _WIN32
     return 0;
@@ -866,11 +866,11 @@ static THREAD_RET hub_thread(void *arg) {
 #endif
 }
 
-static int hub_start(Hub *h, uint16_t bind_port) {
+static int hub_main(uint16_t bind_port) {
     if (net_init_once() != 0) return -1;
-    h->sock = (socket_t)socket(AF_INET, SOCK_DGRAM, 0);
-    if (h->sock == (socket_t)SOCK_ERR) {
-        fprintf(stderr, "[hub] socket() failed\n");
+    socket_t sock = (socket_t)socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock == (socket_t)SOCK_ERR) {
+        fprintf(stderr, "hub: socket() failed\n");
         return -1;
     }
     struct sockaddr_in local;
@@ -878,189 +878,171 @@ static int hub_start(Hub *h, uint16_t bind_port) {
     local.sin_family = AF_INET;
     local.sin_addr.s_addr = htonl(INADDR_ANY);
     local.sin_port = htons(bind_port);
-    if (bind(h->sock, (struct sockaddr*)&local, sizeof(local)) == SOCK_ERR) {
-        fprintf(stderr, "[hub] bind() failed (port %u)\n", bind_port);
-        CLOSESOCK(h->sock);
+    if (bind(sock, (struct sockaddr*)&local, sizeof(local)) == SOCK_ERR) {
+        fprintf(stderr, "hub: bind() failed (port %u)\n", bind_port);
+        CLOSESOCK(sock);
         return -1;
     }
-    hub_init(h, h->sock);
+    Hub h;
+    hub_init(&h, sock);
+    fprintf(stderr, "[hub] listening on *:%u\n", bind_port);
+
 #ifdef _WIN32
-    h->th = CreateThread(NULL, 0, hub_thread, h, 0, NULL);
-    if (!h->th) {
-        CLOSESOCK(h->sock);
+    h.th = CreateThread(NULL, 0, hub_thread, &h, 0, NULL);
+    if (!h.th) {
+        CLOSESOCK(sock);
         return -1;
     }
 #else
-    if (pthread_create(&h->th, NULL, hub_thread, h) != 0) {
-        CLOSESOCK(h->sock);
+    if (pthread_create(&h.th, NULL, hub_thread, &h) != 0) {
+        CLOSESOCK(sock);
         return -1;
     }
 #endif
+
+    fprintf(stderr, "[hub] running. Press Ctrl+C to stop.\n");
+    while (atomic_load(&h.running)) {
+#ifdef _WIN32
+        if (GetAsyncKeyState(VK_CANCEL) || GetAsyncKeyState(VK_ESCAPE)) break;
+#else
+        /* Ctrl+C в POSIX */
+        msleep(100);
+#endif
+    }
+    atomic_store(&h.running, 0);
+#ifdef _WIN32
+    WaitForSingleObject(h.th, INFINITE);
+    CloseHandle(h.th);
+#else
+    pthread_join(h.th, NULL);
+#endif
+    CLOSESOCK(sock);
+    fprintf(stderr, "[hub] stopped.\n");
     return 0;
 }
 
-static void hub_stop(Hub *h) {
-    if (!h) return;
-    atomic_store(&h->running, 0);
-#ifdef _WIN32
-    if (h->th) { WaitForSingleObject(h->th, INFINITE); CloseHandle(h->th); }
-#else
-    if (h->th) pthread_join(h->th, NULL);
-#endif
-    if (h->sock) CLOSESOCK(h->sock);
-}
+/* ------------------------------- main ------------------------------------ */
 
-/* ------------------------------- main ----------------------------------- */
+static volatile atomic_int g_sigint = 0;
 
-static volatile int want_quit = 0;
 #ifdef _WIN32
-BOOL WINAPI console_handler(DWORD signal) {
-    if (signal == CTRL_C_EVENT) want_quit = 1;
-    return TRUE;
+static BOOL WINAPI ctrlc_handler(DWORD ev) {
+    if (ev == CTRL_C_EVENT) {
+        atomic_store(&g_sigint, 1);
+        return TRUE;
+    }
+    return FALSE;
 }
 #else
-static void sigint_handler(int signo) { (void)signo; want_quit = 1; }
+static void ctrlc_handler(int sig) {
+    (void)sig;
+    atomic_store(&g_sigint, 1);
+}
 #endif
+
+static void setup_signal(void) {
+#ifdef _WIN32
+    SetConsoleCtrlHandler(ctrlc_handler, TRUE);
+#else
+    struct sigaction sa;
+    sa.sa_handler = ctrlc_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGINT, &sa, NULL);
+#endif
+}
 
 int main(int argc, char **argv) {
     if (argc < 2) {
         fprintf(stderr,
-            "Usage:\n"
-            "  %s genkey\n"
-            "  %s call <remote_ip> <remote_port> <hexkey32> [local_bind_port]\n"
-            "  %s listen <local_bind_port> <hexkey32>\n"
-            "  %s hub <bind_port>     # run relay hub on server (no audio)\n", argv[0], argv[0], argv[0], argv[0]);
+                "Usage:\n"
+                "  %s genkey\n"
+                "  %s call <remote_ip> <remote_port> <hexkey32> [local_bind_port]\n"
+                "  %s listen <local_bind_port> <hexkey32>\n"
+                "  %s hub <bind_port>\n",
+                argv[0], argv[0], argv[0], argv[0]);
         return 1;
     }
 
     if (strcmp(argv[1], "genkey") == 0) {
         if (sodium_init() < 0) return 1;
-        uint8_t key[AEAD_KEY_LEN];
-        randombytes_buf(key, AEAD_KEY_LEN);
-        print_hex(key, AEAD_KEY_LEN);
+        uint8_t key[AES_GCM_KEY_LEN];
+        randombytes_buf(key, sizeof(key));
+        print_hex(key, sizeof(key));
         return 0;
     }
 
-    int is_caller = 0;
-    const char *remote_ip = NULL;
-    uint16_t remote_port = 0;
-    uint16_t bind_port = 0;
-    uint8_t key[AEAD_KEY_LEN];
+    if (strcmp(argv[1], "hub") == 0) {
+        if (argc < 3) {
+            fprintf(stderr, "Usage: %s hub <bind_port>\n", argv[0]);
+            return 1;
+        }
+        uint16_t port = (uint16_t)atoi(argv[2]);
+        return hub_main(port);
+    }
 
     if (strcmp(argv[1], "call") == 0) {
         if (argc < 5) {
-            fprintf(stderr, "call usage: %s call <remote_ip> <remote_port> <hexkey32> [local_bind_port]\n", argv[0]);
+            fprintf(stderr, "Usage: %s call <remote_ip> <remote_port> <hexkey32> [local_bind_port]\n", argv[0]);
             return 1;
         }
-        is_caller = 1;
-        remote_ip = argv[2];
-        remote_port = (uint16_t)atoi(argv[3]);
-        if (hex2bytes(argv[4], key, AEAD_KEY_LEN) != 0) {
-            fprintf(stderr, "Key must be %d-byte hex (64 hex chars)\n", AEAD_KEY_LEN);
+        const char *ip = argv[2];
+        uint16_t rport = (uint16_t)atoi(argv[3]);
+        const char *hexkey = argv[4];
+        uint16_t lport = (argc >= 6) ? (uint16_t)atoi(argv[5]) : 0;
+
+        uint8_t key[AES_GCM_KEY_LEN];
+        if (hex2bytes(hexkey, key, sizeof(key)) != 0) {
+            fprintf(stderr, "Invalid key (must be 64 hex chars)\n");
             return 1;
         }
-        if (argc >= 6) bind_port = (uint16_t)atoi(argv[5]); else bind_port = 0;
-    } else if (strcmp(argv[1], "listen") == 0) {
-        if (argc < 4) {
-            fprintf(stderr, "listen usage: %s listen <local_bind_port> <hexkey32>\n", argv[0]);
+
+        AudioCall *call = NULL;
+        if (audio_call_start(&call, ip, rport, lport, 1, key) != 0) {
+            fprintf(stderr, "Failed to start call\n");
             return 1;
         }
-        is_caller = 0;
-        bind_port = (uint16_t)atoi(argv[2]);
-        if (hex2bytes(argv[3], key, AEAD_KEY_LEN) != 0) {
-            fprintf(stderr, "Key must be %d-byte hex (64 hex chars)\n", AEAD_KEY_LEN);
-            return 1;
+
+        setup_signal();
+        printf("Calling %s:%u (press Ctrl+C to stop)\n", ip, rport);
+        while (!atomic_load(&g_sigint)) {
+            msleep(100);
         }
-    } else if (strcmp(argv[1], "hub") == 0) {
-        if (argc < 3) {
-            fprintf(stderr, "hub usage: %s hub <bind_port>\n", argv[0]);
-            return 1;
-        }
-        bind_port = (uint16_t)atoi(argv[2]);
-        /* Запустим режим ретранслятора (hub) */
-#ifdef _WIN32
-        SetConsoleCtrlHandler(console_handler, TRUE);
-#else
-        signal(SIGINT, sigint_handler);
-#endif
-        Hub hub;
-        if (hub_start(&hub, bind_port) != 0) {
-            fprintf(stderr, "hub_start failed\n");
-            return 1;
-        }
-        fprintf(stderr, "Hub started on port %u. Relaying packets to participants.\n", (unsigned)bind_port);
-        fprintf(stderr, "Press Ctrl+C or enter 'q' + Enter to stop.\n");
-        /* Ожидание завершения (sigint или 'q') */
-        while (!want_quit) {
-#ifndef _WIN32
-            fd_set rfds;
-            struct timeval tv;
-            FD_ZERO(&rfds);
-            FD_SET(STDIN_FILENO, &rfds);
-            tv.tv_sec = 0;
-            tv.tv_usec = 200000;
-            int rv = select(STDIN_FILENO+1, &rfds, NULL, NULL, &tv);
-            if (rv > 0 && FD_ISSET(STDIN_FILENO, &rfds)) {
-                char buf[16];
-                if (fgets(buf, sizeof(buf), stdin) != NULL) {
-                    if (buf[0] == 'q' || buf[0] == 'Q') { want_quit = 1; break; }
-                }
-            }
-#else
-            Sleep(200);
-#endif
-        }
-        fprintf(stderr, "Stopping hub...\n");
-        hub_stop(&hub);
-        fprintf(stderr, "Hub stopped.\n");
+        audio_call_stop(call);
+        printf("Call ended\n");
         return 0;
-    } else {
-        fprintf(stderr, "Unknown command: %s\n", argv[1]);
-        return 1;
     }
 
-#ifdef _WIN32
-    SetConsoleCtrlHandler(console_handler, TRUE);
-#else
-    signal(SIGINT, sigint_handler);
-#endif
-
-    AudioCall *call = NULL;
-    if (audio_call_start(&call, remote_ip, remote_port, bind_port, is_caller, key) != 0) {
-        fprintf(stderr, "audio_call_start failed\n");
-        return 1;
-    }
-
-    printf("Audio call started. Mode: %s. Local bind port: %u\n",
-           is_caller ? "caller" : "callee", (unsigned)bind_port);
-    if (is_caller) printf("Will send to %s:%u\n", remote_ip, (unsigned)remote_port);
-    printf("Press Ctrl+C or enter 'q' + Enter to stop.\n");
-
-    /* ждем сигнала завершения или пользовательского ввода */
-    while (!want_quit) {
-        /* также позволяем ввести q + Enter для остановки */
-        fd_set rfds;
-        struct timeval tv;
-        FD_ZERO(&rfds);
-#ifdef _WIN32
-        /* простая поллинг-реализация */
-        Sleep(200);
-#else
-        FD_SET(STDIN_FILENO, &rfds);
-        tv.tv_sec = 0;
-        tv.tv_usec = 200000;
-        int rv = select(STDIN_FILENO+1, &rfds, NULL, NULL, &tv);
-        if (rv > 0 && FD_ISSET(STDIN_FILENO, &rfds)) {
-            char buf[16];
-            if (fgets(buf, sizeof(buf), stdin) != NULL) {
-                if (buf[0] == 'q' || buf[0] == 'Q') { want_quit = 1; break; }
-            }
+    if (strcmp(argv[1], "listen") == 0) {
+        if (argc < 4) {
+            fprintf(stderr, "Usage: %s listen <local_bind_port> <hexkey32>\n", argv[0]);
+            return 1;
         }
-#endif
+        uint16_t lport = (uint16_t)atoi(argv[2]);
+        const char *hexkey = argv[3];
+
+        uint8_t key[AES_GCM_KEY_LEN];
+        if (hex2bytes(hexkey, key, sizeof(key)) != 0) {
+            fprintf(stderr, "Invalid key (must be 64 hex chars)\n");
+            return 1;
+        }
+
+        AudioCall *call = NULL;
+        if (audio_call_start(&call, NULL, 0, lport, 0, key) != 0) {
+            fprintf(stderr, "Failed to start listener\n");
+            return 1;
+        }
+
+        setup_signal();
+        printf("Listening on *:%u (press Ctrl+C to stop)\n", lport);
+        while (!atomic_load(&g_sigint)) {
+            msleep(100);
+        }
+        audio_call_stop(call);
+        printf("Listener stopped\n");
+        return 0;
     }
 
-    printf("Stopping call...\n");
-    audio_call_stop(call);
-    printf("Stopped.\n");
-    return 0;
+    fprintf(stderr, "Unknown command: %s\n", argv[1]);
+    return 1;
 }

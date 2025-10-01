@@ -53,7 +53,7 @@ int b64_decode(const char *b64, uint8_t *out, size_t outlen) {
     return (int)real;
 }
 
-// Функция для вычисления CRC32 (упрощенная версия)
+// Функция для вычисления CRC32
 uint32_t crc32(const uint8_t *data, size_t len) {
     uint32_t crc = 0xFFFFFFFF;
     for (size_t i = 0; i < len; i++) {
@@ -63,4 +63,27 @@ uint32_t crc32(const uint8_t *data, size_t len) {
         }
     }
     return ~crc;
+}
+
+// AES-GCM encryption using libsodium
+int aes_gcm_encrypt(const uint8_t *plaintext, size_t plaintext_len,
+                   const uint8_t *additional_data, size_t additional_data_len,
+                   const uint8_t *nonce, const uint8_t *key,
+                   uint8_t *ciphertext, unsigned long long *ciphertext_len) {
+    return crypto_aead_aes256gcm_encrypt(ciphertext, ciphertext_len,
+                                        plaintext, plaintext_len,
+                                        additional_data, additional_data_len,
+                                        NULL, nonce, key);
+}
+
+// AES-GCM decryption using libsodium
+int aes_gcm_decrypt(const uint8_t *ciphertext, size_t ciphertext_len,
+                   const uint8_t *additional_data, size_t additional_data_len,
+                   const uint8_t *nonce, const uint8_t *key,
+                   uint8_t *plaintext, unsigned long long *plaintext_len) {
+    return crypto_aead_aes256gcm_decrypt(plaintext, plaintext_len,
+                                        NULL,
+                                        ciphertext, ciphertext_len,
+                                        additional_data, additional_data_len,
+                                        nonce, key);
 }

@@ -6,7 +6,7 @@
 #include <string.h>
 #include <sodium.h>
 
-#define PROGRAM_VERSION "0.3.0"
+#define PROGRAM_VERSION "0.4.0"
 
 /**
  * @brief Print usage into console
@@ -46,7 +46,7 @@ int main(int argc, char **argv) {
     }
     if (strcmp(argv[1], "genkey") == 0) {
         if (sodium_init() < 0) { fprintf(stderr, "libsodium init failed\n"); return 1; }
-        uint8_t key[crypto_aead_xchacha20poly1305_ietf_KEYBYTES];
+        uint8_t key[CRYPTO_KEYBYTES];
         randombytes_buf(key, sizeof key);
         char *b64 = b64_encode(key, sizeof key);
         if (!b64) { fprintf(stderr, "oom\n"); return 1; }
@@ -76,9 +76,9 @@ int main(int argc, char **argv) {
         if (!name) name = "anon";
         if (strlen(room) > MAX_ROOM - 1) { fprintf(stderr, "room too long (max %d)\n", MAX_ROOM - 1); return 1; }
         if (strlen(name) > MAX_NAME - 1) { fprintf(stderr, "name too long (max %d)\n", MAX_NAME - 1); return 1; }
-        uint8_t key[crypto_aead_xchacha20poly1305_ietf_KEYBYTES];
+        uint8_t key[CRYPTO_KEYBYTES];
         int klen = b64_decode(b64, key, sizeof key);
-        if (klen != crypto_aead_xchacha20poly1305_ietf_KEYBYTES) {
+        if (klen != CRYPTO_KEYBYTES) {
             fprintf(stderr, "invalid key (must be 32 bytes base64 urlsafe)\n");
             return 1;
         }

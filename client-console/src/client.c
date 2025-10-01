@@ -25,15 +25,22 @@ static sock_t dial_tcp(const char *host, uint16_t port) {
 #endif
     char portstr[16];
     snprintf(portstr, sizeof(portstr), "%u", port);
+    
     struct addrinfo hints;
+    struct addrinfo *res = NULL;
+    struct addrinfo *ai;
+    sock_t s = -1;
+    
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
-    struct addrinfo *res = NULL;
+    
     int e = getaddrinfo(host, portstr, &hints, &res);
-    if (e != 0) { fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(e)); exit(1); }
-    sock_t s = -1;
-    struct addrinfo *ai;
+    if (e != 0) { 
+        fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(e)); 
+        exit(1); 
+    }
+    
     for (ai = res; ai; ai = ai->ai_next) {
         s = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
         if (s < 0) continue;
@@ -42,6 +49,7 @@ static sock_t dial_tcp(const char *host, uint16_t port) {
         s = -1;
     }
     freeaddrinfo(res);
+    
     if (s < 0) die("connect");
     return s;
 }
@@ -63,7 +71,7 @@ int send_file_message(sock_t s, const char *room, const char *name,
                      const char *filename, size_t file_size, uint32_t crc) {
     uint16_t room_len = (uint16_t)strlen(room);
     uint16_t name_len = (uint16_t)strlen(name);
-    uint8_t nonce[crypto_aead_xchacha20poly1305_ietf_NPUBBYTES];
+    uint8_t nonce[CRYPTO_NPUBBYTES];
     randombytes_buf(nonce, sizeof nonce);
 
     // Собираем payload (plain), в котором будут метаданные + данные
@@ -108,24 +116,25 @@ int send_file_message(sock_t s, const char *room, const char *name,
     wr_u16(aw, name_len); aw += 2; memcpy(aw, name, name_len);
 
     // Шифруем
-    size_t cmax = payload_len + crypto_aead_xchacha20poly1305_ietf_ABYTES;
+    size_t cmax = payload_len + CRYPTO_ABYTES;
     uint8_t *cipher = (uint8_t*)malloc(cmax);
     if (!cipher) { free(ad); free(payload); return -1; }
+    
     unsigned long long clen = 0;
-    crypto_aead_xchacha20poly1305_ietf_encrypt(cipher, &clen,
-                                              payload, payload_len,
-                                              ad, ad_len, NULL,
-                                              nonce, key);
+    if (aes_gcm_encrypt(payload, payload_len, ad, ad_len, nonce, key, cipher, &clen) != 0) {
+        free(ad); free(cipher); free(payload);
+        return -1;
+    }
 
     // Формируем финальный frame
-    size_t flen = 2 + room_len + 2 + name_len + 2 + sizeof(nonce) + 1 + 4 + (size_t)clen;
+    size_t flen = 2 + room_len + 2 + name_len + 2 + CRYPTO_NPUBBYTES + 1 + 4 + (size_t)clen;
     uint8_t *frame = (uint8_t*)malloc(flen);
     if (!frame) { free(ad); free(cipher); free(payload); return -1; }
 
     uint8_t *w = frame;
     wr_u16(w, room_len); w += 2; memcpy(w, room, room_len); w += room_len;
     wr_u16(w, name_len); w += 2; memcpy(w, name, name_len); w += name_len;
-    wr_u16(w, (uint16_t)sizeof(nonce)); w += 2; memcpy(w, nonce, sizeof(nonce)); w += sizeof(nonce);
+    wr_u16(w, (uint16_t)CRYPTO_NPUBBYTES); w += 2; memcpy(w, nonce, CRYPTO_NPUBBYTES); w += CRYPTO_NPUBBYTES;
     *w++ = (uint8_t)type;
     wr_u32(w, (uint32_t)clen); w += 4;
     memcpy(w, cipher, clen);
@@ -166,8 +175,14 @@ void handle_file_transfer(const char *filename, const uint8_t key[32],
         return;
     }
 
-    fread(file_data, 1, file_size, file);
+    size_t bytes_read = fread(file_data, 1, file_size, file);
     fclose(file);
+
+    if (bytes_read != file_size) {
+        printf("File read error: expected %zu bytes, got %zu\n", file_size, bytes_read);
+        free(file_data);
+        return;
+    }
 
     uint32_t file_crc = crc32(file_data, file_size);
 
@@ -261,6 +276,10 @@ void receive_file(const char *filename, size_t total_size,
 void handle_file_message(const uint8_t *plain, size_t plen, message_type_t type,
                         const char *room_in, const char *sender_name,
                         const uint8_t *key, const char *my_name) {
+    // Помечаем неиспользуемые параметры чтобы избежать warnings
+    (void)room_in;
+    (void)key;
+    
     if (strcmp(sender_name, my_name) == 0) return; // свои пропускаем
 
     switch (type) {
@@ -324,7 +343,7 @@ int send_ciphertext(sock_t s, const char *room, const char *name, const uint8_t 
                    const uint8_t *plaintext, size_t plen) {
     uint16_t room_len = (uint16_t)strlen(room);
     uint16_t name_len = (uint16_t)strlen(name);
-    uint8_t nonce[crypto_aead_xchacha20poly1305_ietf_NPUBBYTES];
+    uint8_t nonce[CRYPTO_NPUBBYTES];
     randombytes_buf(nonce, sizeof nonce);
 
     size_t ad_len = room_len + name_len + 2 + 2;
@@ -334,27 +353,32 @@ int send_ciphertext(sock_t s, const char *room, const char *name, const uint8_t 
     wr_u16(w, room_len); w += 2; memcpy(w, room, room_len); w += room_len;
     wr_u16(w, name_len); w += 2; memcpy(w, name, name_len);
 
-    size_t cmax = plen + crypto_aead_xchacha20poly1305_ietf_ABYTES;
+    size_t cmax = plen + CRYPTO_ABYTES;
     uint8_t *cipher = (uint8_t*)malloc(cmax);
     if (!cipher) { free(ad); return -1; }
+    
     unsigned long long clen = 0;
-    crypto_aead_xchacha20poly1305_ietf_encrypt(cipher, &clen, plaintext, plen, ad, ad_len, NULL, nonce, key);
+    if (aes_gcm_encrypt(plaintext, plen, ad, ad_len, nonce, key, cipher, &clen) != 0) {
+        free(ad); free(cipher);
+        return -1;
+    }
 
-    size_t flen = 2 + room_len + 2 + name_len + 2 + sizeof(nonce) + 1 + 4 + (size_t)clen;
+    size_t flen = 2 + room_len + 2 + name_len + 2 + CRYPTO_NPUBBYTES + 1 + 4 + (size_t)clen;
     uint8_t *frame = (uint8_t*)malloc(flen);
     if (!frame) { free(ad); free(cipher); return -1; }
     w = frame;
     wr_u16(w, room_len); w += 2; memcpy(w, room, room_len); w += room_len;
     wr_u16(w, name_len); w += 2; memcpy(w, name, name_len); w += name_len;
-    wr_u16(w, (uint16_t)sizeof(nonce)); w += 2;
-    memcpy(w, nonce, sizeof(nonce)); w += sizeof(nonce);
+    wr_u16(w, (uint16_t)CRYPTO_NPUBBYTES); w += 2;
+    memcpy(w, nonce, CRYPTO_NPUBBYTES); w += CRYPTO_NPUBBYTES;
 
-    *w++ = (uint8_t)MSG_TYPE_TEXT;   // <-- добавляем тип сообщения
+    *w++ = (uint8_t)MSG_TYPE_TEXT;
 
     wr_u32(w, (uint32_t)clen); w += 4;
     memcpy(w, cipher, clen);
 
     int rc = send_all(s, frame, flen);
+
     free(ad);
     free(cipher);
     free(frame);
@@ -383,8 +407,8 @@ int recv_and_decrypt(sock_t s, const char *room, const uint8_t *key, const char 
     uint8_t npbuf[2];
     if (recv_all(s, npbuf, 2) < 0) { free(room_in); free(name); return -1; }
     uint16_t nonce_len = rd_u16(npbuf);
-    if (nonce_len != crypto_aead_xchacha20poly1305_ietf_NPUBBYTES) { free(room_in); free(name); return -1; }
-    uint8_t nonce[crypto_aead_xchacha20poly1305_ietf_NPUBBYTES];
+    if (nonce_len != CRYPTO_NPUBBYTES) { free(room_in); free(name); return -1; }
+    uint8_t nonce[CRYPTO_NPUBBYTES];
     if (recv_all(s, nonce, nonce_len) < 0) { free(room_in); free(name); return -1; }
 
     // type
@@ -411,10 +435,11 @@ int recv_and_decrypt(sock_t s, const char *room, const uint8_t *key, const char 
     int same_room = (strcmp(room, room_in) == 0);
     uint8_t *plain = (uint8_t*)malloc(clen);
     if (!plain) { free(room_in); free(name); free(cipher); free(ad); return -1; }
+    
     unsigned long long plen = 0;
     int ok = -1;
     if (same_room) {
-        ok = crypto_aead_xchacha20poly1305_ietf_decrypt(plain, &plen, NULL, cipher, clen, ad, ad_len, nonce, key);
+        ok = aes_gcm_decrypt(cipher, clen, ad, ad_len, nonce, key, plain, &plen);
     }
 
     if (!same_room || ok != 0 || strcmp(name, myname) == 0) {
@@ -432,7 +457,7 @@ int recv_and_decrypt(sock_t s, const char *room, const uint8_t *key, const char 
     } else if (msg_type >= MSG_TYPE_FILE_START && msg_type <= MSG_TYPE_FILE_END) {
         handle_file_message(plain, (size_t)plen, msg_type, room_in, name, key, myname);
     } else {
-        printf("[%s] %s: unknown message type %d\n", name, msg_type);
+        printf("[%s] %s: unknown message type %d\n", name, (int)msg_type);
     }
 
     free(room_in);

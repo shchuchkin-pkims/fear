@@ -1,3 +1,5 @@
+#include <QKeyEvent>
+#include <QFontDialog> 
 #include <QApplication>
 #include <QMainWindow>
 #include <QSplitter>
@@ -35,187 +37,253 @@
 #include <QFormLayout>
 #include <QIcon>
 
-#include "dh.h"
+// #include "dh.h"
+#include "key_exchange.h"
 
 class KeyExchangeDialog : public QDialog {
     Q_OBJECT
 public:
     explicit KeyExchangeDialog(QWidget *parent = nullptr) : QDialog(parent) {
-        setWindowTitle("Diffie-Hellman Key Exchange");
+        setWindowTitle("Secure Key Exchange");
         setMinimumSize(600, 500);
-        srand(time(NULL));
+        
+        m_keyExchange = new KeyExchange(this);
 
         QVBoxLayout *mainLayout = new QVBoxLayout(this);
 
-        // Parameters
-        QGroupBox *paramsGroup = new QGroupBox("Parameters", this);
-        QFormLayout *paramsLayout = new QFormLayout(paramsGroup);
-        pEdit = new QLineEdit(paramsGroup);
-        gEdit = new QLineEdit(paramsGroup);
-        pubKeyEdit = new QLineEdit(paramsGroup);
-
+        // Key pair section
+        QGroupBox *keysGroup = new QGroupBox("Key Pair", this);
+        QFormLayout *keysLayout = new QFormLayout(keysGroup);
+        
+        m_publicKeyEdit = new QLineEdit(keysGroup);
+        m_publicKeyEdit->setReadOnly(true);
+        m_publicKeyEdit->setPlaceholderText("Public key will appear here after generation");
+        
+        m_secretKeyEdit = new QLineEdit(keysGroup);
+        m_secretKeyEdit->setEchoMode(QLineEdit::Password);
+        m_secretKeyEdit->setPlaceholderText("Secret key will appear here after generation");
+        
         QHBoxLayout *secretLayout = new QHBoxLayout();
-        secretKeyEdit = new QLineEdit(paramsGroup);
-        secretKeyEdit->setEchoMode(QLineEdit::Password);
-        QPushButton *showBtn = new QPushButton("Show", paramsGroup);
-        secretLayout->addWidget(secretKeyEdit);
-        secretLayout->addWidget(showBtn);
+        secretLayout->addWidget(m_secretKeyEdit);
+        m_showSecretBtn = new QPushButton("Show", keysGroup);
+        secretLayout->addWidget(m_showSecretBtn);
 
-        paramsLayout->addRow("Prime p:", pEdit);
-        paramsLayout->addRow("Primitive root g:", gEdit);
-        paramsLayout->addRow("Public key:", pubKeyEdit);
-        paramsLayout->addRow("Secret key (keep safe!):", secretLayout);
-        mainLayout->addWidget(paramsGroup);
+        keysLayout->addRow("Public key:", m_publicKeyEdit);
+        keysLayout->addRow("Secret key (keep safe!):", secretLayout);
+        mainLayout->addWidget(keysGroup);
 
         // Data to share
         QGroupBox *shareGroup = new QGroupBox("Data to share with friend", this);
         QVBoxLayout *shareLayout = new QVBoxLayout(shareGroup);
-        shareEdit = new QTextEdit(shareGroup);
-        shareEdit->setReadOnly(true);
+        m_shareEdit = new QTextEdit(shareGroup);
+        m_shareEdit->setReadOnly(true);
+        m_shareEdit->setPlaceholderText("Public key and encrypted messages will appear here");
         QPushButton *copyBtn = new QPushButton("Copy to clipboard", shareGroup);
-        shareLayout->addWidget(shareEdit);
+        shareLayout->addWidget(m_shareEdit);
         shareLayout->addWidget(copyBtn);
         mainLayout->addWidget(shareGroup);
 
-        // Encrypted/Decrypted key
-        QGroupBox *encGroup = new QGroupBox("Encryption", this);
-        QFormLayout *encLayout = new QFormLayout(encGroup);
-        origKeyEdit = new QLineEdit(encGroup);
-        friendPubKeyEdit = new QLineEdit(encGroup);
-        encryptedEdit = new QLineEdit(encGroup);
-        decryptedEdit = new QLineEdit(encGroup);
-        encLayout->addRow("Key to send:", origKeyEdit);
-        encLayout->addRow("Friend's public key:", friendPubKeyEdit);
-        encLayout->addRow("Encrypted (hex):", encryptedEdit);
-        encLayout->addRow("Decrypted:", decryptedEdit);
-        mainLayout->addWidget(encGroup);
+        // Encryption section
+        QGroupBox *encryptGroup = new QGroupBox("Encryption", this);
+        QFormLayout *encryptLayout = new QFormLayout(encryptGroup);
+        
+        m_messageEdit = new QLineEdit(encryptGroup);
+        m_messageEdit->setPlaceholderText("Enter message to encrypt");
+        
+        m_friendPublicKeyEdit = new QLineEdit(encryptGroup);
+        m_friendPublicKeyEdit->setPlaceholderText("Enter friend's public key (64 hex characters)");
+        
+        m_encryptedEdit = new QLineEdit(encryptGroup);
+        m_encryptedEdit->setReadOnly(true);
+        m_encryptedEdit->setPlaceholderText("Encrypted message will appear here");
+        
+        encryptLayout->addRow("Message to send:", m_messageEdit);
+        encryptLayout->addRow("Friend's public key:", m_friendPublicKeyEdit);
+        encryptLayout->addRow("Encrypted (hex):", m_encryptedEdit);
+        mainLayout->addWidget(encryptGroup);
+
+        // Decryption section
+        QGroupBox *decryptGroup = new QGroupBox("Decryption", this);
+        QFormLayout *decryptLayout = new QFormLayout(decryptGroup);
+        
+        m_encryptedInputEdit = new QLineEdit(decryptGroup);
+        m_encryptedInputEdit->setPlaceholderText("Paste encrypted message here (hex format)");
+        
+        m_senderPublicKeyEdit = new QLineEdit(decryptGroup);
+        m_senderPublicKeyEdit->setPlaceholderText("Enter sender's public key (64 hex characters)");
+        
+        m_decryptedEdit = new QLineEdit(decryptGroup);
+        m_decryptedEdit->setReadOnly(true);
+        m_decryptedEdit->setPlaceholderText("Decrypted message will appear here");
+        
+        decryptLayout->addRow("Encrypted message:", m_encryptedInputEdit);
+        decryptLayout->addRow("Sender's public key:", m_senderPublicKeyEdit);
+        decryptLayout->addRow("Decrypted:", m_decryptedEdit);
+        mainLayout->addWidget(decryptGroup);
 
         // Buttons
         QHBoxLayout *btnLayout = new QHBoxLayout();
-        QPushButton *genBtn = new QPushButton("Generate parameters", this);
-        QPushButton *genPubBtn = new QPushButton("Generate public key", this);
-        QPushButton *encryptBtn = new QPushButton("Encrypt", this);
-        QPushButton *decryptBtn = new QPushButton("Decrypt", this);
+        m_generateKeysBtn = new QPushButton("Generate Key Pair", this);
+        m_encryptBtn = new QPushButton("Encrypt", this);
+        m_decryptBtn = new QPushButton("Decrypt", this);
         QPushButton *closeBtn = new QPushButton("Close", this);
-        btnLayout->addWidget(genBtn);
-        btnLayout->addWidget(genPubBtn);
-        btnLayout->addWidget(encryptBtn);
-        btnLayout->addWidget(decryptBtn);
+        
+        m_encryptBtn->setEnabled(false);
+        m_decryptBtn->setEnabled(false);
+        
+        btnLayout->addWidget(m_generateKeysBtn);
+        btnLayout->addWidget(m_encryptBtn);
+        btnLayout->addWidget(m_decryptBtn);
         btnLayout->addStretch();
         btnLayout->addWidget(closeBtn);
         mainLayout->addLayout(btnLayout);
 
-        // === Connections ===
+        // Status label
+        m_statusLabel = new QLabel("Ready to generate keys", this);
+        mainLayout->addWidget(m_statusLabel);
+
+        // Connections
         connect(copyBtn, &QPushButton::clicked, this, [this]() {
-            QGuiApplication::clipboard()->setText(shareEdit->toPlainText());
+            QGuiApplication::clipboard()->setText(m_shareEdit->toPlainText());
             QMessageBox::information(this, "Copied", "Shared data copied to clipboard.");
         });
-        connect(genBtn, &QPushButton::clicked, this, &KeyExchangeDialog::onGenerate);
-        connect(genPubBtn, &QPushButton::clicked, this, &KeyExchangeDialog::onGeneratePublicOnly);
-        connect(encryptBtn, &QPushButton::clicked, this, &KeyExchangeDialog::onEncrypt);
-        connect(decryptBtn, &QPushButton::clicked, this, &KeyExchangeDialog::onDecrypt);
+        
+        connect(m_generateKeysBtn, &QPushButton::clicked, this, &KeyExchangeDialog::onGenerateKeys);
+        connect(m_encryptBtn, &QPushButton::clicked, this, &KeyExchangeDialog::onEncrypt);
+        connect(m_decryptBtn, &QPushButton::clicked, this, &KeyExchangeDialog::onDecrypt);
         connect(closeBtn, &QPushButton::clicked, this, &QDialog::accept);
-
-        // Show/Hide secret key
-        connect(showBtn, &QPushButton::clicked, this, [this, showBtn]() {
-            if (secretKeyEdit->echoMode() == QLineEdit::Password) {
-                secretKeyEdit->setEchoMode(QLineEdit::Normal);
-                showBtn->setText("Hide");
+        
+        connect(m_showSecretBtn, &QPushButton::clicked, this, [this]() {
+            if (m_secretKeyEdit->echoMode() == QLineEdit::Password) {
+                m_secretKeyEdit->setEchoMode(QLineEdit::Normal);
+                m_showSecretBtn->setText("Hide");
             } else {
-                secretKeyEdit->setEchoMode(QLineEdit::Password);
-                showBtn->setText("Show");
+                m_secretKeyEdit->setEchoMode(QLineEdit::Password);
+                m_showSecretBtn->setText("Show");
             }
         });
+        
+        // Enable buttons when required fields are filled
+        connect(m_publicKeyEdit, &QLineEdit::textChanged, this, &KeyExchangeDialog::updateButtonStates);
+        connect(m_secretKeyEdit, &QLineEdit::textChanged, this, &KeyExchangeDialog::updateButtonStates);
+        connect(m_messageEdit, &QLineEdit::textChanged, this, &KeyExchangeDialog::updateButtonStates);
+        connect(m_friendPublicKeyEdit, &QLineEdit::textChanged, this, &KeyExchangeDialog::updateButtonStates);
+        connect(m_encryptedInputEdit, &QLineEdit::textChanged, this, &KeyExchangeDialog::updateButtonStates);
+        connect(m_senderPublicKeyEdit, &QLineEdit::textChanged, this, &KeyExchangeDialog::updateButtonStates);
     }
 
 private slots:
-    void onGenerate() {
-        int p = dh_generate_large_prime(10000, 50000);
-        int g = dh_find_primitive_root(p);
-        int priv = dh_generate_random_number(2, p - 2);
-        long long pub = dh_mod_pow(g, priv, p);
 
-        pEdit->setText(QString::number(p));
-        gEdit->setText(QString::number(g));
-        pubKeyEdit->setText(QString::number(pub));
-        secretKeyEdit->setText(QString::number(priv));
-
-        QString shareData = QString("Prime p = %1\nPrimitive root g = %2\nPublic key = %3").arg(p).arg(g).arg(pub);
-        shareEdit->setPlainText(shareData);
-    }
-
-    void onGeneratePublicOnly() {
-        bool ok;
-        int p = pEdit->text().toInt(&ok);
-        if (!ok || p <= 0) {
-            QMessageBox::warning(this, "Error", "Enter valid prime number p first.");
-            return;
+    void onGenerateKeys() {
+        if (m_keyExchange->generateKeyPair()) {
+            m_publicKeyEdit->setText(m_keyExchange->getPublicKey());
+            m_secretKeyEdit->setText(m_keyExchange->getSecretKey());
+            
+            // Только публичный ключ в поле для обмена
+            QString shareData = QString("Public key: %1").arg(m_keyExchange->getPublicKey());
+            m_shareEdit->setPlainText(shareData);
+            
+            m_statusLabel->setText("Key pair generated successfully!");
+        } else {
+            m_statusLabel->setText("Failed to generate key pair");
+            QMessageBox::warning(this, "Error", "Failed to generate key pair. Please try again.");
         }
-        int g = gEdit->text().toInt(&ok);
-        if (!ok || g <= 0) {
-            QMessageBox::warning(this, "Error", "Enter valid primitive root g first.");
-            return;
-        }
-
-        int priv = dh_generate_random_number(2, p - 2);
-        long long pub = dh_mod_pow(g, priv, p);
-
-        pubKeyEdit->setText(QString::number(pub));
-        secretKeyEdit->setText(QString::number(priv));
-
-        QString shareData = QString("Public key = %1").arg(pub);
-        shareEdit->setPlainText(shareData);
-        // QMessageBox::information(this, "Done", "Public key generated. Share it with sender.");
     }
 
     void onEncrypt() {
-        bool ok;
-        int p = pEdit->text().toInt(&ok);
-        if (!ok) return;
-        int priv = secretKeyEdit->text().toInt(&ok);
-        if (!ok) return;
-        long long friendPub = friendPubKeyEdit->text().toLongLong(&ok);
-        if (!ok) return;
-
-        long long shared = dh_mod_pow(friendPub, priv, p);
-        QString key = origKeyEdit->text();
-        if (key.isEmpty()) return;
-
-        char enc[256], hex[512];
-        dh_xor_encrypt_decrypt(key.toUtf8().data(), enc, shared, key.length());
-        dh_binary_to_hex(enc, hex, key.length());
-        encryptedEdit->setText(QString(hex));
-
-        QMessageBox::information(this, "Done",
-                                 QString("Encrypted with shared secret: %1").arg(shared));
+        QString message = m_messageEdit->text();
+        QString friendPublicKey = m_friendPublicKeyEdit->text();
+        
+        if (message.isEmpty()) {
+            QMessageBox::warning(this, "Error", "Please enter a message to encrypt.");
+            return;
+        }
+        
+        if (friendPublicKey.length() != 64) {
+            QMessageBox::warning(this, "Error", "Please enter a valid friend's public key (64 hex characters).");
+            return;
+        }
+        
+        QString encrypted = m_keyExchange->encryptMessage(message, friendPublicKey);
+        if (!encrypted.isEmpty()) {
+            m_encryptedEdit->setText(encrypted);
+            m_statusLabel->setText("Message encrypted successfully!");
+            
+            // Добавляем зашифрованное сообщение в поле для обмена
+            QString shareData = QString("Public key: %1\n\nEncrypted message: %2")
+                                  .arg(m_keyExchange->getPublicKey())
+                                  .arg(encrypted);
+            m_shareEdit->setPlainText(shareData);
+            
+            // Auto-copy encrypted message to clipboard for easy sharing
+            QGuiApplication::clipboard()->setText(encrypted);
+            QMessageBox::information(this, "Encrypted", 
+                "Message encrypted successfully!\n\nEncrypted message has been copied to clipboard. Send it to your friend.");
+        } else {
+            m_statusLabel->setText("Encryption failed");
+            QMessageBox::warning(this, "Error", "Failed to encrypt message. Please check your keys.");
+        }
     }
 
     void onDecrypt() {
-        bool ok;
-        int p = pEdit->text().toInt(&ok);
-        if (!ok) return;
-        int priv = secretKeyEdit->text().toInt(&ok);
-        if (!ok) return;
-        long long friendPub = friendPubKeyEdit->text().toLongLong(&ok);
-        if (!ok) return;
-
-        long long shared = dh_mod_pow(friendPub, priv, p);
-        QString hex = encryptedEdit->text();
-        if (hex.isEmpty()) return;
-
-        int len = hex.length() / 2;
-        char bin[256], dec[256];
-        dh_hex_to_binary(hex.toUtf8().data(), bin, hex.length());
-        dh_xor_encrypt_decrypt(bin, dec, shared, len);
-        decryptedEdit->setText(QString(dec));
+        QString encrypted = m_encryptedInputEdit->text();
+        QString senderPublicKey = m_senderPublicKeyEdit->text();
+        
+        if (encrypted.isEmpty()) {
+            QMessageBox::warning(this, "Error", "Please enter an encrypted message to decrypt.");
+            return;
+        }
+        
+        if (senderPublicKey.length() != 64) {
+            QMessageBox::warning(this, "Error", "Please enter a valid sender's public key (64 hex characters).");
+            return;
+        }
+        
+        QString decrypted = m_keyExchange->decryptMessage(encrypted, senderPublicKey);
+        if (!decrypted.isEmpty()) {
+            m_decryptedEdit->setText(decrypted);
+            m_statusLabel->setText("Message decrypted successfully!");
+            QMessageBox::information(this, "Decrypted", "Message decrypted successfully!");
+        } else {
+            m_statusLabel->setText("Decryption failed");
+            QMessageBox::warning(this, "Error", "Failed to decrypt message. Please check:\n- Encrypted message format\n- Sender's public key\n- Your secret key");
+        }
+    }
+    
+    void updateButtonStates() {
+        bool hasKeys = !m_publicKeyEdit->text().isEmpty() && !m_secretKeyEdit->text().isEmpty();
+        bool hasFriendKey = !m_friendPublicKeyEdit->text().isEmpty() && m_friendPublicKeyEdit->text().length() == 64;
+        bool hasMessage = !m_messageEdit->text().isEmpty();
+        bool hasEncryptedInput = !m_encryptedInputEdit->text().isEmpty();
+        bool hasSenderKey = !m_senderPublicKeyEdit->text().isEmpty() && m_senderPublicKeyEdit->text().length() == 64;
+        
+        m_encryptBtn->setEnabled(hasKeys && hasFriendKey && hasMessage);
+        m_decryptBtn->setEnabled(hasKeys && hasSenderKey && hasEncryptedInput);
     }
 
 private:
-    QLineEdit *pEdit, *gEdit, *pubKeyEdit, *secretKeyEdit;
-    QTextEdit *shareEdit;
-    QLineEdit *origKeyEdit, *friendPubKeyEdit, *encryptedEdit, *decryptedEdit;
+    KeyExchange *m_keyExchange;
+    
+    QLineEdit *m_publicKeyEdit;
+    QLineEdit *m_secretKeyEdit;
+    QPushButton *m_showSecretBtn;
+    QTextEdit *m_shareEdit;
+    
+    // Encryption fields
+    QLineEdit *m_messageEdit;
+    QLineEdit *m_friendPublicKeyEdit;
+    QLineEdit *m_encryptedEdit;
+    
+    // Decryption fields  
+    QLineEdit *m_encryptedInputEdit;
+    QLineEdit *m_senderPublicKeyEdit;
+    QLineEdit *m_decryptedEdit;
+    
+    QPushButton *m_generateKeysBtn;
+    QPushButton *m_encryptBtn;
+    QPushButton *m_decryptBtn;
+    QLabel *m_statusLabel;
 };
-
 
 // Аудио звонки
 class AudioCallManager : public QObject {
@@ -1313,6 +1381,9 @@ public:
         appSettings = new QSettings("fear-messenger", "fear-gui", this);
         backend = new Backend(this);
 
+        // Инициализация шрифта чата
+        chatFont = QFont("Arial", 10);
+
         createActions();
         createMenus();
         createToolbar();
@@ -1343,7 +1414,77 @@ public:
     QString getCliPath() const {
         return backend->cliPath;
     }
+
+protected:
+    void keyPressEvent(QKeyEvent *event) override {
+        if (event->key() == Qt::Key_F1) {
+            onOpenDocumentation();
+        }
+        QMainWindow::keyPressEvent(event);
+    }
+
 private slots:
+
+void onSendFile() {
+    QString filePath = QFileDialog::getOpenFileName(this, "Select file to send", QDir::homePath());
+    if (filePath.isEmpty()) {
+        return;
+    }
+
+    // Проверяем существование файла
+    QFileInfo fileInfo(filePath);
+    if (!fileInfo.exists() || !fileInfo.isFile()) {
+        QMessageBox::warning(this, "Send File", "Selected file does not exist or is not a valid file.");
+        return;
+    }
+
+    // Получаем абсолютный путь (на случай относительных путей)
+    QString absolutePath = QDir::toNativeSeparators(fileInfo.absoluteFilePath());
+    
+    // Формируем команду для отправки
+    QString command = QString("/sendfile %1").arg(absolutePath);
+    
+    // Отправляем команду через бэкенд
+    QString contact = currentContact();
+    bool ok = backend->sendMessage(contact, command);
+
+    if (ok) {
+        // Получаем имя пользователя из настроек
+        QString userName = appSettings->value("last/name", "Me").toString();
+        if (userName.isEmpty()) {
+            userName = "Me";
+        }
+        // Показываем в чате что команда отправлена
+        appendChatLine(QString("[%1] %2: /sendfile \"%3\"")
+                      .arg(QDateTime::currentDateTime().toString("HH:mm:ss"), 
+                           userName, 
+                           fileInfo.fileName()));
+        
+        // Не показываем сообщение об успехе, чтобы не мешать
+        qDebug() << "File send command sent:" << command;
+    } else {
+        QMessageBox::warning(this, "Send File", 
+            "Failed to send file command. Check connection.");
+    }
+}
+
+    void onClearChat() {
+        if (QMessageBox::question(this, "Clear Chat", 
+            "Are you sure you want to clear the chat history?",
+            QMessageBox::Yes | QMessageBox::No) == QMessageBox::Yes) {
+            chatView->clear();
+        }
+    }
+
+    void onFontSettings() {
+        bool ok;
+        QFont font = QFontDialog::getFont(&ok, chatFont, this, "Select Chat Font");
+        if (ok) {
+            chatFont = font;
+            chatView->setFont(chatFont);
+            appSettings->setValue("chat/font", chatFont.toString());
+        }
+    }
 
     void onAudioCall() {
         AudioCallDialog dialog(backend->audioManager, this);
@@ -1356,69 +1497,152 @@ private slots:
     }
 
     void onCreateServer(){
-        bool ok;
-        int defaultPort = appSettings->value("last/port", 7777).toInt();
-        int port = QInputDialog::getInt(this, "Create Server", "Port:", defaultPort, 1, 65535, 1, &ok);
-        if(!ok) return;
-
-        QString name = QInputDialog::getText(this, "Create Server", "Your name:");
-        if(name.isEmpty()) return;
-
-        bool success = backend->createServer(port, name);
-        if(success){
-            appSettings->setValue("last/port", port);
-            QMessageBox::information(this, "Create Server", "Server created successfully.");
-        } else {
-            QMessageBox::warning(this, "Create Server", "Failed to create server. Check if port is available and CLI path is correct.");
+        // Создаем диалоговое окно для настройки сервера
+        QDialog dialog(this);
+        dialog.setWindowTitle("Create Server");
+        dialog.setMinimumWidth(400);
+        
+        QFormLayout *formLayout = new QFormLayout(&dialog);
+        
+        // Порт сервера
+        QSpinBox *portSpin = new QSpinBox(&dialog);
+        portSpin->setRange(1, 65535);
+        portSpin->setValue(appSettings->value("last/port", 7777).toInt());
+        formLayout->addRow("Port:", portSpin);
+        
+        // Кнопки
+        QHBoxLayout *buttonLayout = new QHBoxLayout();
+        QPushButton *createButton = new QPushButton("Create Server", &dialog);
+        QPushButton *cancelButton = new QPushButton("Cancel", &dialog);
+        buttonLayout->addWidget(createButton);
+        buttonLayout->addWidget(cancelButton);
+        
+        formLayout->addRow(buttonLayout);
+        
+        // Подключаем кнопки
+        connect(createButton, &QPushButton::clicked, &dialog, &QDialog::accept);
+        connect(cancelButton, &QPushButton::clicked, &dialog, &QDialog::reject);
+        
+        // Показываем диалог
+        if (dialog.exec() == QDialog::Accepted) {
+            int port = portSpin->value();
+            
+            // Показываем индикатор прогресса
+            QProgressDialog progress("Creating server...", "Cancel", 0, 0, this);
+            progress.setWindowModality(Qt::WindowModal);
+            progress.show();
+            QApplication::processEvents();
+            
+            bool success = backend->createServer(port, "Server");
+            
+            progress.close();
+            
+            if(success){
+                appSettings->setValue("last/port", port);
+                QMessageBox::information(this, "Create Server", "Server created successfully.");
+            } else {
+                QMessageBox::warning(this, "Create Server", "Failed to create server. Check if port is available and CLI path is correct.");
+            }
         }
     }
 
     void onConnect(){
-        QString hostDef = appSettings->value("last/host", "127.0.0.1").toString();
-        int portDef = appSettings->value("last/port", 7777).toInt();
-        QString roomDef = appSettings->value("last/room", "testroom").toString();
-        QString keyDef = appSettings->value("last/key", "").toString();
-        QString nameDef = appSettings->value("last/name", "").toString();
-
-        QString host = QInputDialog::getText(this, "Connect", "Host:", QLineEdit::Normal, hostDef);
-        if(host.isEmpty()) return;
-
-        bool ok;
-        int port = QInputDialog::getInt(this, "Connect", "Port:", portDef, 1, 65535, 1, &ok);
-        if(!ok) return;
-
-        QString room = QInputDialog::getText(this, "Connect", "Room name:", QLineEdit::Normal, roomDef);
-        if(room.isEmpty()) return;
-
-        QString key = QInputDialog::getText(this, "Connect", "Room key (shared secret):", QLineEdit::Normal, keyDef);
-        if(key.isEmpty()){
-            QMessageBox::warning(this, "Connect", "Room key is required to join private rooms.");
-            return;
-        }
-
-        QString name = QInputDialog::getText(this, "Connect", "Your name:", QLineEdit::Normal, nameDef);
-        if(name.isEmpty()) return;
-
-        // Показываем индикатор прогресса
-        QProgressDialog progress("Connecting to server...", "Cancel", 0, 0, this);
-        progress.setWindowModality(Qt::WindowModal);
-        progress.show();
-
-        QApplication::processEvents(); // Обрабатываем события для отображения диалога
-
-        bool success = backend->connectToServer(host, port, room, key, name);
-
-        progress.close();
-
-        if(success){
-            appSettings->setValue("last/host", host);
-            appSettings->setValue("last/port", port);
-            appSettings->setValue("last/room", room);
-            appSettings->setValue("last/key", key);
-            appSettings->setValue("last/name", name);
-            QMessageBox::information(this, "Connect", "Connected successfully.");
-        } else {
-            QMessageBox::warning(this, "Connect", "Failed to connect. Check server availability and credentials.");
+        // Создаем диалоговое окно для подключения
+        QDialog dialog(this);
+        dialog.setWindowTitle("Connect to Server");
+        dialog.setMinimumWidth(500);
+        
+        QFormLayout *formLayout = new QFormLayout(&dialog);
+        
+        // Хост
+        QLineEdit *hostEdit = new QLineEdit(&dialog);
+        hostEdit->setText(appSettings->value("last/host", "127.0.0.1").toString());
+        formLayout->addRow("Host:", hostEdit);
+        
+        // Порт
+        QSpinBox *portSpin = new QSpinBox(&dialog);
+        portSpin->setRange(1, 65535);
+        portSpin->setValue(appSettings->value("last/port", 7777).toInt());
+        formLayout->addRow("Port:", portSpin);
+        
+        // Комната
+        QLineEdit *roomEdit = new QLineEdit(&dialog);
+        roomEdit->setText(appSettings->value("last/room", "testroom").toString());
+        formLayout->addRow("Room name:", roomEdit);
+        
+        // Ключ комнаты - ОБЫЧНЫЙ РЕЖИМ (не скрытый)
+        QLineEdit *keyEdit = new QLineEdit(&dialog);
+        keyEdit->setText(appSettings->value("last/key", "").toString());
+        // Убрано: keyEdit->setEchoMode(QLineEdit::Password);
+        formLayout->addRow("Room key:", keyEdit);
+        
+        // Имя пользователя
+        QLineEdit *nameEdit = new QLineEdit(&dialog);
+        nameEdit->setText(appSettings->value("last/name", "").toString());
+        formLayout->addRow("Your name:", nameEdit);
+        
+        // Кнопки
+        QHBoxLayout *buttonLayout = new QHBoxLayout();
+        QPushButton *connectButton = new QPushButton("Connect", &dialog);
+        QPushButton *cancelButton = new QPushButton("Cancel", &dialog);
+        buttonLayout->addWidget(connectButton);
+        buttonLayout->addWidget(cancelButton);
+        
+        formLayout->addRow(buttonLayout);
+        
+        // Подключаем кнопки
+        connect(connectButton, &QPushButton::clicked, &dialog, &QDialog::accept);
+        connect(cancelButton, &QPushButton::clicked, &dialog, &QDialog::reject);
+        
+        // Показываем диалог
+        if (dialog.exec() == QDialog::Accepted) {
+            QString host = hostEdit->text().trimmed();
+            int port = portSpin->value();
+            QString room = roomEdit->text().trimmed();
+            QString key = keyEdit->text().trimmed();
+            QString name = nameEdit->text().trimmed();
+            
+            // Валидация введенных данных
+            if (host.isEmpty()) {
+                QMessageBox::warning(this, "Connect", "Host cannot be empty.");
+                return;
+            }
+            
+            if (room.isEmpty()) {
+                QMessageBox::warning(this, "Connect", "Room name cannot be empty.");
+                return;
+            }
+            
+            if (key.isEmpty()) {
+                QMessageBox::warning(this, "Connect", "Room key is required to join private rooms.");
+                return;
+            }
+            
+            if (name.isEmpty()) {
+                QMessageBox::warning(this, "Connect", "Your name cannot be empty.");
+                return;
+            }
+            
+            // Показываем индикатор прогресса
+            QProgressDialog progress("Connecting to server...", "Cancel", 0, 0, this);
+            progress.setWindowModality(Qt::WindowModal);
+            progress.show();
+            QApplication::processEvents();
+            
+            bool success = backend->connectToServer(host, port, room, key, name);
+            
+            progress.close();
+            
+            if(success){
+                appSettings->setValue("last/host", host);
+                appSettings->setValue("last/port", port);
+                appSettings->setValue("last/room", room);
+                appSettings->setValue("last/key", key);
+                appSettings->setValue("last/name", name);
+                QMessageBox::information(this, "Connect", "Connected successfully.");
+            } else {
+                QMessageBox::warning(this, "Connect", "Failed to connect. Check server availability and credentials.");
+            }
         }
     }
 
@@ -1531,6 +1755,19 @@ private slots:
         appendChatLine("[server] listening");
     }
 
+    void onOpenDocumentation() {
+    QString docPath = QApplication::applicationDirPath() + "/doc/manual.pdf";
+    if (QFile::exists(docPath)) {
+        QDesktopServices::openUrl(QUrl::fromLocalFile(docPath));
+    } else {
+        QMessageBox::information(this, "Documentation", 
+            "Documentation file not found.\n\n"
+            "Please download the user manual from:\n"
+            "https://github.com/shchuchkin-pkims/fear");
+    }
+
+}
+
 private:
     Backend *backend;
     QListWidget *contactsWidget;
@@ -1541,10 +1778,21 @@ private:
 
     QAction *connectAction;
     QAction *disconnectAction;
+    
+    // Добавляем новые члены для управления чатом
+    QFont chatFont;
+    QAction *clearChatAction;
+    QAction *fontSettingsAction;
+    QAction *sendFileAction;
 
     QString currentContact(){
         QListWidgetItem *it = contactsWidget->currentItem();
         return it ? it->text() : QString();
+    }
+    
+    void createStatusBar() {  // Добавляем правильное объявление метода
+        statusLabel = new QLabel("Disconnected", this);
+        statusBar()->addPermanentWidget(statusLabel);
     }
 
     void appendChatLine(const QString &line){
@@ -1573,6 +1821,15 @@ private:
         disconnectAction = new QAction("Disconnect", this);
         connect(disconnectAction, &QAction::triggered, this, &MainWindow::onDisconnect);
         disconnectAction->setEnabled(false);
+
+        clearChatAction = new QAction("Clear chat", this);
+        connect(clearChatAction, &QAction::triggered, this, &MainWindow::onClearChat);
+
+        fontSettingsAction = new QAction("Font settings", this);
+        connect(fontSettingsAction, &QAction::triggered, this, &MainWindow::onFontSettings);
+
+        sendFileAction = new QAction("Send file", this);
+        connect(sendFileAction, &QAction::triggered, this, &MainWindow::onSendFile);
     }
 
     void createMenus(){
@@ -1590,11 +1847,11 @@ private:
         connMenu->addAction(connectAction);
         connMenu->addAction(disconnectAction);
 
-        QAction *serveAct = new QAction("Create server...", this);
+        QAction *serveAct = new QAction("Create server", this);
         connect(serveAct, &QAction::triggered, this, &MainWindow::onCreateServer);
         connMenu->addAction(serveAct);
 
-        QMenu *audioMenu = menuBar()->addMenu("Audio Call");
+        QMenu *audioMenu = menuBar()->addMenu("Audio call");
         QAction *audioCallAct = new QAction("Start audio call", this);
         connect(audioCallAct, &QAction::triggered, this, &MainWindow::onAudioCall);
         audioMenu->addAction(audioCallAct);
@@ -1608,6 +1865,11 @@ private:
         connect(keyExchangeAction, &QAction::triggered, this, &MainWindow::onKeyExchange);
         keysMenu->addAction(keyExchangeAction);
 
+        QMenu *chatMenu = menuBar()->addMenu("Chat");
+        chatMenu->addAction(clearChatAction);
+        chatMenu->addAction(fontSettingsAction);
+        chatMenu->addAction(sendFileAction);
+
         QMenu *helpMenu = menuBar()->addMenu("Help");
         QAction *update = new QAction("Check for updates", this);
         connect(update, &QAction::triggered, this, [this](){
@@ -1615,6 +1877,10 @@ private:
             dialog.exec();
         });
         helpMenu->addAction(update);
+
+        QAction *docAction = new QAction("Documentation", this);
+        connect(docAction, &QAction::triggered, this, &MainWindow::onOpenDocumentation);
+        helpMenu->addAction(docAction); 
 
         QAction *about = new QAction("About", this);
         connect(about, &QAction::triggered, this, [this](){
@@ -1635,7 +1901,6 @@ private:
         });
 
         helpMenu->addAction(about);
-
     }
 
     void createToolbar(){
@@ -1675,8 +1940,33 @@ private:
         // Right: chat area
         QWidget *right = new QWidget(this);
         QVBoxLayout *rightLayout = new QVBoxLayout(right);
+        
+        // Добавляем панель инструментов для чата
+        QHBoxLayout *chatToolbarLayout = new QHBoxLayout();
+        QLabel *chatLabel = new QLabel("Chat");
+        QPushButton *sendFileBtn = new QPushButton("Send file");
+        QPushButton *clearChatBtn = new QPushButton("Clear");
+        
+        connect(sendFileBtn, &QPushButton::clicked, this, &MainWindow::onSendFile);
+        connect(clearChatBtn, &QPushButton::clicked, this, &MainWindow::onClearChat);
+        
+        chatToolbarLayout->addWidget(chatLabel);
+        chatToolbarLayout->addStretch();
+        chatToolbarLayout->addWidget(sendFileBtn);
+        chatToolbarLayout->addWidget(clearChatBtn);
+        
+        rightLayout->addLayout(chatToolbarLayout);
+        
         chatView = new QTextEdit(right);
         chatView->setReadOnly(true);
+        
+        // Загружаем сохраненные настройки шрифта
+        QString savedFont = appSettings->value("chat/font").toString();
+        if (!savedFont.isEmpty()) {
+            chatFont.fromString(savedFont);
+        }
+        chatView->setFont(chatFont);
+        
         rightLayout->addWidget(chatView);
 
         QHBoxLayout *bottomLayout = new QHBoxLayout();
@@ -1696,11 +1986,6 @@ private:
 
         QVBoxLayout *mainL = new QVBoxLayout(central);
         mainL->addWidget(mainSplitter);
-    }
-
-    void createStatusBar(){
-        statusLabel = new QLabel("Disconnected", this);
-        statusBar()->addPermanentWidget(statusLabel);
     }
 };
 

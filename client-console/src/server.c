@@ -56,7 +56,7 @@ static int read_frame(sock_t fd, uint8_t **out, size_t *outlen) {
     uint8_t nlbuf[2];
     if (recv_all(fd, nlbuf, 2) < 0) { free(buf); return -1; }
     uint16_t nonce_len = rd_u16(nlbuf);
-    if (nonce_len != crypto_aead_xchacha20poly1305_ietf_NPUBBYTES) { free(buf); return -1; }
+    if (nonce_len != CRYPTO_NPUBBYTES) { free(buf); return -1; }
 
     // read nonce
     if (recv_all(fd, buf + 2 + room_len + 2 + name_len, nonce_len) < 0) { free(buf); return -1; }
