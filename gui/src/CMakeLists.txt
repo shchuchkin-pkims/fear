@@ -4,7 +4,7 @@ set(CMAKE_CXX_STANDARD 17)
 
 # Настройка путей сборки
 set(CMAKE_BINARY_DIR "${CMAKE_SOURCE_DIR}/../build")
-set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/../../build/release")
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib")
 set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib")
 
@@ -13,6 +13,13 @@ set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")  # Ст�
 set(CMAKE_POSITION_INDEPENDENT_CODE OFF)  # Отключаем PIC для статической линковки
 
 find_package(Qt6 REQUIRED COMPONENTS Widgets)
+
+# Получаем путь к windeployqt (только для Windows)
+if(WIN32)
+    get_target_property(QMAKE_LOCATION Qt6::qmake IMPORTED_LOCATION)
+    get_filename_component(QT_BIN_DIR "${QMAKE_LOCATION}" DIRECTORY)
+    find_program(WINDEPLOYQT_EXECUTABLE windeployqt HINTS "${QT_BIN_DIR}")
+endif()
 
 # Используем прямые слеши для Windows путей
 set(LIBSODIUM_PATH "${CMAKE_SOURCE_DIR}/../../lib/libsodium-win64" CACHE PATH "Path to libsodium directory (should contain include/ and lib/ folders)")
@@ -152,6 +159,26 @@ set_target_properties(${PROJECT_NAME} PROPERTIES
 file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR})
 file(MAKE_DIRECTORY ${CMAKE_RUNTIME_OUTPUT_DIRECTORY})
 file(MAKE_DIRECTORY ${CMAKE_LIBRARY_OUTPUT_DIRECTORY})
+
+# Добавляем windeployqt после сборки (только для Windows)
+if(WIN32 AND WINDEPLOYQT_EXECUTABLE)
+    # Полный путь к исполняемому файлу
+    set(TARGET_PATH "$<TARGET_FILE:${PROJECT_NAME}>")
+    
+    # Добавляем пользовательскую команду, которая выполняется после сборки
+    add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+        COMMAND "${WINDEPLOYQT_EXECUTABLE}"
+                "$<TARGET_FILE_DIR:${PROJECT_NAME}>"
+        COMMENT "Running windeployqt to deploy Qt dependencies"
+        VERBATIM
+    )
+    
+    message(STATUS "windeployqt will run automatically after build")
+elseif(WIN32)
+    message(WARNING "windeployqt not found - Qt dependencies will not be deployed automatically")
+else()
+    message(STATUS "Skipping windeployqt - not needed on Linux/Unix")
+endif()
 
 message(STATUS "Libsodium configuration complete:")
 message(STATUS "  Include dirs: ${LIBSODIUM_INCLUDE_DIRS}")

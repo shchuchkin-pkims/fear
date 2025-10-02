@@ -82,19 +82,37 @@ add_custom_target(clean-all
 
 # Установка выходных файлов в корневую build директорию
 set_target_properties(fear PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/release/bin"
 )
 
 set_target_properties(key-exchange PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/release/bin"
 )
 
 set_target_properties(updater PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/release/bin"
 )
 
 set_target_properties(audio_call PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/release/bin"
+)
+
+# Автоматическое копирование файлов при ЛЮБОЙ сборке
+add_custom_target(copy-updater-files ALL
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/release/bin"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different 
+        "${CMAKE_SOURCE_DIR}/updater/cacert.pem"
+        "${CMAKE_BINARY_DIR}/release/bin"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different 
+        "${CMAKE_SOURCE_DIR}/updater/libcurl-x64.dll" 
+        "${CMAKE_BINARY_DIR}/release/bin"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different 
+        "${CMAKE_SOURCE_DIR}/updater/updater.conf"
+        "${CMAKE_BINARY_DIR}/release/bin"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different 
+        "${CMAKE_SOURCE_DIR}/doc/manual.pdf"
+        "${CMAKE_BINARY_DIR}/release/doc/manual.pdf"
+    COMMENT "Copying updater files to bin directory"
 )
 
 # Информация о проекте
