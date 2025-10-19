@@ -32,7 +32,8 @@ typedef enum {
     MSG_TYPE_TEXT = 0,
     MSG_TYPE_FILE_START = 1,
     MSG_TYPE_FILE_CHUNK = 2,
-    MSG_TYPE_FILE_END = 3
+    MSG_TYPE_FILE_END = 3,
+    MSG_TYPE_USER_LIST = 4
 } message_type_t;
 
 // Crypto constants for AES-256-GCM (compatible with Android)

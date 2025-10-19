@@ -112,6 +112,10 @@ static void broadcast(client_t *clients, int *nclients, const char *room,
 
     for (int i = 0; i < *nclients; i++) {
         if (clients[i].fd == from) continue;
+
+        // Пропускаем клиентов, которые еще не зарегистрировались в комнате
+        if (clients[i].room[0] == '\0') continue;
+
         if (strcmp(clients[i].room, room) != 0) continue;
 
         // Можно при необходимости добавить логику фильтрации по типу
@@ -121,6 +125,65 @@ static void broadcast(client_t *clients, int *nclients, const char *room,
             (*nclients)--;
             i--;
         }
+    }
+}
+
+// Отправляет список участников комнаты всем клиентам в этой комнате
+static void send_user_list(client_t *clients, int nclients, const char *room) {
+    // Подсчитываем участников комнаты и формируем список имен
+    char user_list[MAX_FRAME];
+    size_t offset = 0;
+    int count = 0;
+
+    for (int i = 0; i < nclients; i++) {
+        if (clients[i].room[0] != '\0' && strcmp(clients[i].room, room) == 0) {
+            size_t name_len = strlen(clients[i].name);
+            if (offset + 2 + name_len < sizeof(user_list) - 100) {
+                wr_u16((uint8_t*)(user_list + offset), (uint16_t)name_len);
+                offset += 2;
+                memcpy(user_list + offset, clients[i].name, name_len);
+                offset += name_len;
+                count++;
+            }
+        }
+    }
+
+    if (count == 0) return;
+
+    // Формируем сообщение MSG_TYPE_USER_LIST
+    // Формат payload: [2 count][для каждого: 2 name_len, name]
+    uint8_t payload[MAX_FRAME];
+    wr_u16(payload, (uint16_t)count);
+    memcpy(payload + 2, user_list, offset);
+    size_t payload_len = 2 + offset;
+
+    // Отправляем всем клиентам комнаты
+    for (int i = 0; i < nclients; i++) {
+        if (clients[i].room[0] == '\0' || strcmp(clients[i].room, room) != 0) continue;
+
+        // Формируем frame с MSG_TYPE_USER_LIST
+        uint16_t room_len = (uint16_t)strlen(room);
+        uint16_t name_len = (uint16_t)strlen("server"); // от имени сервера
+        uint8_t nonce[CRYPTO_NPUBBYTES];
+        memset(nonce, 0, sizeof(nonce)); // для служебных сообщений nonce = 0
+
+        size_t frame_len = 2 + room_len + 2 + name_len + 2 + CRYPTO_NPUBBYTES + 1 + 4 + payload_len;
+        uint8_t *frame = (uint8_t*)malloc(frame_len);
+        if (!frame) continue;
+
+        uint8_t *w = frame;
+        wr_u16(w, room_len); w += 2;
+        memcpy(w, room, room_len); w += room_len;
+        wr_u16(w, name_len); w += 2;
+        memcpy(w, "server", name_len); w += name_len;
+        wr_u16(w, CRYPTO_NPUBBYTES); w += 2;
+        memcpy(w, nonce, CRYPTO_NPUBBYTES); w += CRYPTO_NPUBBYTES;
+        *w++ = (uint8_t)MSG_TYPE_USER_LIST;
+        wr_u32(w, (uint32_t)payload_len); w += 4;
+        memcpy(w, payload, payload_len);
+
+        send_all(clients[i].fd, frame, frame_len);
+        free(frame);
     }
 }
 
@@ -167,10 +230,26 @@ void run_server(uint16_t port) {
             size_t flen = 0;
             if (read_frame(clients[i].fd, &frame, &flen) < 0) {
                 printf("[server] client dropped\n");
+
+                // Сохраняем комнату до удаления клиента
+                char dropped_room[MAX_ROOM];
+                if (clients[i].room[0] != '\0') {
+                    strncpy(dropped_room, clients[i].room, MAX_ROOM - 1);
+                    dropped_room[MAX_ROOM - 1] = '\0';
+                } else {
+                    dropped_room[0] = '\0';
+                }
+
                 close_socket(clients[i].fd);
                 clients[i] = clients[nclients - 1];
                 nclients--;
                 i--;
+
+                // Обновляем список участников для комнаты
+                if (dropped_room[0] != '\0') {
+                    send_user_list(clients, nclients, dropped_room);
+                }
+
                 continue;
             }
             uint16_t room_len = rd_u16(frame);
@@ -183,9 +262,42 @@ void run_server(uint16_t port) {
                 clients[i].room[rl] = '\0';
             }
             if (clients[i].name[0] == '\0') {
+                // Проверяем уникальность имени в той же комнате
+                int name_exists = 0;
+                for (int j = 0; j < nclients; j++) {
+                    if (i == j) continue; // Пропускаем себя
+                    if (clients[j].name[0] != '\0' && clients[j].room[0] != '\0') {
+                        // Сравниваем имена и комнаты
+                        if (strncmp(clients[j].room, room, room_len) == 0 &&
+                            clients[j].room[room_len] == '\0' &&
+                            strncmp(clients[j].name, name, name_len) == 0 &&
+                            clients[j].name[name_len] == '\0') {
+                            name_exists = 1;
+                            break;
+                        }
+                    }
+                }
+
+                if (name_exists) {
+                    // Имя уже занято - отключаем клиента
+                    printf("[server] client rejected: name '%.*s' already exists in room '%.*s'\n",
+                           (int)name_len, name, (int)room_len, room);
+                    close_socket(clients[i].fd);
+                    clients[i] = clients[nclients - 1];
+                    nclients--;
+                    i--;
+                    free(frame);
+                    continue;
+                }
+
                 size_t nl = name_len < MAX_NAME - 1 ? name_len : MAX_NAME - 1;
                 memcpy(clients[i].name, name, nl);
                 clients[i].name[nl] = '\0';
+                printf("[server] client registered: name='%s', room='%s'\n",
+                       clients[i].name, clients[i].room);
+
+                // Отправляем обновленный список участников всем в комнате
+                send_user_list(clients, nclients, clients[i].room);
             }
             broadcast(clients, &nclients, clients[i].room, frame, flen, clients[i].fd);
             free(frame);

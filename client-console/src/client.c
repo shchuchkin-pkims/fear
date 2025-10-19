@@ -433,12 +433,29 @@ int recv_and_decrypt(sock_t s, const char *room, const uint8_t *key, const char 
     wr_u16(w, name_len); w += 2; memcpy(w, name, name_len);
 
     int same_room = (strcmp(room, room_in) == 0);
+
+    // Проверяем, является ли это служебным сообщением (nonce заполнен нулями)
+    int is_service_message = 1;
+    for (int i = 0; i < CRYPTO_NPUBBYTES; i++) {
+        if (nonce[i] != 0) {
+            is_service_message = 0;
+            break;
+        }
+    }
+
     uint8_t *plain = (uint8_t*)malloc(clen);
     if (!plain) { free(room_in); free(name); free(cipher); free(ad); return -1; }
-    
+
     unsigned long long plen = 0;
     int ok = -1;
-    if (same_room) {
+
+    if (is_service_message && same_room && msg_type == MSG_TYPE_USER_LIST) {
+        // Служебное сообщение USER_LIST - не шифруется, просто копируем
+        memcpy(plain, cipher, clen);
+        plen = clen;
+        ok = 0;
+    } else if (same_room && !is_service_message) {
+        // Обычное зашифрованное сообщение
         ok = aes_gcm_decrypt(cipher, clen, ad, ad_len, nonce, key, plain, &plen);
     }
 
@@ -448,12 +465,39 @@ int recv_and_decrypt(sock_t s, const char *room, const uint8_t *key, const char 
     }
 
     if (msg_type == MSG_TYPE_TEXT) {
-        time_t now = time(NULL);
-        struct tm *tm = localtime(&now);
-        char tbuf[32];
-        strftime(tbuf, sizeof tbuf, "%H:%M:%S", tm);
-        printf("[%s] %s: %.*s\n", tbuf, name, (int)plen, (char*)plain);
-        fflush(stdout);
+        // Пропускаем пустые сообщения (регистрационные)
+        if (plen > 0) {
+            time_t now = time(NULL);
+            struct tm *tm = localtime(&now);
+            char tbuf[32];
+            strftime(tbuf, sizeof tbuf, "%H:%M:%S", tm);
+            printf("[%s] %s: %.*s\n", tbuf, name, (int)plen, (char*)plain);
+            fflush(stdout);
+        }
+    } else if (msg_type == MSG_TYPE_USER_LIST) {
+        // Обрабатываем список участников
+        if (plen >= 2) {
+            uint16_t count = rd_u16(plain);
+            const uint8_t *p = plain + 2;
+            size_t remaining = plen - 2;
+
+            printf("[USERS] Room participants (%u):", count);
+            for (uint16_t i = 0; i < count && remaining >= 2; i++) {
+                uint16_t name_len = rd_u16(p);
+                p += 2;
+                remaining -= 2;
+
+                if (name_len > remaining) break;
+
+                printf(" %.*s", (int)name_len, (char*)p);
+                if (i < count - 1) printf(",");
+
+                p += name_len;
+                remaining -= name_len;
+            }
+            printf("\n");
+            fflush(stdout);
+        }
     } else if (msg_type >= MSG_TYPE_FILE_START && msg_type <= MSG_TYPE_FILE_END) {
         handle_file_message(plain, (size_t)plen, msg_type, room_in, name, key, myname);
     } else {
@@ -522,7 +566,16 @@ void run_client(const char *host, uint16_t port, const char *room, const char *n
         mkdir("Downloads", 0755);
     #endif
     sock_t s = dial_tcp(host, port);
-    printf("[client] connected to %s:%u, room=\"%s\"\n", host, port, room);
+    printf("[client] connected to %s:%u, Room name: %s\n", host, port, room);
+
+    // Отправляем пустое сообщение для регистрации на сервере
+    const char *join_msg = "";
+    if (send_ciphertext(s, room, name, key, (uint8_t*)join_msg, strlen(join_msg)) < 0) {
+        fprintf(stderr, "[client] failed to register with server\n");
+        close_socket(s);
+        exit(1);
+    }
+
     printf("Type messages and press Enter. Use '/sendfile filename' to send files. Ctrl+C to exit.\n");
 
 #ifdef _WIN32

@@ -1,13 +1,16 @@
 # Игнорирование папок
 .vscode
+.claude
 audio_call/build/
 client-console/build/
 gui/build/
 key-exchange/build
 temp/
 build/
+build-linux/
 
-lib/
+lib/*
+!lib/README.md
 
 # Игнорирование файлов
 # build.log

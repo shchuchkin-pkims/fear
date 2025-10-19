@@ -191,16 +191,17 @@ private slots:
     }
 
     void onEncrypt() {
-        QString message = m_messageEdit->text();
-        QString friendPublicKey = m_friendPublicKeyEdit->text();
-        
+        QString message = m_messageEdit->text().trimmed();
+        QString friendPublicKey = m_friendPublicKeyEdit->text().trimmed();
+
         if (message.isEmpty()) {
             QMessageBox::warning(this, "Error", "Please enter a message to encrypt.");
             return;
         }
-        
+
         if (friendPublicKey.length() != 64) {
-            QMessageBox::warning(this, "Error", "Please enter a valid friend's public key (64 hex characters).");
+            QMessageBox::warning(this, "Error",
+                QString("Please enter a valid friend's public key (64 hex characters).\nCurrent length: %1").arg(friendPublicKey.length()));
             return;
         }
         
@@ -226,16 +227,17 @@ private slots:
     }
 
     void onDecrypt() {
-        QString encrypted = m_encryptedInputEdit->text();
-        QString senderPublicKey = m_senderPublicKeyEdit->text();
-        
+        QString encrypted = m_encryptedInputEdit->text().trimmed();
+        QString senderPublicKey = m_senderPublicKeyEdit->text().trimmed();
+
         if (encrypted.isEmpty()) {
             QMessageBox::warning(this, "Error", "Please enter an encrypted message to decrypt.");
             return;
         }
-        
+
         if (senderPublicKey.length() != 64) {
-            QMessageBox::warning(this, "Error", "Please enter a valid sender's public key (64 hex characters).");
+            QMessageBox::warning(this, "Error",
+                QString("Please enter a valid sender's public key (64 hex characters).\nCurrent length: %1").arg(senderPublicKey.length()));
             return;
         }
         
@@ -252,11 +254,19 @@ private slots:
     
     void updateButtonStates() {
         bool hasKeys = !m_publicKeyEdit->text().isEmpty() && !m_secretKeyEdit->text().isEmpty();
-        bool hasFriendKey = !m_friendPublicKeyEdit->text().isEmpty() && m_friendPublicKeyEdit->text().length() == 64;
-        bool hasMessage = !m_messageEdit->text().isEmpty();
-        bool hasEncryptedInput = !m_encryptedInputEdit->text().isEmpty();
-        bool hasSenderKey = !m_senderPublicKeyEdit->text().isEmpty() && m_senderPublicKeyEdit->text().length() == 64;
-        
+        bool hasFriendKey = m_friendPublicKeyEdit->text().trimmed().length() == 64;
+        bool hasMessage = !m_messageEdit->text().trimmed().isEmpty();
+        bool hasEncryptedInput = !m_encryptedInputEdit->text().trimmed().isEmpty();
+        bool hasSenderKey = m_senderPublicKeyEdit->text().trimmed().length() == 64;
+
+        // Debug output to help diagnose the issue
+        qDebug() << "updateButtonStates: hasKeys=" << hasKeys
+                 << " hasFriendKey=" << hasFriendKey
+                 << " hasMessage=" << hasMessage
+                 << " friendKeyLen=" << m_friendPublicKeyEdit->text().trimmed().length()
+                 << " publicKeyLen=" << m_publicKeyEdit->text().length()
+                 << " secretKeyLen=" << m_secretKeyEdit->text().length();
+
         m_encryptBtn->setEnabled(hasKeys && hasFriendKey && hasMessage);
         m_decryptBtn->setEnabled(hasKeys && hasSenderKey && hasEncryptedInput);
     }
@@ -328,7 +338,7 @@ public:
         return false;
     }
 
-    bool startCall(const QString &remoteIp, quint16 remotePort, const QString &key, quint16 localPort = 0) {
+    bool startCall(const QString &remoteIp, quint16 remotePort, const QString &key, quint16 localPort = 0, int inputDevice = -1, int outputDevice = -1) {
         if (key.isEmpty()) {
             emit error("Key is required to start a call");
             return false;
@@ -351,6 +361,18 @@ public:
         args << "call" << remoteIp << QString::number(remotePort) << key;
         if (localPort > 0) {
             args << QString::number(localPort);
+        } else {
+            args << "0";  // Default local port
+        }
+
+        // Добавляем параметры устройств
+        if (inputDevice >= 0) {
+            args << QString::number(inputDevice);
+            if (outputDevice >= 0) {
+                args << QString::number(outputDevice);
+            }
+        } else if (outputDevice >= 0) {
+            args << "-1" << QString::number(outputDevice);
         }
 
         callProcess->start(audioAppPath, args);
@@ -366,7 +388,7 @@ public:
         return true;
     }
 
-    bool startListening(quint16 localPort, const QString &key) {
+    bool startListening(quint16 localPort, const QString &key, int inputDevice = -1, int outputDevice = -1) {
         if (key.isEmpty()) {
             emit error("Key is required to start listening");
             return false;
@@ -387,6 +409,16 @@ public:
 
         QStringList args;
         args << "listen" << QString::number(localPort) << key;
+
+        // Добавляем параметры устройств
+        if (inputDevice >= 0) {
+            args << QString::number(inputDevice);
+            if (outputDevice >= 0) {
+                args << QString::number(outputDevice);
+            }
+        } else if (outputDevice >= 0) {
+            args << "-1" << QString::number(outputDevice);
+        }
 
         callProcess->start(audioAppPath, args);
 
@@ -487,10 +519,13 @@ public:
     AudioCallDialog(AudioCallManager *audioManager, QWidget *parent = nullptr)
         : QDialog(parent), audioManager(audioManager) {
         setWindowTitle("Audio Call");
-        setMinimumSize(500, 400);
+        setMinimumSize(500, 450);
 
         setupUI();
         setupConnections();
+
+        // Загружаем список устройств при открытии диалога
+        refreshAudioDevices();
     }
 
 private slots:
@@ -520,7 +555,11 @@ private slots:
             return;
         }
 
-        if (audioManager->startCall(remoteIp, remotePort, key, localPortSpin->value())) {
+        // Получаем выбранные устройства
+        int inputDevice = inputDeviceCombo->currentData().toInt();
+        int outputDevice = outputDeviceCombo->currentData().toInt();
+
+        if (audioManager->startCall(remoteIp, remotePort, key, localPortSpin->value(), inputDevice, outputDevice)) {
             statusLabel->setText("Call started");
         }
     }
@@ -532,7 +571,11 @@ private slots:
             return;
         }
 
-        if (audioManager->startListening(localPortSpin->value(), key)) {
+        // Получаем выбранные устройства
+        int inputDevice = inputDeviceCombo->currentData().toInt();
+        int outputDevice = outputDeviceCombo->currentData().toInt();
+
+        if (audioManager->startListening(localPortSpin->value(), key, inputDevice, outputDevice)) {
             statusLabel->setText("Listening started");
         }
     }
@@ -576,6 +619,23 @@ private:
         keyLayout->addWidget(keyEdit);
         keyLayout->addWidget(genKeyButton);
         layout->addWidget(keyGroup);
+
+        // Audio devices section
+        QGroupBox *devicesGroup = new QGroupBox("Audio Devices", this);
+        QGridLayout *devicesLayout = new QGridLayout(devicesGroup);
+
+        devicesLayout->addWidget(new QLabel("Input device:"), 0, 0);
+        inputDeviceCombo = new QComboBox(devicesGroup);
+        devicesLayout->addWidget(inputDeviceCombo, 0, 1);
+
+        devicesLayout->addWidget(new QLabel("Output device:"), 1, 0);
+        outputDeviceCombo = new QComboBox(devicesGroup);
+        devicesLayout->addWidget(outputDeviceCombo, 1, 1);
+
+        refreshDevicesButton = new QPushButton("Refresh Devices", devicesGroup);
+        devicesLayout->addWidget(refreshDevicesButton, 2, 0, 1, 2);
+
+        layout->addWidget(devicesGroup);
 
         // Connection section
         QGroupBox *connGroup = new QGroupBox("Connection", this);
@@ -633,6 +693,7 @@ private:
 
         // Подключаем кнопки UI
         connect(genKeyButton, &QPushButton::clicked, this, &AudioCallDialog::onGenerateKey);
+        connect(refreshDevicesButton, &QPushButton::clicked, this, &AudioCallDialog::refreshAudioDevices);
         connect(callButton, &QPushButton::clicked, this, &AudioCallDialog::onStartCall);
         connect(listenButton, &QPushButton::clicked, this, &AudioCallDialog::onStartListening);
         connect(stopButton, &QPushButton::clicked, this, &AudioCallDialog::onStopCall);
@@ -643,12 +704,90 @@ private:
     QLineEdit *ipEdit;
     QSpinBox *portSpin;
     QSpinBox *localPortSpin;
+    QComboBox *inputDeviceCombo;
+    QComboBox *outputDeviceCombo;
     QPushButton *genKeyButton;
+    QPushButton *refreshDevicesButton;
     QPushButton *callButton;
     QPushButton *listenButton;
     QPushButton *stopButton;
     QLabel *statusLabel;
     QTextEdit *outputText;
+
+    void refreshAudioDevices() {
+        QString audioAppPath = findAudioCallApp();
+        if (audioAppPath.isEmpty()) {
+            outputText->append("Audio call application not found");
+            return;
+        }
+
+        QProcess process;
+        process.start(audioAppPath, QStringList() << "listdevices");
+
+        if (!process.waitForFinished(5000)) {
+            outputText->append("Failed to get audio devices list");
+            return;
+        }
+
+        QString output = QString::fromUtf8(process.readAllStandardOutput());
+
+        // Парсим вывод
+        inputDeviceCombo->clear();
+        outputDeviceCombo->clear();
+
+        inputDeviceCombo->addItem("Default", -1);
+        outputDeviceCombo->addItem("Default", -1);
+
+        QStringList lines = output.split('\n');
+        for (const QString &line : lines) {
+            // Ищем строки вида "Device N: Name"
+            if (line.contains("Device ") && line.contains(":")) {
+                QStringList parts = line.split(':');
+                if (parts.size() >= 2) {
+                    QString devicePart = parts[0].trimmed();
+                    QString namePart = parts[1].trimmed();
+
+                    // Извлекаем номер устройства
+                    QStringList deviceWords = devicePart.split(' ');
+                    if (deviceWords.size() >= 2) {
+                        bool ok;
+                        int deviceId = deviceWords[1].toInt(&ok);
+                        if (ok) {
+                            // Проверяем на следующих строках, есть ли input/output каналы
+                            inputDeviceCombo->addItem(namePart, deviceId);
+                            outputDeviceCombo->addItem(namePart, deviceId);
+                        }
+                    }
+                }
+            }
+        }
+
+        outputText->append(QString("Found %1 audio devices").arg(inputDeviceCombo->count() - 1));
+    }
+
+    QString findAudioCallApp() {
+        QStringList possiblePaths = {
+            QApplication::applicationDirPath() + "/audio_call",
+            QApplication::applicationDirPath() + "/bin/audio_call",
+            QApplication::applicationDirPath() + "/../bin/audio_call",
+            "audio_call",
+            "./audio_call"
+        };
+
+#ifdef Q_OS_WIN
+        for (QString &path : possiblePaths) {
+            path += ".exe";
+        }
+#endif
+
+        for (const QString &path : possiblePaths) {
+            if (QFile::exists(path)) {
+                return path;
+            }
+        }
+
+        return QString();
+    }
 };
 
 class Backend : public QObject {
@@ -960,16 +1099,21 @@ private slots:
     }
 
     void onClientFinished(int exitCode, QProcess::ExitStatus status){
-        Q_UNUSED(exitCode);
-        Q_UNUSED(status);
-
         isConnected = false;
-        qDebug() << "Client process finished with exit code:" << exitCode;
+        qDebug() << "Client process finished with exit code:" << exitCode << "status:" << status;
+
+        // Очищаем указатель на процесс, чтобы можно было повторно подключиться
+        if(clientProc) {
+            clientProc->deleteLater();
+            clientProc = nullptr;
+        }
+
         emit disconnected();
 
-        if (exitCode != 0) {
-            emit error(QString("Client process exited with error code: %1").arg(exitCode));
-        }
+        // Не показываем ошибку - процесс мог быть остановлен пользователем через disconnect
+        // Ошибки будут приходить через stderr если они есть
+        Q_UNUSED(exitCode);
+        Q_UNUSED(status);
     }
 
     void onServerStdout(){
@@ -1028,6 +1172,26 @@ private:
         for(const QString &l : lines){
             QString t = l.trimmed();
             if(t.isEmpty()) continue;
+
+            // Check for user list messages
+            if(t.startsWith("[USERS]")) {
+                // Парсим список участников: "[USERS] Room participants (2): Alice, Bob"
+                QRegularExpression re("\\[USERS\\].*?:\\s*(.+)$");
+                QRegularExpressionMatch m = re.match(t);
+                if(m.hasMatch()) {
+                    QString userListStr = m.captured(1).trimmed();
+                    QStringList users = userListStr.split(',', Qt::SkipEmptyParts);
+
+                    // Очищаем имена от пробелов
+                    for(QString &user : users) {
+                        user = user.trimmed();
+                    }
+
+                    emit contactsUpdated(users);
+                }
+                // Не добавляем это в out, чтобы не показывать в чате
+                continue;
+            }
 
             // Check for error messages
             if(t.contains("error", Qt::CaseInsensitive) ||
@@ -1402,6 +1566,7 @@ public:
             statusLabel->setText("Disconnected");
             connectAction->setEnabled(true);
             disconnectAction->setEnabled(false);
+            contactsWidget->clear();  // Очищаем список участников при отключении
         });
         connect(backend, &Backend::serverCreated, this, &MainWindow::onServerStarted);
         connect(backend, &Backend::keyGenerated, this, &MainWindow::onKeyGenerated);

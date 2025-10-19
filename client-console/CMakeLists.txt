@@ -90,6 +90,7 @@ else()
 endif()
 
 # Установка свойств цели
-set_target_properties(${TARGET_NAME} PROPERTIES
-    VERSION ${PROJECT_VERSION}
-)
+# Не устанавливаем VERSION, чтобы избежать создания символических ссылок
+# set_target_properties(${TARGET_NAME} PROPERTIES
+#     VERSION ${PROJECT_VERSION}
+# )

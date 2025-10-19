@@ -19,7 +19,7 @@ if(WIN32)
     if(NOT DEFINED CURL_ROOT)
         set(CURL_ROOT "${CMAKE_SOURCE_DIR}/../lib/curl-8.15.0_5-win64-mingw")
     endif()
-    
+
     set(CURL_DIR "${CURL_ROOT}")
     set(CURL_INCLUDE_DIR "${CURL_DIR}/include")
     set(CURL_LIBRARY_DIR "${CURL_DIR}/lib")
@@ -28,30 +28,28 @@ if(WIN32)
     if(NOT EXISTS "${CURL_DIR}")
         message(FATAL_ERROR "Curl directory not found: ${CURL_DIR}")
     endif()
-    
+
     if(NOT EXISTS "${CURL_LIBRARY_DIR}")
         message(FATAL_ERROR "Curl lib directory not found: ${CURL_LIBRARY_DIR}")
     endif()
 
     # Настройка include директорий и линковка для Windows
     target_include_directories(updater PRIVATE "${CURL_INCLUDE_DIR}")
-    target_link_libraries(updater PRIVATE 
+    target_link_libraries(updater PRIVATE
         "${CURL_LIBRARY_DIR}/libcurl.dll.a"
-        ws2_32 
-        bcrypt 
+        ws2_32
+        bcrypt
         crypt32
     )
 
+    message(STATUS "CURL_DIR: ${CURL_DIR}")
 else()
-    # Для Linux и macOS
-    find_package(CURL REQUIRED)
-    if(CURL_FOUND)
-        target_include_directories(updater PRIVATE ${CURL_INCLUDE_DIRS})
-        target_link_libraries(updater PRIVATE ${CURL_LIBRARIES})
-    else()
-        message(FATAL_ERROR "CURL library not found")
-    endif()
-endif()
+    # Для Linux и macOS - используем системную libcurl
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(CURL REQUIRED libcurl)
 
-# Отладочная информация
-message(STATUS "CURL_DIR: ${CURL_DIR}")
+    target_include_directories(updater PRIVATE ${CURL_INCLUDE_DIRS})
+    target_link_libraries(updater PRIVATE ${CURL_LIBRARIES})
+
+    message(STATUS "Using system libcurl: ${CURL_VERSION}")
+endif()

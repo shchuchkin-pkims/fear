@@ -2,9 +2,16 @@ cmake_minimum_required(VERSION 3.16)
 project(fear_gui)
 set(CMAKE_CXX_STANDARD 17)
 
-# Настройка путей сборки
-set(CMAKE_BINARY_DIR "${CMAKE_SOURCE_DIR}/../build")
-set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/../../build/release")
+# Настройка путей сборки - выводим GUI в build (не в bin)
+set(OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/../../build")
+set(BIN_DIRECTORY "${OUTPUT_DIRECTORY}/bin")
+
+# Создаём выходные директории
+file(MAKE_DIRECTORY "${OUTPUT_DIRECTORY}")
+file(MAKE_DIRECTORY "${BIN_DIRECTORY}")
+
+# fear_gui.exe будет в build/, а не в build/bin/
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${OUTPUT_DIRECTORY}")
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib")
 set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib")
 
@@ -21,32 +28,33 @@ if(WIN32)
     find_program(WINDEPLOYQT_EXECUTABLE windeployqt HINTS "${QT_BIN_DIR}")
 endif()
 
-# Используем прямые слеши для Windows путей
-set(LIBSODIUM_PATH "${CMAKE_SOURCE_DIR}/../../lib/libsodium-win64" CACHE PATH "Path to libsodium directory (should contain include/ and lib/ folders)")
+# Конфигурация libsodium для разных платформ
+if(WIN32)
+    # Для Windows используем прямые слеши для путей
+    set(LIBSODIUM_PATH "${CMAKE_SOURCE_DIR}/../../lib/libsodium-win64" CACHE PATH "Path to libsodium directory (should contain include/ and lib/ folders)")
 
-if(LIBSODIUM_PATH)
-    message(STATUS "Using libsodium from: ${LIBSODIUM_PATH}")
-    
-    # Проверяем существование директории
-    if(NOT EXISTS ${LIBSODIUM_PATH})
-        message(FATAL_ERROR "Libsodium directory not found: ${LIBSODIUM_PATH}")
-    endif()
-    
-    # Include директории
-    if(EXISTS ${LIBSODIUM_PATH}/include)
-        set(LIBSODIUM_INCLUDE_DIRS ${LIBSODIUM_PATH}/include)
-        message(STATUS "Found include directory: ${LIBSODIUM_INCLUDE_DIRS}")
-    else()
-        message(FATAL_ERROR "Cannot find include directory in ${LIBSODIUM_PATH}")
-    endif()
-    
-    # Проверяем наличие заголовочного файла
-    if(NOT EXISTS ${LIBSODIUM_INCLUDE_DIRS}/sodium.h)
-        message(FATAL_ERROR "sodium.h not found in ${LIBSODIUM_INCLUDE_DIRS}")
-    endif()
-    
-    # Принудительно используем статическую библиотеку
-    if(WIN32)
+    if(LIBSODIUM_PATH)
+        message(STATUS "Using libsodium from: ${LIBSODIUM_PATH}")
+
+        # Проверяем существование директории
+        if(NOT EXISTS ${LIBSODIUM_PATH})
+            message(FATAL_ERROR "Libsodium directory not found: ${LIBSODIUM_PATH}")
+        endif()
+
+        # Include директории
+        if(EXISTS ${LIBSODIUM_PATH}/include)
+            set(LIBSODIUM_INCLUDE_DIRS ${LIBSODIUM_PATH}/include)
+            message(STATUS "Found include directory: ${LIBSODIUM_INCLUDE_DIRS}")
+        else()
+            message(FATAL_ERROR "Cannot find include directory in ${LIBSODIUM_PATH}")
+        endif()
+
+        # Проверяем наличие заголовочного файла
+        if(NOT EXISTS ${LIBSODIUM_INCLUDE_DIRS}/sodium.h)
+            message(FATAL_ERROR "sodium.h not found in ${LIBSODIUM_INCLUDE_DIRS}")
+        endif()
+
+        # Принудительно используем статическую библиотеку
         # В первую очередь ищем статическую библиотеку libsodium.a
         if(EXISTS ${LIBSODIUM_PATH}/lib/libsodium.a)
             set(LIBSODIUM_LIBRARIES ${LIBSODIUM_PATH}/lib/libsodium.a)
@@ -66,20 +74,26 @@ if(LIBSODIUM_PATH)
             message(FATAL_ERROR "Cannot find libsodium library in ${LIBSODIUM_PATH}/lib/")
         endif()
     else()
-        # Для Linux/Unix используем только статическую библиотеку
-        if(EXISTS ${LIBSODIUM_PATH}/lib/libsodium.a)
-            set(LIBSODIUM_LIBRARIES ${LIBSODIUM_PATH}/lib/libsodium.a)
-            message(STATUS "Using static libsodium.a: ${LIBSODIUM_LIBRARIES}")
-        else()
-            message(FATAL_ERROR "Cannot find static libsodium.a in ${LIBSODIUM_PATH}/lib/")
-        endif()
+        message(FATAL_ERROR "Please set LIBSODIUM_PATH to the libsodium directory")
     endif()
-    
 else()
-    message(FATAL_ERROR "Please set LIBSODIUM_PATH to the libsodium directory")
+    # Для Linux/Unix используем системную библиотеку
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(LIBSODIUM REQUIRED libsodium)
+
+    if(LIBSODIUM_FOUND)
+        message(STATUS "Using system libsodium")
+        message(STATUS "  Include dirs: ${LIBSODIUM_INCLUDE_DIRS}")
+        message(STATUS "  Libraries: ${LIBSODIUM_LIBRARIES}")
+    else()
+        message(FATAL_ERROR "libsodium not found. Install it with: sudo apt-get install libsodium-dev")
+    endif()
 endif()
 
-qt_standard_project_setup()
+# Qt setup (compatible with Qt 6.2+)
+set(CMAKE_AUTOMOC ON)
+set(CMAKE_AUTOUIC ON)
+set(CMAKE_AUTORCC ON)
 
 # Добавляем иконку в ресурсы Qt
 qt_add_resources(RESOURCES_FILES
@@ -106,12 +120,17 @@ if(QT_STATIC_BUILD)
     set(BUILD_SHARED_LIBS OFF)
 endif()
 
-target_link_libraries(fear_gui PRIVATE 
+target_link_libraries(fear_gui PRIVATE
     Qt6::Widgets
     ${LIBSODIUM_LIBRARIES}
 )
 
-target_include_directories(fear_gui PRIVATE ${LIBSODIUM_INCLUDE_DIRS})
+if(WIN32)
+    target_include_directories(fear_gui PRIVATE ${LIBSODIUM_INCLUDE_DIRS})
+else()
+    target_include_directories(fear_gui PRIVATE ${LIBSODIUM_INCLUDE_DIRS})
+    target_link_directories(fear_gui PRIVATE ${LIBSODIUM_LIBRARY_DIRS})
+endif()
 
 # Дополнительные флаги компиляции для статической линковки
 if(WIN32)
@@ -150,11 +169,7 @@ if(WIN32)
     endif()
 endif()
 
-set_target_properties(${PROJECT_NAME} PROPERTIES
-    AUTOMOC ON
-    AUTOUIC ON
-    AUTORCC ON
-)
+# AUTOMOC, AUTOUIC, AUTORCC уже установлены глобально выше
 
 file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR})
 file(MAKE_DIRECTORY ${CMAKE_RUNTIME_OUTPUT_DIRECTORY})
@@ -164,15 +179,15 @@ file(MAKE_DIRECTORY ${CMAKE_LIBRARY_OUTPUT_DIRECTORY})
 if(WIN32 AND WINDEPLOYQT_EXECUTABLE)
     # Полный путь к исполняемому файлу
     set(TARGET_PATH "$<TARGET_FILE:${PROJECT_NAME}>")
-    
+
     # Добавляем пользовательскую команду, которая выполняется после сборки
     add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
         COMMAND "${WINDEPLOYQT_EXECUTABLE}"
-                "$<TARGET_FILE_DIR:${PROJECT_NAME}>"
+                "$<TARGET_FILE:${PROJECT_NAME}>"
         COMMENT "Running windeployqt to deploy Qt dependencies"
         VERBATIM
     )
-    
+
     message(STATUS "windeployqt will run automatically after build")
 elseif(WIN32)
     message(WARNING "windeployqt not found - Qt dependencies will not be deployed automatically")
@@ -180,7 +195,14 @@ else()
     message(STATUS "Skipping windeployqt - not needed on Linux/Unix")
 endif()
 
-message(STATUS "Libsodium configuration complete:")
-message(STATUS "  Include dirs: ${LIBSODIUM_INCLUDE_DIRS}")
-message(STATUS "  Libraries: ${LIBSODIUM_LIBRARIES}")
-message(STATUS "  Linking: Static")
+if(WIN32)
+    message(STATUS "Libsodium configuration complete:")
+    message(STATUS "  Include dirs: ${LIBSODIUM_INCLUDE_DIRS}")
+    message(STATUS "  Libraries: ${LIBSODIUM_LIBRARIES}")
+    message(STATUS "  Linking: Static")
+else()
+    message(STATUS "Libsodium configuration complete:")
+    message(STATUS "  Include dirs: ${LIBSODIUM_INCLUDE_DIRS}")
+    message(STATUS "  Libraries: ${LIBSODIUM_LIBRARIES}")
+    message(STATUS "  Library dirs: ${LIBSODIUM_LIBRARY_DIRS}")
+endif()

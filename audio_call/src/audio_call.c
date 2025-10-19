@@ -449,7 +449,7 @@ static THREAD_RET th_recv_func(void *arg) {
 
 /* ------------------------------ Инициализация ---------------------------- */
 
-static int audio_init_ports(AudioCall *c) {
+static int audio_init_ports(AudioCall *c, int input_device_id, int output_device_id) {
     PaError pe;
 
     pe = Pa_Initialize();
@@ -464,7 +464,7 @@ static int audio_init_ports(AudioCall *c) {
         const PaHostApiInfo* info = Pa_GetHostApiInfo(i);
         printf("%d: %s\n", i, info->name);
     }
-    
+
     printf("Default input device: %d\n", Pa_GetDefaultInputDevice());
     printf("Default output device: %d\n", Pa_GetDefaultOutputDevice());
 
@@ -475,24 +475,46 @@ static int audio_init_ports(AudioCall *c) {
     memset(&inParams, 0, sizeof(inParams));
     memset(&outParams, 0, sizeof(outParams));
 
-    inParams.device = Pa_GetDefaultInputDevice();
-    if (inParams.device != paNoDevice) {
-        const PaDeviceInfo* indev = Pa_GetDeviceInfo(inParams.device);
-        printf("Input device: %s\n", indev->name);
-        inParams.channelCount = AC_CHANNELS;
-        inParams.sampleFormat = paInt16;
-        inParams.suggestedLatency = indev->defaultLowInputLatency;
-        inParams.hostApiSpecificStreamInfo = NULL;
+    // Используем указанное устройство или дефолтное
+    if (input_device_id >= 0) {
+        inParams.device = input_device_id;
+        printf("Using specified input device: %d\n", input_device_id);
+    } else {
+        inParams.device = Pa_GetDefaultInputDevice();
     }
 
-    outParams.device = Pa_GetDefaultOutputDevice();
+    if (inParams.device != paNoDevice) {
+        const PaDeviceInfo* indev = Pa_GetDeviceInfo(inParams.device);
+        if (indev) {
+            printf("Input device: %s\n", indev->name);
+            inParams.channelCount = AC_CHANNELS;
+            inParams.sampleFormat = paInt16;
+            inParams.suggestedLatency = indev->defaultLowInputLatency;
+            inParams.hostApiSpecificStreamInfo = NULL;
+        } else {
+            inParams.device = paNoDevice;
+        }
+    }
+
+    // Используем указанное устройство или дефолтное
+    if (output_device_id >= 0) {
+        outParams.device = output_device_id;
+        printf("Using specified output device: %d\n", output_device_id);
+    } else {
+        outParams.device = Pa_GetDefaultOutputDevice();
+    }
+
     if (outParams.device != paNoDevice) {
         const PaDeviceInfo* outdev = Pa_GetDeviceInfo(outParams.device);
-        printf("Output device: %s\n", outdev->name);
-        outParams.channelCount = AC_CHANNELS;
-        outParams.sampleFormat = paInt16;
-        outParams.suggestedLatency = outdev->defaultLowOutputLatency;
-        outParams.hostApiSpecificStreamInfo = NULL;
+        if (outdev) {
+            printf("Output device: %s\n", outdev->name);
+            outParams.channelCount = AC_CHANNELS;
+            outParams.sampleFormat = paInt16;
+            outParams.suggestedLatency = outdev->defaultLowOutputLatency;
+            outParams.hostApiSpecificStreamInfo = NULL;
+        } else {
+            outParams.device = paNoDevice;
+        }
     }
 
     // Пробуем открыть входной поток
@@ -595,27 +617,52 @@ void audio_call_stop(AudioCall *c) {
     atomic_store(&c->running, 0);
 
 #ifdef _WIN32
-    if (c->th_send) { WaitForSingleObject(c->th_send, INFINITE); CloseHandle(c->th_send); }
-    if (c->th_recv) { WaitForSingleObject(c->th_recv, INFINITE); CloseHandle(c->th_recv); }
+    if (c->th_send) {
+        WaitForSingleObject(c->th_send, INFINITE);
+        CloseHandle(c->th_send);
+        c->th_send = NULL;
+    }
+    if (c->th_recv) {
+        WaitForSingleObject(c->th_recv, INFINITE);
+        CloseHandle(c->th_recv);
+        c->th_recv = NULL;
+    }
 #else
-    if (c->th_send) pthread_join(c->th_send, NULL);
-    if (c->th_recv) pthread_join(c->th_recv, NULL);
+    if (c->th_send) {
+        pthread_join(c->th_send, NULL);
+        c->th_send = 0;
+    }
+    if (c->th_recv) {
+        pthread_join(c->th_recv, NULL);
+        c->th_recv = 0;
+    }
 #endif
 
-    if (c->in_stream) { 
-        Pa_StopStream(c->in_stream); 
-        Pa_CloseStream(c->in_stream); 
+    if (c->in_stream) {
+        Pa_StopStream(c->in_stream);
+        Pa_CloseStream(c->in_stream);
+        c->in_stream = NULL;
     }
-    if (c->out_stream){ 
-        Pa_StopStream(c->out_stream); 
-        Pa_CloseStream(c->out_stream); 
+    if (c->out_stream){
+        Pa_StopStream(c->out_stream);
+        Pa_CloseStream(c->out_stream);
+        c->out_stream = NULL;
     }
     Pa_Terminate();
 
-    if (c->enc) opus_encoder_destroy(c->enc);
-    if (c->dec) opus_decoder_destroy(c->dec);
+    if (c->enc) {
+        opus_encoder_destroy(c->enc);
+        c->enc = NULL;
+    }
+    if (c->dec) {
+        opus_decoder_destroy(c->dec);
+        c->dec = NULL;
+    }
 
-    if (c->sock) CLOSESOCK(c->sock);
+    if (c->sock) {
+        CLOSESOCK(c->sock);
+        c->sock = 0;
+    }
 
     pcmring_free(&c->out_ring);
     free(c);
@@ -625,7 +672,9 @@ int audio_call_start(AudioCall **out_call,
                      const char *remote_ip, uint16_t remote_port,
                      uint16_t bind_port,
                      int is_caller,
-                     const uint8_t key[AES_GCM_KEY_LEN])
+                     const uint8_t key[AES_GCM_KEY_LEN],
+                     int input_device_id,
+                     int output_device_id)
 {
     if (!out_call || !key) return -1;
     if (net_init_once() != 0) return -1;
@@ -683,7 +732,7 @@ int audio_call_start(AudioCall **out_call,
         c->peer_set = 1;
     }
 
-    if (audio_init_ports(c) != 0) {
+    if (audio_init_ports(c, input_device_id, output_device_id) != 0) {
         CLOSESOCK(c->sock);
         pcmring_free(&c->out_ring);
         free(c);
@@ -957,10 +1006,11 @@ int main(int argc, char **argv) {
         fprintf(stderr,
                 "Usage:\n"
                 "  %s genkey\n"
-                "  %s call <remote_ip> <remote_port> <hexkey32> [local_bind_port]\n"
-                "  %s listen <local_bind_port> <hexkey32>\n"
+                "  %s listdevices\n"
+                "  %s call <remote_ip> <remote_port> <hexkey32> [local_bind_port] [input_dev] [output_dev]\n"
+                "  %s listen <local_bind_port> <hexkey32> [input_dev] [output_dev]\n"
                 "  %s hub <bind_port>\n",
-                argv[0], argv[0], argv[0], argv[0]);
+                argv[0], argv[0], argv[0], argv[0], argv[0]);
         return 1;
     }
 
@@ -969,6 +1019,41 @@ int main(int argc, char **argv) {
         uint8_t key[AES_GCM_KEY_LEN];
         randombytes_buf(key, sizeof(key));
         print_hex(key, sizeof(key));
+        return 0;
+    }
+
+    if (strcmp(argv[1], "listdevices") == 0) {
+        PaError pe = Pa_Initialize();
+        if (pe != paNoError) {
+            fprintf(stderr, "PortAudio init error: %s\n", Pa_GetErrorText(pe));
+            return 1;
+        }
+
+        int numDevices = Pa_GetDeviceCount();
+        if (numDevices < 0) {
+            fprintf(stderr, "Pa_GetDeviceCount error: %s\n", Pa_GetErrorText(numDevices));
+            Pa_Terminate();
+            return 1;
+        }
+
+        printf("Total devices: %d\n", numDevices);
+        printf("Default input: %d\n", Pa_GetDefaultInputDevice());
+        printf("Default output: %d\n", Pa_GetDefaultOutputDevice());
+        printf("\n");
+
+        for (int i = 0; i < numDevices; i++) {
+            const PaDeviceInfo *info = Pa_GetDeviceInfo(i);
+            if (!info) continue;
+
+            printf("Device %d: %s\n", i, info->name);
+            printf("  Host API: %s\n", Pa_GetHostApiInfo(info->hostApi)->name);
+            printf("  Max input channels: %d\n", info->maxInputChannels);
+            printf("  Max output channels: %d\n", info->maxOutputChannels);
+            printf("  Default sample rate: %.0f Hz\n", info->defaultSampleRate);
+            printf("\n");
+        }
+
+        Pa_Terminate();
         return 0;
     }
 
@@ -983,13 +1068,15 @@ int main(int argc, char **argv) {
 
     if (strcmp(argv[1], "call") == 0) {
         if (argc < 5) {
-            fprintf(stderr, "Usage: %s call <remote_ip> <remote_port> <hexkey32> [local_bind_port]\n", argv[0]);
+            fprintf(stderr, "Usage: %s call <remote_ip> <remote_port> <hexkey32> [local_bind_port] [input_dev] [output_dev]\n", argv[0]);
             return 1;
         }
         const char *ip = argv[2];
         uint16_t rport = (uint16_t)atoi(argv[3]);
         const char *hexkey = argv[4];
         uint16_t lport = (argc >= 6) ? (uint16_t)atoi(argv[5]) : 0;
+        int input_dev = (argc >= 7) ? atoi(argv[6]) : -1;
+        int output_dev = (argc >= 8) ? atoi(argv[7]) : -1;
 
         uint8_t key[AES_GCM_KEY_LEN];
         if (hex2bytes(hexkey, key, sizeof(key)) != 0) {
@@ -998,7 +1085,7 @@ int main(int argc, char **argv) {
         }
 
         AudioCall *call = NULL;
-        if (audio_call_start(&call, ip, rport, lport, 1, key) != 0) {
+        if (audio_call_start(&call, ip, rport, lport, 1, key, input_dev, output_dev) != 0) {
             fprintf(stderr, "Failed to start call\n");
             return 1;
         }
@@ -1015,11 +1102,13 @@ int main(int argc, char **argv) {
 
     if (strcmp(argv[1], "listen") == 0) {
         if (argc < 4) {
-            fprintf(stderr, "Usage: %s listen <local_bind_port> <hexkey32>\n", argv[0]);
+            fprintf(stderr, "Usage: %s listen <local_bind_port> <hexkey32> [input_dev] [output_dev]\n", argv[0]);
             return 1;
         }
         uint16_t lport = (uint16_t)atoi(argv[2]);
         const char *hexkey = argv[3];
+        int input_dev = (argc >= 5) ? atoi(argv[4]) : -1;
+        int output_dev = (argc >= 6) ? atoi(argv[5]) : -1;
 
         uint8_t key[AES_GCM_KEY_LEN];
         if (hex2bytes(hexkey, key, sizeof(key)) != 0) {
@@ -1028,7 +1117,7 @@ int main(int argc, char **argv) {
         }
 
         AudioCall *call = NULL;
-        if (audio_call_start(&call, NULL, 0, lport, 0, key) != 0) {
+        if (audio_call_start(&call, NULL, 0, lport, 0, key, input_dev, output_dev) != 0) {
             fprintf(stderr, "Failed to start listener\n");
             return 1;
         }

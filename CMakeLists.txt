@@ -18,49 +18,53 @@ if(WIN32)
     endif()
 endif()
 
-# Установка путей для библиотек в папке lib
-set(LIBS_DIR "${CMAKE_SOURCE_DIR}/lib")
-set(LIBSODIUM_ROOT "${LIBS_DIR}/libsodium-win64")
-set(CURL_ROOT "${LIBS_DIR}/curl-8.15.0_5-win64-mingw")
-set(OPUS_ROOT "${LIBS_DIR}/opus-1.5.2")
-set(PORTAUDIO_ROOT "${LIBS_DIR}/portaudio")
-
-# Передача путей в субмодули
-set(LIBS_DIR "${LIBS_DIR}" CACHE PATH "Path to libraries directory")
-set(LIBSODIUM_ROOT "${LIBSODIUM_ROOT}" CACHE PATH "Path to libsodium")
-set(CURL_ROOT "${CURL_ROOT}" CACHE PATH "Path to curl")
-set(OPUS_ROOT "${OPUS_ROOT}" CACHE PATH "Path to opus")
-set(PORTAUDIO_ROOT "${PORTAUDIO_ROOT}" CACHE PATH "Path to portaudio")
-
-# Проверка существования библиотечных директорий
+# Установка путей для библиотек в папке lib (только для Windows)
 if(WIN32)
+    set(LIBS_DIR "${CMAKE_SOURCE_DIR}/lib")
+    set(LIBSODIUM_ROOT "${LIBS_DIR}/libsodium-win64")
+    set(CURL_ROOT "${LIBS_DIR}/curl-8.15.0_5-win64-mingw")
+    set(OPUS_ROOT "${LIBS_DIR}/opus-1.5.2")
+    set(PORTAUDIO_ROOT "${LIBS_DIR}/portaudio")
+
+    # Передача путей в субмодули
+    set(LIBS_DIR "${LIBS_DIR}" CACHE PATH "Path to libraries directory")
+    set(LIBSODIUM_ROOT "${LIBSODIUM_ROOT}" CACHE PATH "Path to libsodium")
+    set(CURL_ROOT "${CURL_ROOT}" CACHE PATH "Path to curl")
+    set(OPUS_ROOT "${OPUS_ROOT}" CACHE PATH "Path to opus")
+    set(PORTAUDIO_ROOT "${PORTAUDIO_ROOT}" CACHE PATH "Path to portaudio")
+
+    # Проверка существования библиотечных директорий
     if(NOT EXISTS "${LIBSODIUM_ROOT}")
         message(WARNING "libsodium not found at: ${LIBSODIUM_ROOT}")
         message(STATUS "Please download libsodium and place it in lib/ directory")
     else()
         message(STATUS "Found libsodium at: ${LIBSODIUM_ROOT}")
     endif()
-    
+
     if(NOT EXISTS "${CURL_ROOT}")
         message(WARNING "curl not found at: ${CURL_ROOT}")
         message(STATUS "Please download curl and place it in lib/ directory")
     else()
         message(STATUS "Found curl at: ${CURL_ROOT}")
     endif()
-    
+
     if(NOT EXISTS "${OPUS_ROOT}")
         message(WARNING "opus not found at: ${OPUS_ROOT}")
         message(STATUS "Please download opus and place it in lib/ directory")
     else()
         message(STATUS "Found opus at: ${OPUS_ROOT}")
     endif()
-    
+
     if(NOT EXISTS "${PORTAUDIO_ROOT}")
         message(WARNING "portaudio not found at: ${PORTAUDIO_ROOT}")
         message(STATUS "Please download portaudio and place it in lib/ directory")
     else()
         message(STATUS "Found portaudio at: ${PORTAUDIO_ROOT}")
     endif()
+else()
+    # На Linux используем системные библиотеки через pkg-config
+    find_package(PkgConfig REQUIRED)
+    message(STATUS "Using system libraries on Linux")
 endif()
 
 # Включение субмодулей
@@ -80,48 +84,61 @@ add_custom_target(clean-all
     COMMENT "Cleaning all build artifacts"
 )
 
-# Установка выходных файлов в корневую build директорию
+# Установка выходных файлов напрямую в build директорию
+# Все исполняемые файлы попадают в build/bin
+set(OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/build")
+set(BIN_DIRECTORY "${OUTPUT_DIRECTORY}/bin")
+set(DOC_DIRECTORY "${OUTPUT_DIRECTORY}/doc")
+
+# Создаём выходные директории
+file(MAKE_DIRECTORY "${OUTPUT_DIRECTORY}")
+file(MAKE_DIRECTORY "${BIN_DIRECTORY}")
+file(MAKE_DIRECTORY "${DOC_DIRECTORY}")
+
 set_target_properties(fear PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/release/bin"
+    RUNTIME_OUTPUT_DIRECTORY "${BIN_DIRECTORY}"
 )
 
 set_target_properties(key-exchange PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/release/bin"
+    RUNTIME_OUTPUT_DIRECTORY "${BIN_DIRECTORY}"
 )
 
 set_target_properties(updater PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/release/bin"
+    RUNTIME_OUTPUT_DIRECTORY "${BIN_DIRECTORY}"
 )
 
 set_target_properties(audio_call PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/release/bin"
+    RUNTIME_OUTPUT_DIRECTORY "${BIN_DIRECTORY}"
 )
 
-# Автоматическое копирование файлов при ЛЮБОЙ сборке
-add_custom_target(copy-updater-files ALL
-    COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/release/bin"
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different 
+# Автоматическое копирование необходимых файлов при ЛЮБОЙ сборке
+add_custom_target(copy-runtime-files ALL
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${CMAKE_SOURCE_DIR}/updater/cacert.pem"
-        "${CMAKE_BINARY_DIR}/release/bin"
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different 
-        "${CMAKE_SOURCE_DIR}/updater/libcurl-x64.dll" 
-        "${CMAKE_BINARY_DIR}/release/bin"
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different 
+        "${BIN_DIRECTORY}/cacert.pem"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_SOURCE_DIR}/updater/libcurl-x64.dll"
+        "${BIN_DIRECTORY}/libcurl-x64.dll"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${CMAKE_SOURCE_DIR}/updater/updater.conf"
-        "${CMAKE_BINARY_DIR}/release/bin"
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different 
+        "${BIN_DIRECTORY}/updater.conf"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${CMAKE_SOURCE_DIR}/doc/manual.pdf"
-        "${CMAKE_BINARY_DIR}/release/doc/manual.pdf"
-    COMMENT "Copying updater files to bin directory"
+        "${DOC_DIRECTORY}/manual.pdf"
+    COMMENT "Copying runtime files to output directory"
 )
 
 # Информация о проекте
 message(STATUS "Project: ${PROJECT_NAME}")
-message(STATUS "Libraries directory: ${LIBS_DIR}")
-message(STATUS "libsodium path: ${LIBSODIUM_ROOT}")
-message(STATUS "curl path: ${CURL_ROOT}")
-message(STATUS "opus path: ${OPUS_ROOT}")
-message(STATUS "portaudio path: ${PORTAUDIO_ROOT}")
+if(WIN32)
+    message(STATUS "Libraries directory: ${LIBS_DIR}")
+    message(STATUS "libsodium path: ${LIBSODIUM_ROOT}")
+    message(STATUS "curl path: ${CURL_ROOT}")
+    message(STATUS "opus path: ${OPUS_ROOT}")
+    message(STATUS "portaudio path: ${PORTAUDIO_ROOT}")
+else()
+    message(STATUS "Using system libraries via pkg-config")
+endif()
 
 # Дополнительная цель для создания lib директории
 add_custom_target(create-lib-dir

@@ -1,314 +1,550 @@
 /**
  * @file key-exchange.c
  * @author Evgeny Shchuchkin (shchuchkin-pkims@yandex.ru)
- * @brief Diffie-Hellman algorithm for secret key exchange between 2 persons for F.E.A.R. project messager
- * @version 0.1
- * @date 2025-08-22
- * 
+ * @brief Secure key exchange using libsodium (Curve25519) for F.E.A.R. project messenger
+ * @version 0.2
+ * @date 2025-10-16
+ *
  * @copyright Copyright (c) 2025
- * 
+ *
  */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <math.h>
-#include <time.h>
 #include <stdbool.h>
+#include <sodium.h>
 
-// Function to check if a number is prime
-bool is_prime(int n) {
-    if (n <= 1) return false;
-    if (n <= 3) return true;
-    if (n % 2 == 0 || n % 3 == 0) return false;
-    
-    for (int i = 5; i * i <= n; i += 6) {
-        if (n % i == 0 || n % (i + 2) == 0)
-            return false;
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <unistd.h>
+#endif
+
+// ANSI color codes for better terminal UI
+#define COLOR_RESET   "\033[0m"
+#define COLOR_BOLD    "\033[1m"
+#define COLOR_GREEN   "\033[32m"
+#define COLOR_BLUE    "\033[34m"
+#define COLOR_YELLOW  "\033[33m"
+#define COLOR_RED     "\033[31m"
+#define COLOR_CYAN    "\033[36m"
+
+// Box drawing characters (ASCII-compatible for Windows)
+#ifdef _WIN32
+#define BOX_TOP_LEFT     "+"
+#define BOX_TOP_RIGHT    "+"
+#define BOX_BOTTOM_LEFT  "+"
+#define BOX_BOTTOM_RIGHT "+"
+#define BOX_HORIZONTAL   "="
+#define BOX_VERTICAL     "|"
+#define BOX_SEPARATOR    "-"
+#define ICON_SUCCESS     "[OK]"
+#define ICON_ERROR       "[X]"
+#define ICON_WARNING     "[!]"
+#define ICON_INFO        "[i]"
+#else
+#define BOX_TOP_LEFT     "╔"
+#define BOX_TOP_RIGHT    "╗"
+#define BOX_BOTTOM_LEFT  "╚"
+#define BOX_BOTTOM_RIGHT "╝"
+#define BOX_HORIZONTAL   "═"
+#define BOX_VERTICAL     "║"
+#define BOX_SEPARATOR    "━"
+#define ICON_SUCCESS     "✓"
+#define ICON_ERROR       "✗"
+#define ICON_WARNING     "⚠"
+#define ICON_INFO        "ℹ"
+#endif
+
+// Key storage structure
+typedef struct {
+    unsigned char public_key[crypto_box_PUBLICKEYBYTES];
+    unsigned char secret_key[crypto_box_SECRETKEYBYTES];
+    bool keys_generated;
+} KeyPair;
+
+// Function prototypes
+void clear_screen(void);
+void print_header(void);
+void print_separator(void);
+void bytes_to_hex(const unsigned char *bytes, size_t bytes_len, char *hex);
+bool hex_to_bytes(const char *hex, unsigned char *bytes, size_t expected_len);
+void secure_input(char *buffer, size_t size);
+void generate_keypair_mode(KeyPair *kp);
+void encrypt_message_mode(KeyPair *kp);
+void decrypt_message_mode(KeyPair *kp);
+void export_keys_mode(KeyPair *kp);
+void import_keys_mode(KeyPair *kp);
+void print_menu(void);
+
+// Clear screen cross-platform
+void clear_screen(void) {
+    #ifdef _WIN32
+    system("cls");
+    #else
+    printf("\033[2J\033[H");
+    #endif
+}
+
+
+void print_separator(void) {
+    printf(COLOR_BLUE);
+    for (int i = 0; i < 50; i++) printf(BOX_SEPARATOR);
+    printf(COLOR_RESET "\n");
+}
+
+
+void print_header(void) {
+    const char *title = "F.E.A.R. Secure Key Exchange";
+    int box_width = 50;
+    int title_len = strlen(title);
+    int padding = (box_width - title_len - 2) / 2; // -2 for side borders
+
+    // Top border
+    printf(COLOR_BOLD COLOR_CYAN);
+    printf("%s", BOX_TOP_LEFT);
+    for (int i = 0; i < box_width - 2; i++) printf(BOX_HORIZONTAL);
+    printf("%s\n", BOX_TOP_RIGHT);
+
+    // Title line with centering
+    printf("%s", BOX_VERTICAL);
+    for (int i = 0; i < padding; i++) printf(" ");
+    printf("%s", title);
+    for (int i = 0; i < box_width - title_len - padding - 2; i++) printf(" ");
+    printf("%s\n", BOX_VERTICAL);
+
+    // Bottom border
+    printf("%s", BOX_BOTTOM_LEFT);
+    for (int i = 0; i < box_width - 2; i++) printf(BOX_HORIZONTAL);
+    printf("%s\n", BOX_BOTTOM_RIGHT);
+    printf(COLOR_RESET);
+}
+
+
+void bytes_to_hex(const unsigned char *bytes, size_t bytes_len, char *hex) {
+    static const char hex_table[] = "0123456789abcdef";
+    for (size_t i = 0; i < bytes_len; i++) {
+    hex[i * 2] = hex_table[(bytes[i] >> 4) & 0xF];
+    hex[i * 2 + 1] = hex_table[bytes[i] & 0xF];
+    }
+    hex[bytes_len * 2] = '\0';
+}
+
+// Convert hex string to bytes
+bool hex_to_bytes(const char *hex, unsigned char *bytes, size_t expected_len) {
+    size_t len = strlen(hex);
+    if (len != expected_len * 2) return false;
+    for (size_t i = 0; i < expected_len; i++) {
+    unsigned int value;
+    if (sscanf(hex + i * 2, "%2x", &value) != 1) return false;
+    bytes[i] = (unsigned char)value;
     }
     return true;
 }
 
-// Generate a large prime number
-int generate_large_prime(int min, int max) {
-    int candidate;
-    do {
-        candidate = min + rand() % (max - min + 1);
-        // Ensure the number is odd (except 2)
-        if (candidate % 2 == 0 && candidate != 2) candidate++;
-    } while (!is_prime(candidate));
-    return candidate;
+
+void secure_input(char *buffer, size_t size) {
+    if (!fgets(buffer, size, stdin)) {
+    buffer[0] = '\0';
+    return;
+    }
+    size_t len = strlen(buffer);
+    if (len > 0 && buffer[len - 1] == '\n') buffer[len - 1] = '\0';
 }
 
-// Find a primitive root modulo p
-int find_primitive_root(int p) {
-    if (p == 2) return 1;
-    
-    int phi = p - 1;
-    int factors[100];
-    int factor_count = 0;
-    
-    int temp = phi;
-    for (int i = 2; i <= temp; i++) {
-        while (temp % i == 0) {
-            factors[factor_count++] = i;
-            temp /= i;
+// Generate new keypair
+
+
+void generate_keypair_mode(KeyPair *kp) {
+    clear_screen();
+    print_header();
+    printf(COLOR_BOLD COLOR_GREEN "\n[1] GENERATE NEW KEY PAIR\n\n" COLOR_RESET);
+
+
+    crypto_box_keypair(kp->public_key, kp->secret_key);
+    kp->keys_generated = true;
+
+
+    char public_hex[crypto_box_PUBLICKEYBYTES * 2 + 1];
+    char secret_hex[crypto_box_SECRETKEYBYTES * 2 + 1];
+
+
+    bytes_to_hex(kp->public_key, crypto_box_PUBLICKEYBYTES, public_hex);
+    bytes_to_hex(kp->secret_key, crypto_box_SECRETKEYBYTES, secret_hex);
+
+
+    printf(COLOR_CYAN "Your keys were generated successfully!\n" COLOR_RESET);
+    print_separator();
+    printf(COLOR_BOLD "PUBLIC KEY:\n" COLOR_RESET "%s\n", public_hex);
+    printf(COLOR_BOLD "SECRET KEY:\n" COLOR_RESET "%s\n", secret_hex);
+    print_separator();
+}
+
+// Encrypt message
+void encrypt_message_mode(KeyPair *kp) {
+    clear_screen();
+    print_header();
+    printf(COLOR_BOLD COLOR_GREEN "\n[2] ENCRYPT MESSAGE\n\n" COLOR_RESET);
+
+
+    if (!kp->keys_generated) {
+    printf(COLOR_RED "%s Error: No keys generated! Please generate or import keys first.\n" COLOR_RESET, ICON_ERROR);
+    return;
+    }
+
+
+    char recipient_hex[crypto_box_PUBLICKEYBYTES * 2 + 1];
+    unsigned char recipient_pk[crypto_box_PUBLICKEYBYTES];
+
+
+    printf("Enter recipient's PUBLIC KEY (hex): ");
+    secure_input(recipient_hex, sizeof(recipient_hex));
+
+
+    int ch;
+    while ((ch = getchar()) != '\n' && ch != EOF);
+
+
+    if (!hex_to_bytes(recipient_hex, recipient_pk, crypto_box_PUBLICKEYBYTES)) {
+    printf(COLOR_RED "%s Error: Invalid public key format!\n" COLOR_RESET, ICON_ERROR);
+    return;
+    }
+
+
+    char message[1024];
+    printf("Enter message to encrypt: ");
+    secure_input(message, sizeof(message));
+
+
+    if (strlen(message) == 0) {
+    printf(COLOR_RED "[X] Error: Message cannot be empty!\n" COLOR_RESET);
+    return;
+    }
+
+
+    unsigned char nonce[crypto_box_NONCEBYTES];
+    randombytes_buf(nonce, sizeof(nonce));
+
+
+    size_t ciphertext_len = crypto_box_MACBYTES + strlen(message);
+    unsigned char *ciphertext = malloc(ciphertext_len);
+
+
+    crypto_box_easy(ciphertext, (const unsigned char *)message, strlen(message), nonce, recipient_pk, kp->secret_key);
+
+
+    char hex_nonce[crypto_box_NONCEBYTES * 2 + 1];
+    char hex_cipher[ciphertext_len * 2 + 1];
+
+
+    bytes_to_hex(nonce, crypto_box_NONCEBYTES, hex_nonce);
+    bytes_to_hex(ciphertext, ciphertext_len, hex_cipher);
+
+    // Get your public key to share
+    char your_public_hex[crypto_box_PUBLICKEYBYTES * 2 + 1];
+    bytes_to_hex(kp->public_key, crypto_box_PUBLICKEYBYTES, your_public_hex);
+
+    printf(COLOR_GREEN "\n%s Message encrypted successfully!\n\n" COLOR_RESET, ICON_SUCCESS);
+    print_separator();
+    printf(COLOR_BOLD "Share Your PUBLIC KEY with recipient (hex):\n" COLOR_RESET);
+    printf(COLOR_CYAN "%s\n\n" COLOR_RESET, your_public_hex);
+    printf(COLOR_BOLD "ENCRYPTED MESSAGE (hex):\n" COLOR_RESET);
+    printf(COLOR_YELLOW "%s%s\n" COLOR_RESET, hex_nonce, hex_cipher);
+    print_separator();
+
+
+free(ciphertext);
+}
+
+// Decrypt message
+void decrypt_message_mode(KeyPair *kp) {
+    clear_screen();
+    print_header();
+    printf(COLOR_BOLD COLOR_GREEN "\n[3] DECRYPT MESSAGE\n\n" COLOR_RESET);
+
+    if (!kp->keys_generated) {
+        printf(COLOR_RED "%s Error: No keys generated! Please generate or import keys first.\n" COLOR_RESET, ICON_ERROR);
+        return;
+    }
+
+    // Show your public key to share with sender
+    char your_public_hex[crypto_box_PUBLICKEYBYTES * 2 + 1];
+    bytes_to_hex(kp->public_key, crypto_box_PUBLICKEYBYTES, your_public_hex);
+    printf(COLOR_BOLD "Your public key to share: " COLOR_RESET);
+    printf(COLOR_CYAN "%s\n\n" COLOR_RESET, your_public_hex);
+
+    // Get sender's public key
+    char sender_hex[crypto_box_PUBLICKEYBYTES * 2 + 1];
+    unsigned char sender_pk[crypto_box_PUBLICKEYBYTES];
+
+    printf("Enter sender's PUBLIC KEY (hex): ");
+    secure_input(sender_hex, sizeof(sender_hex));
+
+    // Clear input buffer
+    int ch;
+    while ((ch = getchar()) != '\n' && ch != EOF);
+
+    if (!hex_to_bytes(sender_hex, sender_pk, crypto_box_PUBLICKEYBYTES)) {
+        printf(COLOR_RED "\n%s Error: Invalid public key format!\n" COLOR_RESET, ICON_ERROR);
+        return;
+    }
+
+    // Get ciphertext
+    char *hex_ciphertext = malloc(4096);
+    if (!hex_ciphertext) {
+        printf(COLOR_RED "\n%s Error: Memory allocation failed!\n" COLOR_RESET, ICON_ERROR);
+        return;
+    }
+
+    printf("\nEnter ENCRYPTED MESSAGE (hex): ");
+    secure_input(hex_ciphertext, 4096);
+
+    size_t hex_len = strlen(hex_ciphertext);
+    size_t min_len = (crypto_box_NONCEBYTES + crypto_box_MACBYTES) * 2;
+    if (hex_len < min_len) {
+        printf(COLOR_RED "\n%s Error: Ciphertext too short!\n" COLOR_RESET, ICON_ERROR);
+        printf(COLOR_YELLOW "   Expected at least %zu hex characters, but got %zu\n" COLOR_RESET, min_len, hex_len);
+        printf(COLOR_CYAN "   Hint: Make sure you paste the complete encrypted message\n" COLOR_RESET);
+        free(hex_ciphertext);
+        return;
+    }
+
+    // Convert hex to bytes
+    size_t ciphertext_len = hex_len / 2;
+    unsigned char *ciphertext = malloc(ciphertext_len);
+    if (!ciphertext) {
+        printf(COLOR_RED "\n%s Error: Memory allocation failed!\n" COLOR_RESET, ICON_ERROR);
+        free(hex_ciphertext);
+        return;
+    }
+
+    if (!hex_to_bytes(hex_ciphertext, ciphertext, ciphertext_len)) {
+        printf(COLOR_RED "\n%s Error: Invalid ciphertext format!\n" COLOR_RESET, ICON_ERROR);
+        free(hex_ciphertext);
+        free(ciphertext);
+        return;
+    }
+
+    // Extract nonce
+    unsigned char nonce[crypto_box_NONCEBYTES];
+    memcpy(nonce, ciphertext, crypto_box_NONCEBYTES);
+
+    // Prepare decrypted message buffer
+    size_t message_len = ciphertext_len - crypto_box_NONCEBYTES - crypto_box_MACBYTES;
+    unsigned char *decrypted = malloc(message_len + 1);
+    if (!decrypted) {
+        printf(COLOR_RED "\n%s Error: Memory allocation failed!\n" COLOR_RESET, ICON_ERROR);
+        free(hex_ciphertext);
+        free(ciphertext);
+        return;
+    }
+
+    // Decrypt the message
+    if (crypto_box_open_easy(decrypted,
+                            ciphertext + crypto_box_NONCEBYTES,
+                            ciphertext_len - crypto_box_NONCEBYTES,
+                            nonce, sender_pk, kp->secret_key) != 0) {
+        printf(COLOR_RED "\n%s Error: Decryption failed! Wrong key or corrupted message.\n" COLOR_RESET, ICON_ERROR);
+        free(hex_ciphertext);
+        free(ciphertext);
+        free(decrypted);
+        return;
+    }
+
+    // Null-terminate the decrypted message
+    decrypted[message_len] = '\0';
+
+    printf(COLOR_GREEN "\n%s Message decrypted successfully!\n\n" COLOR_RESET, ICON_SUCCESS);
+    print_separator();
+    printf(COLOR_BOLD "DECRYPTED MESSAGE:\n" COLOR_RESET);
+    printf(COLOR_YELLOW "%s\n" COLOR_RESET, decrypted);
+    print_separator();
+
+    // Clean up
+    sodium_memzero(decrypted, message_len);
+    sodium_memzero(ciphertext, ciphertext_len);
+    free(hex_ciphertext);
+    free(ciphertext);
+    free(decrypted);
+}
+
+// Export keys to file
+void export_keys_mode(KeyPair *kp) {
+    clear_screen();
+    print_header();
+    printf(COLOR_BOLD COLOR_GREEN "\n[4] EXPORT KEYS TO FILE\n\n" COLOR_RESET);
+
+    if (!kp->keys_generated) {
+        printf(COLOR_RED "%s Error: No keys generated! Please generate or import keys first.\n" COLOR_RESET, ICON_ERROR);
+        return;
+    }
+
+    char filename[256];
+    printf("Enter filename to save keys (e.g., my_keys.txt): ");
+    secure_input(filename, sizeof(filename));
+
+    FILE *file = fopen(filename, "w");
+    if (!file) {
+        printf(COLOR_RED "\n%s Error: Cannot create file!\n" COLOR_RESET, ICON_ERROR);
+        return;
+    }
+
+    char public_hex[crypto_box_PUBLICKEYBYTES * 2 + 1];
+    char secret_hex[crypto_box_SECRETKEYBYTES * 2 + 1];
+
+    bytes_to_hex(kp->public_key, crypto_box_PUBLICKEYBYTES, public_hex);
+    bytes_to_hex(kp->secret_key, crypto_box_SECRETKEYBYTES, secret_hex);
+
+    fprintf(file, "# F.E.A.R. Key Exchange Keys\n");
+    fprintf(file, "# WARNING: Keep this file secure!\n\n");
+    fprintf(file, "PUBLIC_KEY=%s\n", public_hex);
+    fprintf(file, "SECRET_KEY=%s\n", secret_hex);
+
+    fclose(file);
+
+    printf(COLOR_GREEN "\n%s Keys exported successfully to '%s'!\n" COLOR_RESET, ICON_SUCCESS, filename);
+    printf(COLOR_YELLOW "%s Keep this file secure and never share your secret key!\n" COLOR_RESET, ICON_WARNING);
+}
+
+// Import keys from file
+void import_keys_mode(KeyPair *kp) {
+    clear_screen();
+    print_header();
+    printf(COLOR_BOLD COLOR_GREEN "\n[5] IMPORT KEYS FROM FILE\n\n" COLOR_RESET);
+
+    char filename[256];
+    printf("Enter filename to load keys from: ");
+    secure_input(filename, sizeof(filename));
+
+    FILE *file = fopen(filename, "r");
+    if (!file) {
+        printf(COLOR_RED "\n%s Error: Cannot open file!\n" COLOR_RESET, ICON_ERROR);
+        return;
+    }
+
+    char line[256];
+    char public_hex[crypto_box_PUBLICKEYBYTES * 2 + 1] = {0};
+    char secret_hex[crypto_box_SECRETKEYBYTES * 2 + 1] = {0};
+
+    while (fgets(line, sizeof(line), file)) {
+        if (strncmp(line, "PUBLIC_KEY=", 11) == 0) {
+            strncpy(public_hex, line + 11, crypto_box_PUBLICKEYBYTES * 2);
+            public_hex[crypto_box_PUBLICKEYBYTES * 2] = '\0';
+        } else if (strncmp(line, "SECRET_KEY=", 11) == 0) {
+            strncpy(secret_hex, line + 11, crypto_box_SECRETKEYBYTES * 2);
+            secret_hex[crypto_box_SECRETKEYBYTES * 2] = '\0';
         }
     }
-    
-    for (int r = 2; r <= p; r++) {
-        bool is_primitive = true;
-        for (int i = 0; i < factor_count; i++) {
-            if (i == 0 || factors[i] != factors[i-1]) {
-                int exponent = phi / factors[i];
-                long long result = 1;
-                long long base = r;
-                
-                // Fast exponentiation modulo
-                while (exponent > 0) {
-                    if (exponent % 2 == 1) {
-                        result = (result * base) % p;
-                    }
-                    base = (base * base) % p;
-                    exponent /= 2;
-                }
-                
-                if (result == 1) {
-                    is_primitive = false;
-                    break;
-                }
-            }
-        }
-        if (is_primitive) {
-            return r;
-        }
+
+    fclose(file);
+
+    if (strlen(public_hex) != crypto_box_PUBLICKEYBYTES * 2 ||
+        strlen(secret_hex) != crypto_box_SECRETKEYBYTES * 2) {
+        printf(COLOR_RED "\n%s Error: Invalid key file format!\n" COLOR_RESET, ICON_ERROR);
+        return;
     }
-    return 2; // Return 2 as a simple option
-}
 
-// Fast exponentiation modulo
-long long mod_pow(long long base, long long exponent, long long mod) {
-    long long result = 1;
-    base = base % mod;
-    
-    while (exponent > 0) {
-        if (exponent % 2 == 1) {
-            result = (result * base) % mod;
-        }
-        exponent = exponent >> 1;
-        base = (base * base) % mod;
+    if (!hex_to_bytes(public_hex, kp->public_key, crypto_box_PUBLICKEYBYTES) ||
+        !hex_to_bytes(secret_hex, kp->secret_key, crypto_box_SECRETKEYBYTES)) {
+        printf(COLOR_RED "\n%s Error: Invalid key data in file!\n" COLOR_RESET, ICON_ERROR);
+        return;
     }
-    return result;
+
+    kp->keys_generated = true;
+
+    printf(COLOR_GREEN "\n%s Keys imported successfully from '%s'!\n" COLOR_RESET, ICON_SUCCESS, filename);
+    printf(COLOR_CYAN "\n%s Your keys are now loaded and ready to use.\n" COLOR_RESET, ICON_INFO);
 }
 
-// Generate a random number
-int generate_random_number(int min, int max) {
-    return min + rand() % (max - min + 1);
+// Print main menu
+void print_menu(void) {
+    printf("\n");
+    print_separator();
+    printf(COLOR_BOLD "MAIN MENU:\n" COLOR_RESET);
+    printf("  [1] Generate new key pair\n");
+    printf("  [2] Encrypt message\n");
+    printf("  [3] Decrypt message\n");
+    printf("  [4] Export keys to file\n");
+    printf("  [5] Import keys from file\n");
+    printf("  [0] Exit\n");
+    print_separator();
+    printf("Your choice: ");
 }
 
-// XOR encryption/decryption function
-void xor_encrypt_decrypt(const char *input, char *output, long long key, int length) {
-    for (int i = 0; i < length; i++) {
-        output[i] = input[i] ^ (char)(key >> (8 * (i % 8)));
+int main(void) {
+#ifdef _WIN32
+    // Enable UTF-8 support for Windows Console (Windows 10+)
+    SetConsoleOutputCP(CP_UTF8);
+    SetConsoleCP(CP_UTF8);
+
+    // Enable ANSI color codes support
+    HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+    DWORD dwMode = 0;
+    GetConsoleMode(hOut, &dwMode);
+    dwMode |= ENABLE_VIRTUAL_TERMINAL_PROCESSING;
+    SetConsoleMode(hOut, dwMode);
+#endif
+
+    // Initialize libsodium
+    if (sodium_init() < 0) {
+        fprintf(stderr, "Fatal error: Failed to initialize libsodium!\n");
+        return 1;
     }
-    output[length] = '\0';
-}
 
-// Convert hex to binary
-void hex_to_binary(const char *hex, char *binary, int length) {
-    for (int i = 0; i < length; i += 2) {
-        char hex_byte[3] = {hex[i], hex[i+1], '\0'};
-        binary[i/2] = (char)strtol(hex_byte, NULL, 16);
-    }
-}
+    KeyPair kp = {0};
+    kp.keys_generated = false;
 
-// Convert binary to hex
-void binary_to_hex(const char *binary, char *hex, int length) {
-    for (int i = 0; i < length; i++) {
-        sprintf(hex + i*2, "%02x", (unsigned char)binary[i]);
-    }
-    hex[length*2] = '\0';
-}
-
-// Sender mode
-void sender_mode() {
-    printf("\n=== SENDER MODE ===\n\n");
-    
-    srand(time(NULL));
-    
-    // Automatically generate a large prime number
-    int p = generate_large_prime(10000, 50000);
-    int g = find_primitive_root(p);
-    
-    printf("Generated parameters:\n");
-    printf("- Prime number (p): %d\n", p);
-    printf("- Primitive root (g): %d\n", g);
-    
-    // Generate secret key
-    int private_key = generate_random_number(2, p-2);
-    printf("Your secret key: %d (keep secret!)\n", private_key);
-    
-    // Calculate public key
-    long long public_key = mod_pow(g, private_key, p);
-    printf("Your public key: %lld\n", public_key);
-    
-    // Get the key to transfer
-    char original_key[100];
-    printf("\nEnter the key you want to transfer: ");
-    fgets(original_key, sizeof(original_key), stdin);
-    original_key[strcspn(original_key, "\n")] = '\0';
-    
-    printf("Key to transfer: '%s'\n", original_key);
-    printf("Key length: %zu characters\n", strlen(original_key));
-    
-    // Get friend's public key
-    long long friend_public_key;
-    printf("\nEnter your friend's public key: ");
-    scanf("%lld", &friend_public_key);
-    getchar();
-    
-    // Calculate shared secret
-    long long shared_secret = mod_pow(friend_public_key, private_key, p);
-    printf("Shared secret key: %lld\n", shared_secret);
-    
-    // Encrypt the key
-    char encrypted_key[100];
-    xor_encrypt_decrypt(original_key, encrypted_key, shared_secret, strlen(original_key));
-    
-    // Convert to hex for easier transfer
-    char hex_encrypted[200];
-    binary_to_hex(encrypted_key, hex_encrypted, strlen(original_key));
-    
-    printf("\n=== DATA TO SEND TO YOUR FRIEND ===\n\n");
-    printf("1. Prime number (p): %d\n", p);
-    printf("2. Primitive root (g): %d\n", g);
-    printf("3. Your public key: %lld\n", public_key);
-    printf("4. Encrypted key (hex): %s\n", hex_encrypted);
-    printf("\nSend this data to your friend!\n");
-}
-
-// Public key generation mode
-void get_public_key_mode() {
-    printf("\n=== PUBLIC KEY GENERATION MODE ===\n\n");
-    
-    srand(time(NULL));
-    
-    // Get parameters from sender
-    int p, g;
-    printf("Enter prime number (p) from sender: ");
-    scanf("%d", &p);
-    getchar();
-    
-    printf("Enter primitive root (g) from sender: ");
-    scanf("%d", &g);
-    getchar();
-    
-    // Generate own secret key
-    int private_key = generate_random_number(2, p-2);
-    printf("Your secret key: %d (keep secret!)\n", private_key);
-    
-    // Calculate own public key
-    long long public_key = mod_pow(g, private_key, p);
-    printf("\n=== YOUR PUBLIC KEY TO SEND ===\n\n");
-    printf("%lld\n\n", public_key);
-    printf("Send this key to the sender!\n");
-    
-    // Save parameters for future use
-    printf("\nRemember these parameters for decryption:\n");
-    printf("- p: %d\n", p);
-    printf("- g: %d\n", g);
-    printf("- Your secret key: %d\n", private_key);
-    printf("- Sender's public key: (to be received later)\n");
-}
-
-// Receiver mode
-void receiver_mode() {
-    printf("\n=== RECEIVER MODE ===\n\n");
-    
-    // Get parameters from sender
-    int p, g;
-    long long sender_public_key;
-    char hex_encrypted[200];
-    
-    printf("Enter prime number (p): ");
-    scanf("%d", &p);
-    getchar();
-    
-    printf("Enter primitive root (g): ");
-    scanf("%d", &g);
-    getchar();
-    
-    printf("Enter sender's public key: ");
-    scanf("%lld", &sender_public_key);
-    getchar();
-    
-    printf("Enter encrypted key (hex): ");
-    scanf("%s", hex_encrypted);
-    getchar();
-    
-    // Enter own secret key
-    int private_key;
-    printf("Enter your secret key: ");
-    scanf("%d", &private_key);
-    getchar();
-    
-    // Calculate shared secret
-    long long shared_secret = mod_pow(sender_public_key, private_key, p);
-    printf("Shared secret key: %lld\n", shared_secret);
-    
-    // Convert hex back to binary
-    int encrypted_length = strlen(hex_encrypted) / 2;
-    char encrypted_key[100];
-    hex_to_binary(hex_encrypted, encrypted_key, strlen(hex_encrypted));
-    
-    // Decrypt the key
-    char decrypted_key[100];
-    xor_encrypt_decrypt(encrypted_key, decrypted_key, shared_secret, encrypted_length);
-    decrypted_key[encrypted_length] = '\0';
-    
-    printf("\n=== RESULT ===\n\n");
-    printf("Decrypted key: '%s'\n", decrypted_key);
-    printf("Key length: %zu characters\n", strlen(decrypted_key));
-}
-
-int main() {
-    printf("=== DIFFIE-HELLMAN KEY EXCHANGE PROGRAM ===\n\n");
-    
-    srand(time(NULL));
-    
     int choice;
+    char input[10];
+
+    clear_screen();
+    print_header();
+    printf("\n" COLOR_GREEN "%s libsodium initialized successfully!\n" COLOR_RESET, ICON_SUCCESS);
+    printf(COLOR_CYAN "%s This utility uses Curve25519 for secure key exchange.\n" COLOR_RESET, ICON_INFO);
+
     do {
-        printf("Select mode:\n");
-        printf("1 - I am sender (want to send a key)\n");
-        printf("2 - Generate public key (for receiver)\n");
-        printf("3 - I am receiver (want to decrypt a key)\n");
-        printf("0 - Exit\n");
-        printf("Your choice: ");
-        scanf("%d", &choice);
-        getchar();
-        
+        print_menu();
+        secure_input(input, sizeof(input));
+        choice = atoi(input);
+
         switch (choice) {
             case 1:
-                sender_mode();
+                generate_keypair_mode(&kp);
                 break;
             case 2:
-                get_public_key_mode();
+                encrypt_message_mode(&kp);
                 break;
             case 3:
-                receiver_mode();
+                decrypt_message_mode(&kp);
+                break;
+            case 4:
+                export_keys_mode(&kp);
+                break;
+            case 5:
+                import_keys_mode(&kp);
                 break;
             case 0:
-                printf("Exiting program.\n");
+                clear_screen();
+                print_header();
+                printf("\n" COLOR_GREEN "Goodbye! Stay secure.\n" COLOR_RESET);
                 break;
             default:
-                printf("Invalid choice. Please try again.\n");
+                printf(COLOR_RED "\n%s Invalid choice. Please try again.\n" COLOR_RESET, ICON_ERROR);
         }
-        
+
         if (choice != 0) {
-            printf("\nPress Enter to continue...");
-            getchar();
+            printf("\n" COLOR_CYAN "Press Enter to continue..." COLOR_RESET);
+            char dummy[2];
+            secure_input(dummy, sizeof(dummy));
         }
-        
+
     } while (choice != 0);
-    
+
+    // Clear sensitive data from memory
+    if (kp.keys_generated) {
+        sodium_memzero(kp.secret_key, sizeof(kp.secret_key));
+    }
+
     return 0;
 }

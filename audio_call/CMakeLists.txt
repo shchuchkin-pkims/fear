@@ -81,10 +81,11 @@ if(WIN32)
     endif()
 
     # Линковка библиотек
-    target_link_libraries(audio_call PRIVATE 
+    target_link_libraries(audio_call PRIVATE
         "${SODIUM_LIB}"
         "${OPUS_LIB}"
         "${PORTAUDIO_LIB}"
+        ssp
         ws2_32
         winmm
         ole32
@@ -98,47 +99,34 @@ if(WIN32)
     )
 
 else()
-    # Для Linux (если понадобится)
-    find_package(PkgConfig)
-    
+    # Для Linux - используем системные библиотеки
+    find_package(PkgConfig REQUIRED)
+
     # Поиск libsodium
-    pkg_check_modules(LIBSODIUM libsodium)
-    if(LIBSODIUM_FOUND)
-        target_include_directories(audio_call PRIVATE ${LIBSODIUM_INCLUDE_DIRS})
-        target_link_libraries(audio_call PRIVATE ${LIBSODIUM_LIBRARIES})
-    else()
-        find_library(SODIUM_LIB sodium)
-        if(SODIUM_LIB)
-            target_link_libraries(audio_call PRIVATE ${SODIUM_LIB})
-        else()
-            message(FATAL_ERROR "libsodium not found")
-        endif()
-    endif()
+    pkg_check_modules(LIBSODIUM REQUIRED libsodium)
+    target_include_directories(audio_call PRIVATE ${LIBSODIUM_INCLUDE_DIRS})
+    target_link_libraries(audio_call PRIVATE ${LIBSODIUM_LIBRARIES})
+    message(STATUS "Using system libsodium: ${LIBSODIUM_VERSION}")
 
     # Поиск opus
-    pkg_check_modules(OPUS opus)
-    if(OPUS_FOUND)
-        target_include_directories(audio_call PRIVATE ${OPUS_INCLUDE_DIRS})
-        target_link_libraries(audio_call PRIVATE ${OPUS_LIBRARIES})
-    else()
-        find_library(OPUS_LIB opus)
-        if(OPUS_LIB)
-            target_link_libraries(audio_call PRIVATE ${OPUS_LIB})
-        else()
-            message(FATAL_ERROR "opus not found")
-        endif()
-    endif()
+    pkg_check_modules(OPUS REQUIRED opus)
+    target_include_directories(audio_call PRIVATE ${OPUS_INCLUDE_DIRS})
+    target_link_libraries(audio_call PRIVATE ${OPUS_LIBRARIES})
+    message(STATUS "Using system opus: ${OPUS_VERSION}")
 
     # Поиск portaudio
-    find_library(PORTAUDIO_LIB portaudio)
-    if(PORTAUDIO_LIB)
-        target_link_libraries(audio_call PRIVATE ${PORTAUDIO_LIB})
-    else()
-        message(FATAL_ERROR "portaudio not found")
-    endif()
+    pkg_check_modules(PORTAUDIO REQUIRED portaudio-2.0)
+    target_include_directories(audio_call PRIVATE ${PORTAUDIO_INCLUDE_DIRS})
+    target_link_libraries(audio_call PRIVATE ${PORTAUDIO_LIBRARIES})
+    message(STATUS "Using system portaudio: ${PORTAUDIO_VERSION}")
+
+    # Дополнительные библиотеки для Linux
+    target_link_libraries(audio_call PRIVATE pthread m)
 endif()
 
 # Отладочная информация
-message(STATUS "libsodium path: ${LIBSODIUM_ROOT}")
-message(STATUS "opus path: ${OPUS_ROOT}")
-message(STATUS "portaudio path: ${PORTAUDIO_ROOT}")
+if(WIN32)
+    message(STATUS "libsodium path: ${LIBSODIUM_ROOT}")
+    message(STATUS "opus path: ${OPUS_ROOT}")
+    message(STATUS "portaudio path: ${PORTAUDIO_ROOT}")
+endif()
