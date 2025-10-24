@@ -2,7 +2,7 @@
 
 <div align="center">
 
-![F.E.A.R. Project](./doc/images/logo.png)
+![F.E.A.R. Project](./doc/images/banner_small.png)
 
 **Privacy-focused secure messaging platform with end-to-end encryption**
 
