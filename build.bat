@@ -140,6 +140,72 @@ echo %GREEN%GUI built successfully%NC%
 echo.
 
 REM =============================================================================
+REM Deploy Qt Dependencies
+REM =============================================================================
+
+echo ========================================
+echo   Deploying Qt Dependencies
+echo ========================================
+echo.
+
+REM Check if fear_gui.exe exists
+if not exist "%OUTPUT_DIR%\fear_gui.exe" (
+    echo %RED%Error: fear_gui.exe not found in %OUTPUT_DIR%%NC%
+    goto build_error
+)
+
+echo %YELLOW%Searching for windeployqt...%NC%
+
+REM Try to find windeployqt in PATH
+where windeployqt >nul 2>&1
+if errorlevel 1 (
+    REM Try to find Qt installation
+    echo %YELLOW%windeployqt not in PATH, searching Qt installation...%NC%
+
+    REM Common Qt installation paths
+    set "QT_PATHS=C:\Qt\6.8.0\mingw_64\bin;C:\Qt\6.7.0\mingw_64\bin;C:\Qt\6.6.0\mingw_64\bin;C:\Qt\6.5.0\mingw_64\bin;C:\Qt\6.4.0\mingw_64\bin"
+
+    set "WINDEPLOYQT_FOUND="
+    for %%p in ("%QT_PATHS:;=" "%") do (
+        if exist "%%~p\windeployqt.exe" (
+            set "WINDEPLOYQT=%%~p\windeployqt.exe"
+            set "WINDEPLOYQT_FOUND=1"
+            echo %GREEN%Found windeployqt at: %%~p%NC%
+            goto :found_windeployqt
+        )
+    )
+
+    if not defined WINDEPLOYQT_FOUND (
+        echo %RED%WARNING: windeployqt not found!%NC%
+        echo Qt DLL files will NOT be deployed automatically.
+        echo.
+        echo To fix this issue:
+        echo 1. Add Qt bin directory to PATH, or
+        echo 2. Run windeployqt manually: windeployqt %OUTPUT_DIR%\fear_gui.exe
+        echo.
+        echo %YELLOW%GUI may not work on systems without Qt installed.%NC%
+        echo.
+        goto skip_windeployqt
+    )
+) else (
+    set "WINDEPLOYQT=windeployqt"
+)
+
+:found_windeployqt
+echo %YELLOW%Running windeployqt to deploy Qt libraries...%NC%
+cd /d "%OUTPUT_DIR%"
+"%WINDEPLOYQT%" fear_gui.exe --release --no-translations
+if errorlevel 1 (
+    echo %RED%Warning: windeployqt completed with errors%NC%
+    echo %YELLOW%GUI may not work properly%NC%
+) else (
+    echo %GREEN%Qt dependencies deployed successfully%NC%
+)
+echo.
+
+:skip_windeployqt
+
+REM =============================================================================
 REM Clean temporary files
 REM =============================================================================
 

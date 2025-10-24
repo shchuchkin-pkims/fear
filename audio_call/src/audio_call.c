@@ -34,6 +34,9 @@ typedef SOCKET socket_t;
 #  define SOCK_ERR SOCKET_ERROR
 #  define THREAD_RET DWORD WINAPI
 #  include <windows.h>
+#  include <io.h>
+#  define isatty _isatty
+#  define fileno _fileno
 #else
 #  include <unistd.h>
 #  include <arpa/inet.h>
@@ -54,6 +57,14 @@ typedef int socket_t;
 #include <sodium.h>
 #include <portaudio.h>
 
+/* Модульные компоненты */
+#include "audio_types.h"
+#include "audio_network.h"
+#include "audio_ring.h"
+#include "audio_codec.h"
+#include "audio_crypto.h"
+#include "audio_hub.h"
+
 /* -------------------------- Конфигурация --------------------------------- */
 
 #define AC_SAMPLE_RATE       48000
@@ -61,7 +72,7 @@ typedef int socket_t;
 #define AC_FRAME_MS          20
 #define AC_FRAME_SAMPLES     ((AC_SAMPLE_RATE/1000)*AC_FRAME_MS) /* 960 */
 #define AC_APP               OPUS_APPLICATION_VOIP
-#define AC_OPUS_BITRATE      24000
+#define AC_OPUS_BITRATE      128000  /* 128 kbps for high quality */
 #define AC_OPUS_COMPLEXITY   5
 #define AC_UDP_RECV_BUFSZ    1500
 #define AC_MAX_OPUS_BYTES    1275
@@ -88,111 +99,22 @@ typedef int socket_t;
 
 /* ------------------------- Вспомогательные -------------------------------- */
 
-static uint64_t htonll_u64(uint64_t v) {
-#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
-    return (((uint64_t)htonl((uint32_t)(v & 0xFFFFFFFFULL))) << 32) | htonl((uint32_t)(v >> 32));
-#else
-    return v;
-#endif
-}
-static uint64_t ntohll_u64(uint64_t v) {
-    return htonll_u64(v);
-}
-
-static void msleep(unsigned ms) {
-#ifdef _WIN32
-    Sleep(ms);
-#else
-    struct timespec ts;
-    ts.tv_sec = ms / 1000;
-    ts.tv_nsec = (ms % 1000) * 1000000UL;
-    nanosleep(&ts, NULL);
-#endif
-}
+/* Сетевые функции теперь в audio_network.h:
+   - htonll_u64(uint64_t v)
+   - ntohll_u64(uint64_t v)
+   - msleep(unsigned ms)
+   - net_init_once(void)
+*/
 
 /* --------------------- Кольцевой буфер PCM ------------------------------- */
 
-typedef struct {
-    int16_t *buf;
-    size_t frames_cap;
-    size_t rd, wr;
-    atomic_size_t count;
-#ifdef _WIN32
-    CRITICAL_SECTION lock;
-#else
-    pthread_mutex_t lock;
-#endif
-} PcmRing;
-
-static int pcmring_init(PcmRing *r, size_t frames_cap) {
-    memset(r, 0, sizeof(*r));
-    r->frames_cap = frames_cap;
-    r->buf = (int16_t*)malloc(frames_cap * AC_FRAME_SAMPLES * sizeof(int16_t));
-    if (!r->buf) return -1;
-#ifdef _WIN32
-    InitializeCriticalSection(&r->lock);
-#else
-    pthread_mutex_init(&r->lock, NULL);
-#endif
-    atomic_init(&r->count, 0);
-    r->rd = r->wr = 0;
-    return 0;
-}
-static void pcmring_free(PcmRing *r) {
-    if (!r) return;
-    if (r->buf) free(r->buf);
-#ifdef _WIN32
-    DeleteCriticalSection(&r->lock);
-#else
-    pthread_mutex_destroy(&r->lock);
-#endif
-    memset(r, 0, sizeof(*r));
-}
-static int pcmring_push(PcmRing *r, const int16_t *frame) {
-#ifdef _WIN32
-    EnterCriticalSection(&r->lock);
-#else
-    pthread_mutex_lock(&r->lock);
-#endif
-    if (atomic_load(&r->count) == r->frames_cap) {
-        r->rd = (r->rd + 1) % r->frames_cap;
-        atomic_fetch_sub(&r->count, 1);
-    }
-    memcpy(&r->buf[r->wr * AC_FRAME_SAMPLES], frame, AC_PCM_BYTES_PER_FR);
-    r->wr = (r->wr + 1) % r->frames_cap;
-    atomic_fetch_add(&r->count, 1);
-#ifdef _WIN32
-    LeaveCriticalSection(&r->lock);
-#else
-    pthread_mutex_unlock(&r->lock);
-#endif
-    return 0;
-}
-static int pcmring_pop(PcmRing *r, int16_t *out_frame) {
-    if (atomic_load(&r->count) == 0) return -1;
-#ifdef _WIN32
-    EnterCriticalSection(&r->lock);
-#else
-    pthread_mutex_lock(&r->lock);
-#endif
-    if (atomic_load(&r->count) == 0) {
-#ifdef _WIN32
-        LeaveCriticalSection(&r->lock);
-#else
-        pthread_mutex_unlock(&r->lock);
-#endif
-        return -1;
-    }
-    memcpy(out_frame, &r->buf[r->rd * AC_FRAME_SAMPLES], AC_PCM_BYTES_PER_FR);
-    r->rd = (r->rd + 1) % r->frames_cap;
-    atomic_fetch_sub(&r->count, 1);
-#ifdef _WIN32
-    LeaveCriticalSection(&r->lock);
-#else
-    pthread_mutex_unlock(&r->lock);
-#endif
-    return 0;
-}
+/* PcmRing теперь в audio_ring.h:
+   - typedef struct PcmRing
+   - pcmring_init(PcmRing *r, size_t frames_cap)
+   - pcmring_free(PcmRing *r)
+   - pcmring_push(PcmRing *r, const int16_t *frame)
+   - pcmring_pop(PcmRing *r, int16_t *out_frame)
+*/
 
 /* --------------------------- Состояние звонка ---------------------------- */
 
@@ -227,18 +149,7 @@ typedef struct AudioCall {
 
 /* --------------------------- Сеть: инициализация ------------------------- */
 
-static int net_init_once(void) {
-#ifdef _WIN32
-    static atomic_int did = 0;
-    if (atomic_exchange(&did, 1) == 0) {
-        WSADATA w;
-        if (WSAStartup(MAKEWORD(2,2), &w) != 0) return -1;
-    }
-#else
-    (void)0;
-#endif
-    return 0;
-}
+/* net_init_once() теперь в audio_network.h */
 
 /* ------------------------- HELLO handshake -------------------------------- */
 
@@ -259,61 +170,24 @@ static int handle_hello(AudioCall *c, const uint8_t *buf, size_t len) {
 
 /* --------------------------- AEAD-helpers -------------------------------- */
 
-static void make_nonce(uint8_t out[AES_GCM_NONCE_LEN],
-                       const uint8_t prefix[NONCE_PREFIX_LEN],
-                       uint64_t seq)
-{
-    memcpy(out, prefix, NONCE_PREFIX_LEN);
-    uint64_t be = htonll_u64(seq);
-    memcpy(out + NONCE_PREFIX_LEN, &be, sizeof(be));
-}
+/* Криптографические функции теперь в audio_crypto.h:
+   - audio_encrypt_packet() - шифрование с sequence number
+   - audio_decrypt_packet() - расшифровка с проверкой
+*/
 
 static int encrypt_opus(AudioCall *c, const uint8_t *opus, size_t opus_len,
                         uint8_t *out, size_t *out_len, uint64_t seq)
 {
-    uint8_t nonce[AES_GCM_NONCE_LEN];
-    make_nonce(nonce, c->local_nonce_prefix, seq);
-
-    out[0] = PKT_VER_AUDIO;
-    uint64_t be = htonll_u64(seq);
-    memcpy(out + 1, &be, sizeof(be));
-
-    unsigned long long clen = 0;
-    if (crypto_aead_aes256gcm_encrypt(
-            out + 1 + sizeof(be), &clen,
-            opus, opus_len,
-            NULL, 0,
-            NULL, nonce, c->key) != 0) return -1;
-
-    *out_len = 1 + sizeof(be) + (size_t)clen;
-    return 0;
+    return audio_encrypt_packet(opus, opus_len, c->key,
+                                c->local_nonce_prefix, seq, out, out_len);
 }
 
 static int decrypt_opus(AudioCall *c, const uint8_t *pkt, size_t pkt_len,
                         uint8_t *opus_out, size_t *opus_len)
 {
-    if (pkt_len < 1 + 8 + AES_GCM_ABYTES) return -1;
-    if (pkt[0] != PKT_VER_AUDIO) return -1;
-
     if (!atomic_load(&c->remote_prefix_ready)) return -2;
-
-    uint64_t be_seq;
-    memcpy(&be_seq, pkt + 1, 8);
-    uint64_t seq = ntohll_u64(be_seq);
-
-    uint8_t nonce[AES_GCM_NONCE_LEN];
-    make_nonce(nonce, c->remote_nonce_prefix, seq);
-
-    unsigned long long mlen = 0;
-    if (crypto_aead_aes256gcm_decrypt(
-            opus_out, &mlen,
-            NULL,
-            pkt + 1 + 8, pkt_len - (1 + 8),
-            NULL, 0, nonce, c->key) != 0) {
-        return -1;
-    }
-    *opus_len = (size_t)mlen;
-    return 0;
+    return audio_decrypt_packet(pkt, pkt_len, c->key,
+                                c->remote_nonce_prefix, opus_out, opus_len);
 }
 
 /* ----------------------------- Потоки ----------------------------------- */
@@ -427,15 +301,11 @@ static THREAD_RET th_recv_func(void *arg) {
 
         pcmring_push(&c->out_ring, pcm);
 
-        // Воспроизводим только если выходной поток доступен
-        if (c->out_stream) {
+        // Воспроизводим только если выходной поток доступен и буфер достаточно наполнен
+        if (c->out_stream && atomic_load(&c->out_ring.count) >= PLAYOUT_BUFFER_FRAMES) {
             int16_t play[AC_FRAME_SAMPLES];
-            while (atomic_load(&c->running) && atomic_load(&c->out_ring.count) > 0) {
-                if (pcmring_pop(&c->out_ring, play) == 0) {
-                    PaError pe = Pa_WriteStream(c->out_stream, play, AC_FRAME_SAMPLES);
-                    if (pe == paOutputUnderflowed) break;
-                    if (pe != paNoError) break;
-                } else break;
+            if (pcmring_pop(&c->out_ring, play) == 0) {
+                Pa_WriteStream(c->out_stream, play, AC_FRAME_SAMPLES);
             }
         }
     }
@@ -787,188 +657,92 @@ int audio_call_start(AudioCall **out_call,
 
 /* -------------------------- Утилиты для main ----------------------------- */
 
-static int hex2bytes(const char *hex, uint8_t *out, size_t out_len) {
-    size_t hlen = strlen(hex);
-    if (hlen != out_len * 2) return -1;
-    for (size_t i = 0; i < out_len; ++i) {
-        unsigned int v;
-        if (sscanf(hex + 2*i, "%2x", &v) != 1) return -1;
-        out[i] = (uint8_t)v;
-    }
-    return 0;
-}
+/* hex2bytes теперь в audio_crypto.h */
 
 static void print_hex(const uint8_t *b, size_t n) {
     for (size_t i = 0; i < n; ++i) printf("%02x", b[i]);
     printf("\n");
 }
 
+/**
+ * @brief Read key from file securely
+ *
+ * @param filename Path to key file
+ * @param buffer Buffer to store key (hex string)
+ * @param bufsize Size of buffer
+ * @return 0 on success, -1 on error
+ */
+static int read_key_from_file(const char *filename, char *buffer, size_t bufsize) {
+    FILE *f = fopen(filename, "r");
+    if (!f) {
+        fprintf(stderr, "Error: Cannot open key file '%s'\n", filename);
+        return -1;
+    }
+
+    // Read first line from file
+    if (!fgets(buffer, (int)bufsize, f)) {
+        fprintf(stderr, "Error: Cannot read from key file '%s'\n", filename);
+        fclose(f);
+        return -1;
+    }
+    fclose(f);
+
+    // Remove newline and whitespace
+    size_t len = strlen(buffer);
+    while (len > 0 && (buffer[len-1] == '\n' || buffer[len-1] == '\r' || buffer[len-1] == ' ')) {
+        buffer[len-1] = '\0';
+        len--;
+    }
+
+    if (len == 0) {
+        fprintf(stderr, "Error: Key file is empty\n");
+        return -1;
+    }
+
+    return 0;
+}
+
+/**
+ * @brief Read key from stdin securely
+ *
+ * @param buffer Buffer to store key (hex string)
+ * @param bufsize Size of buffer
+ * @param interactive Show prompt if true
+ * @return 0 on success, -1 on error
+ */
+static int read_key_from_stdin(char *buffer, size_t bufsize, int interactive) {
+    if (interactive) {
+        fprintf(stderr, "Enter audio call key (64 hex chars): ");
+        fflush(stderr);
+    }
+
+    if (!fgets(buffer, (int)bufsize, stdin)) {
+        fprintf(stderr, "Error: Failed to read key from stdin\n");
+        return -1;
+    }
+
+    // Remove newline and whitespace
+    size_t len = strlen(buffer);
+    while (len > 0 && (buffer[len-1] == '\n' || buffer[len-1] == '\r' || buffer[len-1] == ' ')) {
+        buffer[len-1] = '\0';
+        len--;
+    }
+
+    if (len == 0) {
+        fprintf(stderr, "Error: Empty key provided\n");
+        return -1;
+    }
+
+    return 0;
+}
+
 /* ------------------------------- HUB (ретранслятор) --------------------- */
 
-typedef struct {
-    struct sockaddr_in addr;
-    time_t last_seen;
-    int used;
-} HubClient;
-
-typedef struct {
-    socket_t sock;
-    HubClient clients[HUB_MAX_CLIENTS];
-    atomic_int running;
-#ifdef _WIN32
-    HANDLE th;
-#else
-    pthread_t th;
-#endif
-} Hub;
-
-static void hub_init(Hub *h, socket_t sock) {
-    memset(h, 0, sizeof(*h));
-    h->sock = sock;
-    atomic_store(&h->running, 1);
-}
-
-static int hub_find_or_add(Hub *h, const struct sockaddr_in *src) {
-    /* Найти клиента по адресу, если нет — добавить. Возвращает индекс или -1 */
-    for (int i = 0; i < HUB_MAX_CLIENTS; ++i) {
-        if (h->clients[i].used) {
-            if (h->clients[i].addr.sin_addr.s_addr == src->sin_addr.s_addr &&
-                h->clients[i].addr.sin_port == src->sin_port) {
-                h->clients[i].last_seen = time(NULL);
-                return i;
-            }
-        }
-    }
-    /* добавить */
-    for (int i = 0; i < HUB_MAX_CLIENTS; ++i) {
-        if (!h->clients[i].used) {
-            h->clients[i].used = 1;
-            h->clients[i].addr = *src;
-            h->clients[i].last_seen = time(NULL);
-            char buf[INET_ADDRSTRLEN];
-            inet_ntop(AF_INET, &src->sin_addr, buf, sizeof(buf));
-            fprintf(stderr, "[hub] new client %s:%u (slot %d)\n", buf, ntohs(src->sin_port), i);
-            return i;
-        }
-    }
-    return -1;
-}
-
-static void hub_prune(Hub *h) {
-    time_t now = time(NULL);
-    for (int i = 0; i < HUB_MAX_CLIENTS; ++i) {
-        if (h->clients[i].used) {
-            if (now - h->clients[i].last_seen > HUB_CLIENT_TIMEOUT_SEC) {
-                char buf[INET_ADDRSTRLEN];
-                inet_ntop(AF_INET, &h->clients[i].addr.sin_addr, buf, sizeof(buf));
-                fprintf(stderr, "[hub] remove client %s:%u (slot %d) due timeout\n", buf, ntohs(h->clients[i].addr.sin_port), i);
-                h->clients[i].used = 0;
-            }
-        }
-    }
-}
-
-static int hub_count(Hub *h) {
-    int c = 0;
-    for (int i = 0; i < HUB_MAX_CLIENTS; ++i) if (h->clients[i].used) c++;
-    return c;
-}
-
-static void hub_forward(Hub *h, const uint8_t *buf, size_t len, const struct sockaddr_in *src) {
-    /* пересылаем пакеты всем зарегистрированным клиентам, кроме src */
-    for (int i = 0; i < HUB_MAX_CLIENTS; ++i) {
-        if (!h->clients[i].used) continue;
-        if (h->clients[i].addr.sin_addr.s_addr == src->sin_addr.s_addr &&
-            h->clients[i].addr.sin_port == src->sin_port) continue; /* не посылаем обратно отправителю */
-        sendto(h->sock, (const char*)buf, (int)len, 0,
-               (struct sockaddr*)&h->clients[i].addr, sizeof(h->clients[i].addr));
-    }
-}
-
-static THREAD_RET hub_thread(void *arg) {
-    Hub *h = (Hub*)arg;
-    uint8_t rbuf[AC_UDP_RECV_BUFSZ];
-    while (atomic_load(&h->running)) {
-        struct sockaddr_in src;
-#ifdef _WIN32
-        int slen = sizeof(src);
-#else
-        socklen_t slen = sizeof(src);
-#endif
-        int n = recvfrom(h->sock, (char*)rbuf, (int)sizeof(rbuf), 0,
-                         (struct sockaddr*)&src, &slen);
-        if (n <= 0) {
-            msleep(5);
-            hub_prune(h);
-            continue;
-        }
-        /* Регистрация клиента (или обновление таймера) */
-        int idx = hub_find_or_add(h, &src);
-        if (idx < 0) continue; /* нет места */
-        /* Пересылка всем остальным */
-        hub_forward(h, rbuf, (size_t)n, &src);
-    }
-#ifdef _WIN32
-    return 0;
-#else
-    return NULL;
-#endif
-}
-
-static int hub_main(uint16_t bind_port) {
-    if (net_init_once() != 0) return -1;
-    socket_t sock = (socket_t)socket(AF_INET, SOCK_DGRAM, 0);
-    if (sock == (socket_t)SOCK_ERR) {
-        fprintf(stderr, "hub: socket() failed\n");
-        return -1;
-    }
-    struct sockaddr_in local;
-    memset(&local, 0, sizeof(local));
-    local.sin_family = AF_INET;
-    local.sin_addr.s_addr = htonl(INADDR_ANY);
-    local.sin_port = htons(bind_port);
-    if (bind(sock, (struct sockaddr*)&local, sizeof(local)) == SOCK_ERR) {
-        fprintf(stderr, "hub: bind() failed (port %u)\n", bind_port);
-        CLOSESOCK(sock);
-        return -1;
-    }
-    Hub h;
-    hub_init(&h, sock);
-    fprintf(stderr, "[hub] listening on *:%u\n", bind_port);
-
-#ifdef _WIN32
-    h.th = CreateThread(NULL, 0, hub_thread, &h, 0, NULL);
-    if (!h.th) {
-        CLOSESOCK(sock);
-        return -1;
-    }
-#else
-    if (pthread_create(&h.th, NULL, hub_thread, &h) != 0) {
-        CLOSESOCK(sock);
-        return -1;
-    }
-#endif
-
-    fprintf(stderr, "[hub] running. Press Ctrl+C to stop.\n");
-    while (atomic_load(&h.running)) {
-#ifdef _WIN32
-        if (GetAsyncKeyState(VK_CANCEL) || GetAsyncKeyState(VK_ESCAPE)) break;
-#else
-        /* Ctrl+C в POSIX */
-        msleep(100);
-#endif
-    }
-    atomic_store(&h.running, 0);
-#ifdef _WIN32
-    WaitForSingleObject(h.th, INFINITE);
-    CloseHandle(h.th);
-#else
-    pthread_join(h.th, NULL);
-#endif
-    CLOSESOCK(sock);
-    fprintf(stderr, "[hub] stopped.\n");
-    return 0;
-}
+/* Весь код Hub теперь в audio_hub.h и audio_hub.c:
+   - HubClient, Hub structures
+   - hub_init(), hub_find_or_add(), hub_prune(), hub_forward()
+   - hub_main(uint16_t bind_port) - главная функция хаба
+*/
 
 /* ------------------------------- main ------------------------------------ */
 
@@ -1007,9 +781,14 @@ int main(int argc, char **argv) {
                 "Usage:\n"
                 "  %s genkey\n"
                 "  %s listdevices\n"
-                "  %s call <remote_ip> <remote_port> <hexkey32> [local_bind_port] [input_dev] [output_dev]\n"
-                "  %s listen <local_bind_port> <hexkey32> [input_dev] [output_dev]\n"
-                "  %s hub <bind_port>\n",
+                "  %s call <remote_ip> <remote_port> [--key-file FILE] [local_bind_port] [input_dev] [output_dev]\n"
+                "  %s listen <local_bind_port> [--key-file FILE] [input_dev] [output_dev]\n"
+                "  %s hub <bind_port>\n"
+                "\n"
+                "Key input methods (in order of priority):\n"
+                "  1. --key-file FILE    Read key from file (recommended for scripts)\n"
+                "  2. stdin              Read key from standard input (interactive or piped)\n"
+                "  3. <hexkey32>         Direct key argument (DEPRECATED - insecure, visible in process list)\n",
                 argv[0], argv[0], argv[0], argv[0], argv[0]);
         return 1;
     }
@@ -1018,7 +797,18 @@ int main(int argc, char **argv) {
         if (sodium_init() < 0) return 1;
         uint8_t key[AES_GCM_KEY_LEN];
         randombytes_buf(key, sizeof(key));
-        print_hex(key, sizeof(key));
+
+        // SECURITY: Output key to stdout for clipboard copy
+        // The GUI or user can copy it to clipboard directly
+        // DO NOT save to file automatically (user can redirect output if needed)
+        for (size_t i = 0; i < sizeof(key); ++i) {
+            printf("%02x", key[i]);
+        }
+        printf("\n");
+
+        fprintf(stderr, "Audio call key generated successfully.\n");
+        fprintf(stderr, "IMPORTANT: Copy the key above to clipboard and share it securely.\n");
+        fprintf(stderr, "           The key is NOT saved to disk for security reasons.\n");
         return 0;
     }
 
@@ -1045,8 +835,12 @@ int main(int argc, char **argv) {
             const PaDeviceInfo *info = Pa_GetDeviceInfo(i);
             if (!info) continue;
 
-            printf("Device %d: %s\n", i, info->name);
-            printf("  Host API: %s\n", Pa_GetHostApiInfo(info->hostApi)->name);
+            const PaHostApiInfo *hostInfo = Pa_GetHostApiInfo(info->hostApi);
+            const char *hostName = hostInfo ? hostInfo->name : "Unknown";
+
+            // Include Host API in device name to avoid duplicates
+            printf("Device %d: %s (%s)\n", i, info->name, hostName);
+            printf("  Host API: %s\n", hostName);
             printf("  Max input channels: %d\n", info->maxInputChannels);
             printf("  Max output channels: %d\n", info->maxOutputChannels);
             printf("  Default sample rate: %.0f Hz\n", info->defaultSampleRate);
@@ -1067,16 +861,76 @@ int main(int argc, char **argv) {
     }
 
     if (strcmp(argv[1], "call") == 0) {
-        if (argc < 5) {
-            fprintf(stderr, "Usage: %s call <remote_ip> <remote_port> <hexkey32> [local_bind_port] [input_dev] [output_dev]\n", argv[0]);
+        if (argc < 4) {
+            fprintf(stderr, "Usage: %s call <remote_ip> <remote_port> [--key-file FILE] [local_bind_port] [input_dev] [output_dev]\n", argv[0]);
             return 1;
         }
         const char *ip = argv[2];
         uint16_t rport = (uint16_t)atoi(argv[3]);
-        const char *hexkey = argv[4];
-        uint16_t lport = (argc >= 6) ? (uint16_t)atoi(argv[5]) : 0;
-        int input_dev = (argc >= 7) ? atoi(argv[6]) : -1;
-        int output_dev = (argc >= 8) ? atoi(argv[7]) : -1;
+
+        // Parse optional arguments
+        const char *keyfile = NULL;
+        const char *hexkey_arg = NULL;
+        uint16_t lport = 0;
+        int input_dev = -1;
+        int output_dev = -1;
+        int using_deprecated_key_arg = 0;
+
+        int arg_idx = 4;
+        while (arg_idx < argc) {
+            if (strcmp(argv[arg_idx], "--key-file") == 0 && arg_idx + 1 < argc) {
+                keyfile = argv[arg_idx + 1];
+                arg_idx += 2;
+            } else {
+                // Legacy positional arguments: [hexkey] [local_bind_port] [input_dev] [output_dev]
+                if (hexkey_arg == NULL && strlen(argv[arg_idx]) == 64) {
+                    hexkey_arg = argv[arg_idx];
+                    using_deprecated_key_arg = 1;
+                    arg_idx++;
+                } else if (lport == 0) {
+                    lport = (uint16_t)atoi(argv[arg_idx]);
+                    arg_idx++;
+                } else if (input_dev == -1) {
+                    input_dev = atoi(argv[arg_idx]);
+                    arg_idx++;
+                } else if (output_dev == -1) {
+                    output_dev = atoi(argv[arg_idx]);
+                    arg_idx++;
+                } else {
+                    arg_idx++;
+                }
+            }
+        }
+
+        // Buffer for key storage
+        static char key_buffer[256];
+        memset(key_buffer, 0, sizeof(key_buffer));
+        const char *hexkey = NULL;
+
+        // Priority 1: Read from --key-file
+        if (keyfile) {
+            if (read_key_from_file(keyfile, key_buffer, sizeof(key_buffer)) != 0) {
+                return 1;
+            }
+            hexkey = key_buffer;
+        }
+        // Priority 2: Read from stdin (interactive or piped)
+        else if (!hexkey_arg) {
+            int is_interactive = isatty(fileno(stdin));
+            if (read_key_from_stdin(key_buffer, sizeof(key_buffer), is_interactive) != 0) {
+                return 1;
+            }
+            hexkey = key_buffer;
+        }
+        // Priority 3: Deprecated hexkey argument
+        else if (using_deprecated_key_arg) {
+            fprintf(stderr, "\n");
+            fprintf(stderr, "WARNING: Using key as command line argument is insecure!\n");
+            fprintf(stderr, "         The key is visible in process lists (ps, top, Task Manager).\n");
+            fprintf(stderr, "         Use --key-file or stdin instead.\n");
+            fprintf(stderr, "\n");
+            hexkey = hexkey_arg;
+        }
 
         uint8_t key[AES_GCM_KEY_LEN];
         if (hex2bytes(hexkey, key, sizeof(key)) != 0) {
@@ -1101,14 +955,71 @@ int main(int argc, char **argv) {
     }
 
     if (strcmp(argv[1], "listen") == 0) {
-        if (argc < 4) {
-            fprintf(stderr, "Usage: %s listen <local_bind_port> <hexkey32> [input_dev] [output_dev]\n", argv[0]);
+        if (argc < 3) {
+            fprintf(stderr, "Usage: %s listen <local_bind_port> [--key-file FILE] [input_dev] [output_dev]\n", argv[0]);
             return 1;
         }
         uint16_t lport = (uint16_t)atoi(argv[2]);
-        const char *hexkey = argv[3];
-        int input_dev = (argc >= 5) ? atoi(argv[4]) : -1;
-        int output_dev = (argc >= 6) ? atoi(argv[5]) : -1;
+
+        // Parse optional arguments
+        const char *keyfile = NULL;
+        const char *hexkey_arg = NULL;
+        int input_dev = -1;
+        int output_dev = -1;
+        int using_deprecated_key_arg = 0;
+
+        int arg_idx = 3;
+        while (arg_idx < argc) {
+            if (strcmp(argv[arg_idx], "--key-file") == 0 && arg_idx + 1 < argc) {
+                keyfile = argv[arg_idx + 1];
+                arg_idx += 2;
+            } else {
+                // Legacy positional arguments: [hexkey] [input_dev] [output_dev]
+                if (hexkey_arg == NULL && strlen(argv[arg_idx]) == 64) {
+                    hexkey_arg = argv[arg_idx];
+                    using_deprecated_key_arg = 1;
+                    arg_idx++;
+                } else if (input_dev == -1) {
+                    input_dev = atoi(argv[arg_idx]);
+                    arg_idx++;
+                } else if (output_dev == -1) {
+                    output_dev = atoi(argv[arg_idx]);
+                    arg_idx++;
+                } else {
+                    arg_idx++;
+                }
+            }
+        }
+
+        // Buffer for key storage
+        static char key_buffer[256];
+        memset(key_buffer, 0, sizeof(key_buffer));
+        const char *hexkey = NULL;
+
+        // Priority 1: Read from --key-file
+        if (keyfile) {
+            if (read_key_from_file(keyfile, key_buffer, sizeof(key_buffer)) != 0) {
+                return 1;
+            }
+            hexkey = key_buffer;
+        }
+        // Priority 2: Read from stdin (interactive or piped)
+        else if (!hexkey_arg) {
+            int is_interactive = isatty(fileno(stdin));
+            if (read_key_from_stdin(key_buffer, sizeof(key_buffer), is_interactive) != 0) {
+                return 1;
+            }
+            hexkey = key_buffer;
+        }
+        // Priority 3: Deprecated hexkey argument
+        else if (using_deprecated_key_arg) {
+            fprintf(stderr, "\n");
+            fprintf(stderr, "WARNING: Using key as command line argument is insecure!\n");
+            fprintf(stderr, "         The key is visible in process lists (ps, top, Task Manager).\n");
+            fprintf(stderr, "         Use --key-file or stdin instead.\n");
+            fprintf(stderr, "\n");
+            hexkey = hexkey_arg;
+        }
 
         uint8_t key[AES_GCM_KEY_LEN];
         if (hex2bytes(hexkey, key, sizeof(key)) != 0) {

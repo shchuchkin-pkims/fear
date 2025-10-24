@@ -1,42 +1,76 @@
+/**
+ * @file server.c
+ * @brief F.E.A.R. message relay server implementation
+ *
+ * This server acts as a relay for encrypted messages between clients.
+ * It NEVER has access to message plaintext - all messages are end-to-end
+ * encrypted by clients using room keys. The server only sees metadata:
+ * - Room names
+ * - User names
+ * - Message sizes
+ *
+ * Server responsibilities:
+ * - Accept client connections
+ * - Route messages to correct room participants
+ * - Enforce unique names per room
+ * - Broadcast user list changes
+ * - Handle client disconnections
+ */
+
 #include "server.h"
+#include "network.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include <sodium.h>  // Добавлено
+#include <locale.h>
+#include <sodium.h>
 #ifdef _WIN32
 #include <windows.h>
 #else
 #include <sys/select.h>
-#include <errno.h>   // Добавлено для errno
+#include <errno.h>
 #endif
 
+/**
+ * @brief Connected client information
+ *
+ * Stores per-client state for the server. Room and name are extracted
+ * from the first message and remain fixed for the connection.
+ */
 typedef struct {
-    sock_t fd;
-    char room[MAX_ROOM];
-    char name[MAX_NAME];
+    sock_t fd;              /**< Socket descriptor for this client */
+    char room[MAX_ROOM];    /**< Room name (empty until first message) */
+    char name[MAX_NAME];    /**< User name (empty until first message) */
 } client_t;
 
-static int server_listen(uint16_t port) {
-    sock_t s = socket(AF_INET, SOCK_STREAM, 0);
-    if (s < 0) die("socket");
-    int yes = 1;
-    setsockopt(s, SOL_SOCKET, SO_REUSEADDR, (char*)&yes, sizeof(yes));
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = INADDR_ANY;
-    addr.sin_port = htons(port);
-    if (bind(s, (struct sockaddr*)&addr, sizeof(addr)) < 0) die("bind");
-    if (listen(s, 16) < 0) die("listen");
-    return s;
-}
-
+/**
+ * @brief Read a complete protocol frame from client socket
+ *
+ * Reads and reassembles a complete message frame in the protocol format:
+ * [2 room_len][room][2 name_len][name][2 nonce_len][nonce][1 type][4 clen][cipher]
+ *
+ * The server doesn't decrypt messages - it just forwards them to other
+ * clients in the same room.
+ *
+ * @param fd Client socket descriptor
+ * @param out Receives pointer to allocated frame buffer
+ * @param outlen Receives total frame length
+ * @return 0 on success, -1 on error or disconnect
+ *
+ * @note Caller must free(*out) after use
+ * @note Returns -1 if frame is malformed or exceeds limits
+ */
 static int read_frame(sock_t fd, uint8_t **out, size_t *outlen) {
     uint8_t hdr[2];
-    if (recv_all(fd, hdr, 2) < 0) return -1;
+    if (recv_all(fd, hdr, 2) < 0) {
+        return -1;
+    }
+
     uint16_t room_len = rd_u16(hdr);
-    if (room_len > MAX_ROOM) return -1;
+    if (room_len > MAX_ROOM) {
+        return -1;
+    }
 
     // временный буфер для header-полей (room + name + nonce)
     size_t bufsize = 2 + room_len + 2 + MAX_NAME + 2 + crypto_aead_xchacha20poly1305_ietf_NPUBBYTES;
@@ -97,28 +131,49 @@ static int read_frame(sock_t fd, uint8_t **out, size_t *outlen) {
     return 0;
 }
 
-static void broadcast(client_t *clients, int *nclients, const char *room, 
+/**
+ * @brief Broadcast a message to all clients in the same room
+ *
+ * Forwards the message frame to all connected clients who are in the
+ * specified room, except the sender.
+ *
+ * @param clients Array of connected clients
+ * @param nclients Pointer to client count (may be decremented if client disconnects)
+ * @param room Target room name
+ * @param frame Complete message frame to broadcast
+ * @param flen Frame length in bytes
+ * @param from Socket of sender (to avoid echoing message back)
+ *
+ * @note Automatically removes clients if send fails
+ */
+static void broadcast(client_t *clients, int *nclients, const char *room,
                      const uint8_t *frame, size_t flen, sock_t from) {
-    // извлекаем room/name/nonce, чтобы найти offset для type
+    /* Extract frame fields to validate structure */
     if (flen < 2) return;
     uint16_t room_len = rd_u16(frame);
-    if (2 + room_len + 2 > flen) return;
+    if (2 + (size_t)room_len + 2 > flen) return;
     uint16_t name_len = rd_u16(frame + 2 + room_len);
-    if (2 + room_len + 2 + name_len + 2 > flen) return;
-    uint16_t nonce_len = rd_u16(frame + 2 + room_len + 2 + name_len);
-    size_t type_offset = 2 + room_len + 2 + name_len + 2 + nonce_len;
-    if (type_offset + 1 > flen) return;
-    message_type_t msg_type = (message_type_t)frame[type_offset];
+    if (2 + (size_t)room_len + 2 + (size_t)name_len + 2 > flen) return;
+
+    /* Frame is valid, broadcast to room participants */
+    (void)room; /* Suppress unused parameter warning */
 
     for (int i = 0; i < *nclients; i++) {
-        if (clients[i].fd == from) continue;
+        if (clients[i].fd == from) {
+            continue; /* Don't echo back to sender */
+        }
 
-        // Пропускаем клиентов, которые еще не зарегистрировались в комнате
-        if (clients[i].room[0] == '\0') continue;
+        /* Skip clients that haven't registered yet */
+        if (clients[i].room[0] == '\0') {
+            continue;
+        }
 
-        if (strcmp(clients[i].room, room) != 0) continue;
+        /* Only send to clients in same room */
+        if (strcmp(clients[i].room, room) != 0) {
+            continue;
+        }
 
-        // Можно при необходимости добавить логику фильтрации по типу
+        /* Send frame to client; remove if send fails */
         if (send_all(clients[i].fd, frame, flen) < 0) {
             close_socket(clients[i].fd);
             clients[i] = clients[*nclients - 1];
@@ -128,9 +183,21 @@ static void broadcast(client_t *clients, int *nclients, const char *room,
     }
 }
 
-// Отправляет список участников комнаты всем клиентам в этой комнате
+/**
+ * @brief Send updated room participant list to all clients in room
+ *
+ * Broadcasts MSG_TYPE_USER_LIST message containing names of all users
+ * currently in the specified room. Called when user joins or leaves.
+ *
+ * @param clients Array of all connected clients
+ * @param nclients Total number of connected clients
+ * @param room Room name to send list for
+ *
+ * @note Uses zero nonce (service message, not encrypted)
+ * @note Sent from "server" name to distinguish from user messages
+ */
 static void send_user_list(client_t *clients, int nclients, const char *room) {
-    // Подсчитываем участников комнаты и формируем список имен
+    /* Build list of participant names */
     char user_list[MAX_FRAME];
     size_t offset = 0;
     int count = 0;
@@ -188,13 +255,39 @@ static void send_user_list(client_t *clients, int nclients, const char *room) {
 }
 
 
+/**
+ * @brief Main server loop - accept connections and relay messages
+ *
+ * Runs an event loop using select() to handle multiple clients concurrently:
+ * 1. Accept new client connections
+ * 2. Read messages from connected clients
+ * 3. Broadcast messages to appropriate rooms
+ * 4. Handle disconnections and errors
+ *
+ * The server maintains zero knowledge of message content - it only sees:
+ * - Room names (metadata)
+ * - User names (metadata)
+ * - Encrypted ciphertext (cannot decrypt without room key)
+ *
+ * @param port TCP port to listen on (e.g., 8888)
+ *
+ * @note Runs indefinitely until interrupted (Ctrl+C)
+ * @note Maximum MAX_CLIENTS (100) simultaneous connections
+ */
 void run_server(uint16_t port) {
 #ifdef _WIN32
     WSADATA wsa;
     WSAStartup(MAKEWORD(2, 2), &wsa);
+    // Set console code page to UTF-8
+    SetConsoleOutputCP(CP_UTF8);
+    SetConsoleCP(CP_UTF8);
+#else
+    // Set locale to UTF-8 for Linux/Android
+    setlocale(LC_ALL, "");
 #endif
     sock_t listener = server_listen(port);
     printf("[server] listening on 0.0.0.0:%u\n", port);
+
     client_t clients[MAX_CLIENTS];
     int nclients = 0;
     for (;;) {

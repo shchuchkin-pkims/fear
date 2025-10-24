@@ -157,22 +157,33 @@ For detailed build instructions, see [BUILD.md](BUILD.md).
 ### Quick Usage Example
 
 ```bash
-# 1. Generate room key
+# 1. Generate room key (automatically copied to clipboard in GUI)
 cd build/bin
 ./fear genkey
-# Output: z6aK3_k9I7rmpy6Sn-84QZ9Yc0p3T7VhzReWCKE0x4I
+# Output to stdout: z6aK3_k9I7rmpy6Sn-84QZ9Yc0p3T7VhzReWCKE0x4I
+# SECURITY: Key is NOT saved to disk by default
 
 # 2. Start server (on trusted machine)
 ./fear server --port 7777
 
-# 3. User A: Connect to room
+# 3. User A: Connect to room (key passed via stdin for security)
+echo "YOUR_KEY" | ./fear client --host SERVER_IP --port 7777 \
+    --room myroom --name Alice
+
+# OR use --key-file (recommended for scripts)
 ./fear client --host SERVER_IP --port 7777 \
-    --room myroom --key YOUR_KEY --name Alice
+    --room myroom --key-file room_key.txt --name Alice
 
 # 4. User B: Join same room
-./fear client --host SERVER_IP --port 7777 \
-    --room myroom --key YOUR_KEY --name Bob
+echo "YOUR_KEY" | ./fear client --host SERVER_IP --port 7777 \
+    --room myroom --name Bob
 ```
+
+**Security Notes:**
+- Keys are **never saved to disk automatically** - they're output to stdout/clipboard only
+- When using CLI, pass keys via **stdin** or **--key-file** (not command-line args)
+- Command-line args are visible in process lists - avoid `--key` parameter
+- GUI automatically copies generated keys to clipboard
 
 ## 📦 Installation
 
@@ -207,9 +218,17 @@ cd build/bin
 
 Example output:
 ```
-Room key (base64 urlsafe, save/share securely):
 z6aK3_k9I7rmpy6Sn-84QZ9Yc0p3T7VhzReWCKE0x4I
+Room key generated successfully.
+IMPORTANT: Copy the key above to clipboard and share it securely.
+           The key is NOT saved to disk for security reasons.
 ```
+
+**Security Features (v0.3+):**
+- ✅ Keys output to **stdout** (not saved to files automatically)
+- ✅ GUI version **auto-copies to clipboard** for convenience
+- ✅ No sensitive data left in terminal scrollback (stderr messages only)
+- ✅ User can redirect to file if needed: `./fear genkey > my_key.txt`
 
 ⚠️ **Important**: Share this key securely with intended participants only.
 
@@ -223,13 +242,30 @@ z6aK3_k9I7rmpy6Sn-84QZ9Yc0p3T7VhzReWCKE0x4I
 
 #### Connect as Client
 
+**Recommended (secure key input via stdin):**
+```bash
+echo "z6aK3_k9I7rmpy6Sn-84QZ9Yc0p3T7VhzReWCKE0x4I" | ./fear client \
+    --host 127.0.0.1 \
+    --port 7777 \
+    --room myroom \
+    --name YourName
+```
+
+**Alternative (using key file):**
 ```bash
 ./fear client \
     --host 127.0.0.1 \
     --port 7777 \
     --room myroom \
-    --key z6aK3_k9I7rmpy6Sn-84QZ9Yc0p3T7VhzReWCKE0x4I \
+    --key-file room_key.txt \
     --name YourName
+```
+
+**⚠️ Deprecated (insecure - key visible in process list):**
+```bash
+# DO NOT USE in production - for testing only
+./fear client --host 127.0.0.1 --port 7777 \
+    --room myroom --key YOUR_KEY --name YourName
 ```
 
 ### Secure Key Exchange
@@ -259,13 +295,27 @@ Encrypted voice communication:
 
 ```bash
 cd build/bin
-./audio_call
+
+# Generate audio call key (outputs to stdout, auto-copied in GUI)
+./audio_call genkey
+# Output: b1aae1360b0e242c18bad535b1179133789c60d8fc3063a259f25b7bcab9a938
+
+# List available audio devices
+./audio_call listdevices
+
+# Start call (key via stdin for security)
+echo "YOUR_KEY" | ./audio_call call 192.168.1.100 50000
+
+# Or listen for incoming call
+echo "YOUR_KEY" | ./audio_call listen 50000
 ```
 
-Features:
-- Opus codec for high-quality, low-latency audio
-- Real-time encryption with libsodium
-- PortAudio for cross-platform audio I/O
+**Features:**
+- ✅ Opus codec for high-quality, low-latency audio
+- ✅ Real-time AES-256-GCM encryption with libsodium
+- ✅ PortAudio for cross-platform audio I/O
+- ✅ Secure key input via stdin (v0.3+)
+- ✅ Audio device selection with Host API info (fixes duplicate names)
 
 ### Auto-Updater
 
@@ -374,9 +424,16 @@ build/
 
 1. **Server Trust**: Only connect to servers you control or explicitly trust
 2. **Key Distribution**: Use the key-exchange utility for initial setup
-3. **Key Storage**: Store room keys securely, never in plaintext
-4. **Updates**: Keep software up-to-date with security patches
-5. **Verification**: Audit the open-source code before deployment
+3. **Key Storage**:
+   - ✅ **v0.3+**: Keys output to stdout/clipboard only (not auto-saved to disk)
+   - ⚠️ Avoid saving keys in plaintext files when possible
+   - 🔒 Use encrypted key stores or system keychains for long-term storage
+4. **Key Input Security**:
+   - ✅ **Recommended**: Pass keys via stdin or --key-file
+   - ⚠️ **Avoid**: Command-line `--key` argument (visible in process lists)
+5. **Updates**: Keep software up-to-date with security patches
+6. **Verification**: Audit the open-source code before deployment
+7. **Audio Device Privacy**: GUI shows Host API with device names to prevent confusion
 
 ### Responsible Disclosure
 
@@ -395,6 +452,13 @@ Security vulnerabilities should be reported privately to the maintainers. Please
 - [x] Cross-platform build system
 - [x] Static linking (Windows portable builds)
 - [x] File transfer with encryption
+- [x] **Secure key handling** (v0.3+):
+  - [x] Keys output to stdout (not auto-saved to files)
+  - [x] GUI auto-copy to clipboard
+  - [x] Secure key input via stdin/--key-file
+  - [x] Deprecation warnings for insecure --key argument
+- [x] **Audio device improvements** (v0.3+):
+  - [x] Host API info in device names (fixes duplicates)
 
 ### 🚧 In Progress
 

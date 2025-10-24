@@ -7,12 +7,21 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 # Общие флаги компиляции
 add_compile_options(-O2 -Wall -Wextra -pedantic)
 
-# Указываем конкретные исходные файлы
-#set(SOURCES audio_call.c)
-file(GLOB SOURCES "src/*.c")
+# Явный список исходных файлов (лучше, чем GLOB)
+set(SOURCES
+    src/audio_call.c
+    src/audio_network.c
+    src/audio_ring.c
+    src/audio_codec.c
+    src/audio_crypto.c
+    src/audio_hub.c
+)
 
 # Создание исполняемого файла
 add_executable(audio_call ${SOURCES})
+
+# Добавляем include директорию для наших заголовков
+target_include_directories(audio_call PRIVATE include)
 
 # Платформо-зависимые настройки
 if(WIN32)

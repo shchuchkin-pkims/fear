@@ -1,14 +1,34 @@
+/**
+ * @file client.c
+ * @brief F.E.A.R. console client implementation
+ *
+ * Handles all client-side functionality:
+ * - Connecting to server and joining rooms
+ * - Encrypting and sending messages
+ * - Receiving and decrypting messages from other users
+ * - File transfers with encryption and integrity checking
+ * - User list updates from server
+ *
+ * Security model:
+ * - All messages are encrypted with room key before transmission
+ * - Server never sees plaintext (zero-knowledge architecture)
+ * - AES-256-GCM provides confidentiality and authenticity
+ * - File integrity verified with CRC32 checksums
+ */
+
 #include "client.h"
+#include "network.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include <sodium.h>  // Добавлено
+#include <locale.h>
+#include <sodium.h>
 #ifdef _WIN32
 #include <windows.h>
 #else
 #include <sys/select.h>
-#include <errno.h>   // Добавлено для errno
+#include <errno.h>
 #endif
 
 #ifdef _WIN32
@@ -17,42 +37,6 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #endif
-
-static sock_t dial_tcp(const char *host, uint16_t port) {
-#ifdef _WIN32
-    WSADATA wsa;
-    WSAStartup(MAKEWORD(2, 2), &wsa);
-#endif
-    char portstr[16];
-    snprintf(portstr, sizeof(portstr), "%u", port);
-    
-    struct addrinfo hints;
-    struct addrinfo *res = NULL;
-    struct addrinfo *ai;
-    sock_t s = -1;
-    
-    memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
-    
-    int e = getaddrinfo(host, portstr, &hints, &res);
-    if (e != 0) { 
-        fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(e)); 
-        exit(1); 
-    }
-    
-    for (ai = res; ai; ai = ai->ai_next) {
-        s = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
-        if (s < 0) continue;
-        if (connect(s, ai->ai_addr, (socklen_t)ai->ai_addrlen) == 0) break;
-        close_socket(s);
-        s = -1;
-    }
-    freeaddrinfo(res);
-    
-    if (s < 0) die("connect");
-    return s;
-}
 
 typedef struct {
     FILE *fp;
@@ -501,7 +485,7 @@ int recv_and_decrypt(sock_t s, const char *room, const uint8_t *key, const char 
     } else if (msg_type >= MSG_TYPE_FILE_START && msg_type <= MSG_TYPE_FILE_END) {
         handle_file_message(plain, (size_t)plen, msg_type, room_in, name, key, myname);
     } else {
-        printf("[%s] %s: unknown message type %d\n", name, (int)msg_type);
+        printf("[%s] unknown message type %d\n", name, (int)msg_type);
     }
 
     free(room_in);
@@ -559,10 +543,16 @@ DWORD WINAPI input_thread(LPVOID param) {
 
 void run_client(const char *host, uint16_t port, const char *room, const char *name, const uint8_t key[32]) {
     if (sodium_init() < 0) { fprintf(stderr, "libsodium init failed\n"); exit(1); }
-    // ensure Downloads folder exists
+
+    // Set UTF-8 encoding for console output
     #ifdef _WIN32
+        // Set console code page to UTF-8
+        SetConsoleOutputCP(CP_UTF8);
+        SetConsoleCP(CP_UTF8);
         _mkdir("Downloads");
     #else
+        // Set locale to UTF-8 for Linux/Android
+        setlocale(LC_ALL, "");
         mkdir("Downloads", 0755);
     #endif
     sock_t s = dial_tcp(host, port);

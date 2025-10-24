@@ -1,25 +1,58 @@
+/**
+ * @file key_exchange.cpp
+ * @brief Implementation of Curve25519 key exchange for F.E.A.R. GUI
+ *
+ * Provides Qt wrapper around libsodium's crypto_box API for:
+ * - Key pair generation (X25519)
+ * - Public key encryption (XSalsa20-Poly1305)
+ * - Authenticated decryption
+ */
+
 #include "key_exchange.h"
 #include <sodium.h>
 #include <QDebug>
 #include <QByteArray>
 
-KeyExchange::KeyExchange(QObject *parent) 
+/**
+ * @brief Construct KeyExchange object and initialize libsodium
+ *
+ * Calls sodium_init() to initialize the cryptographic library.
+ * This must be called before any libsodium functions.
+ *
+ * @param parent Parent QObject for Qt memory management
+ */
+KeyExchange::KeyExchange(QObject *parent)
     : QObject(parent), m_keysGenerated(false)
 {
-    // Initialize libsodium
+    /* Initialize libsodium (safe to call multiple times) */
     if (sodium_init() < 0) {
         qCritical() << "Failed to initialize libsodium";
     }
 }
 
+/**
+ * @brief Destructor - securely erase secret key from memory
+ *
+ * Uses sodium_memzero() to prevent secret key from remaining
+ * in memory after destruction (defense against memory dumps).
+ */
 KeyExchange::~KeyExchange()
 {
-    // Clear sensitive data from memory
+    /* Securely clear sensitive data from memory */
     if (m_keysGenerated) {
         sodium_memzero(m_secretKey, sizeof(m_secretKey));
     }
 }
 
+/**
+ * @brief Generate new Curve25519 key pair
+ *
+ * Creates a new public/secret key pair using crypto_box_keypair().
+ * The secret key is randomly generated, and the public key is derived from it.
+ *
+ * @return true if successful, false on failure
+ * @note Overwrites any existing keys
+ */
 bool KeyExchange::generateKeyPair()
 {
     if (crypto_box_keypair(m_publicKey, m_secretKey) != 0) {
@@ -27,7 +60,7 @@ bool KeyExchange::generateKeyPair()
         m_keysGenerated = false;
         return false;
     }
-    
+
     m_keysGenerated = true;
     qDebug() << "Key pair generated successfully";
     return true;

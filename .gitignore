@@ -1,6 +1,5 @@
 # Игнорирование папок
 .vscode
-.claude
 audio_call/build/
 client-console/build/
 gui/build/
@@ -8,16 +7,15 @@ key-exchange/build
 temp/
 build/
 build-linux/
-
-lib/*
-!lib/README.md
+lib/
 
 # Игнорирование файлов
 # build.log
 # fear.exe
 fear.exe.bak
-
 Thumbs.db
+fear-linux-x86_64.zip
+fear-windows-x86_64.zip
 
 # Дополнительные полезные правила (опционально)
 *.log

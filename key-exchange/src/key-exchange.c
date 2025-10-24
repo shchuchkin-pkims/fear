@@ -64,21 +64,39 @@ typedef struct {
     bool keys_generated;
 } KeyPair;
 
-// Function prototypes
+/**
+ * @brief Function prototypes for key exchange utility
+ *
+ * This utility implements secure key exchange using Curve25519 elliptic curve
+ * cryptography (via libsodium). It provides both interactive CLI and command-line
+ * modes for generating keypairs and exchanging encrypted messages.
+ */
+
+/* UI Functions */
 void clear_screen(void);
 void print_header(void);
 void print_separator(void);
+
+/* Utility Functions */
 void bytes_to_hex(const unsigned char *bytes, size_t bytes_len, char *hex);
 bool hex_to_bytes(const char *hex, unsigned char *bytes, size_t expected_len);
 void secure_input(char *buffer, size_t size);
+
+/* Key Management Functions */
 void generate_keypair_mode(KeyPair *kp);
 void encrypt_message_mode(KeyPair *kp);
 void decrypt_message_mode(KeyPair *kp);
 void export_keys_mode(KeyPair *kp);
 void import_keys_mode(KeyPair *kp);
+
+/* Menu */
 void print_menu(void);
 
-// Clear screen cross-platform
+/**
+ * @brief Clear terminal screen (cross-platform)
+ *
+ * Uses system("cls") on Windows, ANSI escape codes on Unix-like systems
+ */
 void clear_screen(void) {
     #ifdef _WIN32
     system("cls");
@@ -87,14 +105,21 @@ void clear_screen(void) {
     #endif
 }
 
-
+/**
+ * @brief Print horizontal separator line for UI formatting
+ */
 void print_separator(void) {
     printf(COLOR_BLUE);
     for (int i = 0; i < 50; i++) printf(BOX_SEPARATOR);
     printf(COLOR_RESET "\n");
 }
 
-
+/**
+ * @brief Print application header with ASCII box drawing
+ *
+ * Creates a centered title box using platform-specific box drawing characters.
+ * Uses UTF-8 box drawing on Unix, ASCII fallback on Windows.
+ */
 void print_header(void) {
     const char *title = "F.E.A.R. Secure Key Exchange";
     int box_width = 50;
@@ -122,6 +147,21 @@ void print_header(void) {
 }
 
 
+/**
+ * @brief Convert binary data to hexadecimal string
+ *
+ * Converts raw bytes to lowercase hexadecimal representation.
+ * Output buffer must be at least (bytes_len * 2 + 1) bytes.
+ *
+ * @param bytes Input binary data
+ * @param bytes_len Length of input data
+ * @param hex Output buffer for hex string (null-terminated)
+ *
+ * @example
+ * unsigned char data[] = {0x12, 0xAB};
+ * char hex[5];
+ * bytes_to_hex(data, 2, hex);  // hex = "12ab"
+ */
 void bytes_to_hex(const unsigned char *bytes, size_t bytes_len, char *hex) {
     static const char hex_table[] = "0123456789abcdef";
     for (size_t i = 0; i < bytes_len; i++) {
@@ -131,7 +171,19 @@ void bytes_to_hex(const unsigned char *bytes, size_t bytes_len, char *hex) {
     hex[bytes_len * 2] = '\0';
 }
 
-// Convert hex string to bytes
+/**
+ * @brief Convert hexadecimal string to binary data
+ *
+ * Parses hex string and converts to raw bytes. Validates input length
+ * and hex character validity.
+ *
+ * @param hex Input hex string (case-insensitive)
+ * @param bytes Output buffer for binary data
+ * @param expected_len Expected number of output bytes
+ * @return true on success, false if hex string is invalid or wrong length
+ *
+ * @note Hex string must be exactly (expected_len * 2) characters long
+ */
 bool hex_to_bytes(const char *hex, unsigned char *bytes, size_t expected_len) {
     size_t len = strlen(hex);
     if (len != expected_len * 2) return false;
@@ -143,7 +195,18 @@ bool hex_to_bytes(const char *hex, unsigned char *bytes, size_t expected_len) {
     return true;
 }
 
-
+/**
+ * @brief Securely read line from stdin
+ *
+ * Reads user input with automatic newline trimming.
+ * Handles EOF gracefully by returning empty string.
+ *
+ * @param buffer Output buffer for input string
+ * @param size Maximum buffer size (including null terminator)
+ *
+ * @note Removes trailing newline if present
+ * @note Buffer is always null-terminated
+ */
 void secure_input(char *buffer, size_t size) {
     if (!fgets(buffer, size, stdin)) {
     buffer[0] = '\0';
@@ -153,9 +216,29 @@ void secure_input(char *buffer, size_t size) {
     if (len > 0 && buffer[len - 1] == '\n') buffer[len - 1] = '\0';
 }
 
-// Generate new keypair
-
-
+/**
+ * @brief Generate new Curve25519 keypair
+ *
+ * Creates a new public/private keypair using libsodium's crypto_box_keypair().
+ * The keypair uses Curve25519 elliptic curve cryptography (X25519 key exchange).
+ *
+ * CRYPTOGRAPHIC DETAILS:
+ * - Algorithm: Curve25519 (elliptic curve Diffie-Hellman)
+ * - Public key: 32 bytes (256 bits)
+ * - Secret key: 32 bytes (256 bits)
+ * - Security level: ~128-bit (quantum-resistant: ~85-bit)
+ *
+ * SECURITY NOTES:
+ * - Secret key MUST be kept confidential
+ * - Public key can be freely shared
+ * - Keys are displayed in hexadecimal format for easy copying
+ * - This function does NOT save keys to disk (user must export manually)
+ *
+ * @param kp Pointer to KeyPair structure to populate
+ *
+ * @post kp->keys_generated is set to true
+ * @post kp->public_key and kp->secret_key contain valid key material
+ */
 void generate_keypair_mode(KeyPair *kp) {
     clear_screen();
     print_header();
@@ -181,7 +264,36 @@ void generate_keypair_mode(KeyPair *kp) {
     print_separator();
 }
 
-// Encrypt message
+/**
+ * @brief Encrypt message using authenticated encryption
+ *
+ * Encrypts a plaintext message for a specific recipient using their public key.
+ * Uses libsodium's crypto_box_easy() which implements authenticated encryption
+ * with Curve25519, XSalsa20, and Poly1305.
+ *
+ * ENCRYPTION PROTOCOL:
+ * 1. User enters recipient's public key (hex format)
+ * 2. User enters plaintext message
+ * 3. Random nonce is generated (24 bytes)
+ * 4. Message is encrypted with: crypto_box_easy(message, nonce, recipient_pk, sender_sk)
+ * 5. Output format: [nonce (48 hex chars)][ciphertext (variable)]
+ *
+ * CRYPTOGRAPHIC DETAILS:
+ * - Key agreement: X25519 (ECDH on Curve25519)
+ * - Cipher: XSalsa20 stream cipher
+ * - Authentication: Poly1305 MAC (16-byte tag)
+ * - Nonce: 24 bytes (randomly generated per message)
+ *
+ * SECURITY GUARANTEES:
+ * - Confidentiality: Only recipient can decrypt (has matching secret key)
+ * - Authentication: Recipient knows message is from sender (sender's secret key used)
+ * - Integrity: Any tampering detected by Poly1305 MAC
+ *
+ * @param kp Pointer to sender's KeyPair (must have keys_generated = true)
+ *
+ * @warning Requires keypair to be generated or imported first
+ * @note Nonce is prepended to ciphertext for easy decryption
+ */
 void encrypt_message_mode(KeyPair *kp) {
     clear_screen();
     print_header();
@@ -258,6 +370,29 @@ free(ciphertext);
 }
 
 // Decrypt message
+/**
+ * @brief Decrypt authenticated encrypted message
+ *
+ * Decrypts a ciphertext that was encrypted with encrypt_message_mode().
+ * Uses crypto_box_open_easy() to verify authentication and decrypt.
+ *
+ * DECRYPTION PROTOCOL:
+ * 1. User enters sender's public key (hex format)
+ * 2. User enters encrypted message (hex: nonce + ciphertext)
+ * 3. Nonce extracted from first 48 hex characters (24 bytes)
+ * 4. Message decrypted with: crypto_box_open_easy(ciphertext, nonce, sender_pk, recipient_sk)
+ * 5. Plaintext displayed if decryption succeeds
+ *
+ * SECURITY FEATURES:
+ * - Verifies message came from claimed sender (authentication)
+ * - Detects any tampering via Poly1305 MAC verification
+ * - Returns error if MAC check fails (message modified or wrong keys)
+ *
+ * @param kp Pointer to recipient's KeyPair (must have keys_generated = true)
+ *
+ * @warning Requires keypair to be generated or imported first
+ * @warning Will fail if ciphertext was modified or wrong sender key provided
+ */
 void decrypt_message_mode(KeyPair *kp) {
     clear_screen();
     print_header();
@@ -268,7 +403,7 @@ void decrypt_message_mode(KeyPair *kp) {
         return;
     }
 
-    // Show your public key to share with sender
+    /* Show your public key to share with sender */
     char your_public_hex[crypto_box_PUBLICKEYBYTES * 2 + 1];
     bytes_to_hex(kp->public_key, crypto_box_PUBLICKEYBYTES, your_public_hex);
     printf(COLOR_BOLD "Your public key to share: " COLOR_RESET);

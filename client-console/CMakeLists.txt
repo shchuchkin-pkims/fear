@@ -20,8 +20,14 @@ endif()
 set(SRC_DIR src)
 set(INCLUDE_DIR include)
 
-# Исходные файлы
-file(GLOB SOURCES "${SRC_DIR}/*.c")
+# Явный список исходных файлов (лучше, чем GLOB для надежности)
+set(SOURCES
+    ${SRC_DIR}/main.c
+    ${SRC_DIR}/common.c
+    ${SRC_DIR}/network.c
+    ${SRC_DIR}/client.c
+    ${SRC_DIR}/server.c
+)
 
 # Создание исполняемого файла
 add_executable(${TARGET_NAME} ${SOURCES})

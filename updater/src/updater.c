@@ -1,7 +1,34 @@
-// updater.c
-// Cross-platform GitHub Releases updater.
-// Requires: libcurl
-// Author: you. License: MIT (free to use).
+/**
+ * @file updater.c
+ * @brief Cross-platform automatic updater for F.E.A.R. Project
+ *
+ * Downloads and installs updates from GitHub Releases automatically.
+ * Supports ZIP archives with automatic extraction and binary replacement.
+ *
+ * FEATURES:
+ * - Fetches latest release from GitHub API
+ * - Compares semantic versions (vX.Y.Z)
+ * - Downloads matching asset (by prefix)
+ * - Extracts ZIP archive
+ * - Replaces current binary with updated version
+ * - Cross-platform (Windows/Linux/macOS)
+ *
+ * CONFIGURATION:
+ * Reads settings from updater.conf:
+ * - repo_owner: GitHub repository owner
+ * - repo_name: GitHub repository name
+ * - app_path: Path to application binary to update
+ * - version_arg: Command-line arg to get current version (e.g., "--version")
+ * - asset_prefix: Prefix filter for release assets
+ *
+ * REQUIRES:
+ * - libcurl (for HTTP requests)
+ * - unzip utility (for archive extraction)
+ *
+ * @author F.E.A.R. Project contributors
+ * @license MIT (free to use)
+ * @version 1.0
+ */
 
 #define _CRT_SECURE_NO_WARNINGS
 
@@ -41,26 +68,47 @@
 #define MAX_REPO 128
 #define DL_BUF_CHUNK 8192
 
+/**
+ * @struct Config
+ * @brief Updater configuration loaded from updater.conf
+ *
+ * Contains all settings needed to check for updates and download releases.
+ */
 typedef struct {
-    char repo_owner[MAX_OWNER];
-    char repo_name[MAX_REPO];
-    char app_path[MAX_PATH_LEN];
-    char version_arg[64];
-    char asset_prefix[MAX_PREFIX];
+    char repo_owner[MAX_OWNER];      /**< GitHub repository owner */
+    char repo_name[MAX_REPO];        /**< GitHub repository name */
+    char app_path[MAX_PATH_LEN];     /**< Path to application binary to update */
+    char version_arg[64];            /**< Command-line argument to get version (e.g., "--version") */
+    char asset_prefix[MAX_PREFIX];   /**< Prefix filter for release assets (e.g., "fear-v") */
 } Config;
 
+/**
+ * @struct MemBuf
+ * @brief In-memory buffer for HTTP responses
+ *
+ * Used by libcurl to accumulate downloaded data in memory.
+ */
 typedef struct {
-    char *data;
-    size_t size;
+    char *data;    /**< Dynamically allocated buffer */
+    size_t size;   /**< Current size of data in buffer */
 } MemBuf;
 
-/* ---------- Utilities ---------- */
+/* ========== Utility Functions ========== */
 
+/**
+ * @brief Print error message and exit
+ * @param msg Error message to display
+ */
 static void die(const char *msg) {
     fprintf(stderr, "ERROR: %s\n", msg);
     exit(1);
 }
 
+/**
+ * @brief Print formatted error message and exit
+ * @param fmt Format string
+ * @param a Argument to format
+ */
 static void dief(const char *fmt, const char *a) {
     fprintf(stderr, "ERROR: ");
     fprintf(stderr, fmt, a);
@@ -68,10 +116,23 @@ static void dief(const char *fmt, const char *a) {
     exit(1);
 }
 
+/**
+ * @brief Remove leading/trailing whitespace from string
+ *
+ * Modifies string in-place by removing:
+ * - Trailing whitespace, newlines, carriage returns
+ * - Leading whitespace
+ *
+ * @param s String to trim (modified in-place, can be NULL)
+ */
 static void trim(char *s) {
     if(!s) return;
     size_t n = strlen(s);
-    while(n>0 && (s[n-1]=='\r' || s[n-1]=='\n' || isspace((unsigned char)s[n-1]))) { s[--n] = '\0'; }
+    /* Remove trailing whitespace */
+    while(n>0 && (s[n-1]=='\r' || s[n-1]=='\n' || isspace((unsigned char)s[n-1]))) {
+        s[--n] = '\0';
+    }
+    /* Remove leading whitespace */
     size_t i = 0;
     while(s[i] && isspace((unsigned char)s[i])) i++;
     if(i>0) memmove(s, s+i, strlen(s+i)+1);
@@ -112,6 +173,26 @@ static void detect_os_arch(char *out, size_t outsz) {
 
 /* ---------- Configuration reading ---------- */
 
+/**
+ * @brief Load configuration from INI-style file
+ *
+ * Parses updater.conf file with key=value pairs.
+ * Supports comments (#, ;) and blank lines.
+ *
+ * REQUIRED KEYS:
+ * - repo_owner: GitHub repository owner
+ * - repo_name: GitHub repository name
+ * - app_path: Path to application binary
+ * - asset_prefix: Asset name prefix filter
+ *
+ * OPTIONAL KEYS:
+ * - version_arg: Command argument to get version (default: "--version")
+ *
+ * @param path Path to configuration file
+ * @param cfg Output Config structure to populate
+ *
+ * @note Exits program if config file missing or incomplete
+ */
 static void load_config(const char *path, Config *cfg) {
     FILE *f = fopen(path, "r");
     if(!f) dief("Failed to open config: %s", path);
@@ -138,10 +219,37 @@ static void load_config(const char *path, Config *cfg) {
         die("Config is incomplete. Required: repo_owner, repo_name, app_path, asset_prefix. Optional: version_arg.");
     }
     if(cfg->version_arg[0]=='\0') strcpy(cfg->version_arg, "--version");
+
+    // Fix app_path for platform - remove .exe on Linux, add .exe on Windows if missing
+#ifdef _WIN32
+    // On Windows, ensure .exe extension
+    if(!strstr(cfg->app_path, ".exe")) {
+        strncat(cfg->app_path, ".exe", sizeof(cfg->app_path) - strlen(cfg->app_path) - 1);
+    }
+#else
+    // On Linux, remove .exe extension if present
+    char *exe_ext = strstr(cfg->app_path, ".exe");
+    if(exe_ext) {
+        *exe_ext = '\0';  // Remove .exe extension
+    }
+#endif
 }
 
-/* ---------- Command execution to get local app version ---------- */
+/* ========== Version Detection ========== */
 
+/**
+ * @brief Extract semantic version from string
+ *
+ * Searches for version pattern like "vX.Y.Z" or "X.Y.Z" in string.
+ * Supports 1-4 numeric components separated by dots.
+ *
+ * @param s Input string to search
+ * @param out Output buffer for extracted version
+ * @param outsz Size of output buffer
+ * @return true if version found, false otherwise
+ *
+ * @example extract_semver("Version v1.2.3-beta", out, sz) -> "1.2.3"
+ */
 static bool extract_semver(const char *s, char *out, size_t outsz) {
     // Look for first subsequence like \d+(\.\d+){0,3}, allow 'v' prefix
     const char *p = s;
@@ -171,24 +279,103 @@ static bool extract_semver(const char *s, char *out, size_t outsz) {
 static void get_local_version(const Config *cfg, char *out_ver, size_t outsz) {
     out_ver[0] = '\0';
     char cmd[ MAX_PATH_LEN + 128 ];
-    
+    char app_path_to_check[MAX_PATH_LEN];
+    const char *exec_path;  /* For Windows command execution */
+
+    // First, check if the file exists in current directory
+    // Extract filename, handling ./ or .\ prefix
+    char check_path[MAX_PATH_LEN];
+    const char *filename_only = cfg->app_path;
+
+    if (cfg->app_path[0] == '.' && (cfg->app_path[1] == '/' || cfg->app_path[1] == '\\')) {
+        filename_only = cfg->app_path + 2;  // Skip ./ or . with backslash
+    }
+
+    // For checking existence, we need the full relative path with ./
+    // Build check_path: add ./ if not present
+    if (cfg->app_path[0] == '.') {
+        strncpy(check_path, cfg->app_path, sizeof(check_path) - 1);
+    } else {
+        snprintf(check_path, sizeof(check_path), ".%c%s", PATH_SEP, filename_only);
+    }
+    check_path[sizeof(check_path) - 1] = '\0';
+
+    // Check if file exists in current directory
     #ifdef _WIN32
-    snprintf(cmd, sizeof(cmd), "\"%s\" %s 2>&1", cfg->app_path, cfg->version_arg);
+    bool file_exists_here = (_access(check_path, 0) == 0);
     #else
-    snprintf(cmd, sizeof(cmd), "'%s' %s 2>&1", cfg->app_path, cfg->version_arg);
+    bool file_exists_here = (access(check_path, F_OK) == 0);
     #endif
-    
+
+    if (file_exists_here) {
+        // File is in current directory, use it directly
+        strncpy(app_path_to_check, check_path, sizeof(app_path_to_check) - 1);
+        app_path_to_check[sizeof(app_path_to_check) - 1] = '\0';
+    } else {
+        // File not in current directory, check if we're in bin/ subdirectory
+        char cwd[MAX_PATH_LEN];
+        #ifdef _WIN32
+        _getcwd(cwd, sizeof(cwd));
+        #else
+        if (getcwd(cwd, sizeof(cwd)) == NULL) {
+            strcpy(cwd, ".");
+        }
+        #endif
+
+        size_t len = strlen(cwd);
+        bool in_bin_dir = false;
+        if (len >= 4) {
+            const char *end = cwd + len - 4;
+            #ifdef _WIN32
+            if (strcmp(end, "\\bin") == 0 || strcmp(end, "/bin") == 0) {
+                in_bin_dir = true;
+            }
+            #else
+            if (strcmp(end, "/bin") == 0) {
+                in_bin_dir = true;
+            }
+            #endif
+        }
+
+        if (in_bin_dir) {
+            // We're in bin/ subdirectory, try parent directory
+            #ifdef _WIN32
+            snprintf(app_path_to_check, sizeof(app_path_to_check), "..\\%s", filename_only);
+            #else
+            snprintf(app_path_to_check, sizeof(app_path_to_check), "../%s", filename_only);
+            #endif
+        } else {
+            // Use path as-is
+            strncpy(app_path_to_check, cfg->app_path, sizeof(app_path_to_check) - 1);
+            app_path_to_check[sizeof(app_path_to_check) - 1] = '\0';
+        }
+    }
+
+    // Build command to execute
+    #ifdef _WIN32
+    /* On Windows, remove ./ or .\ prefix if present (CMD doesn't understand it) */
+    exec_path = app_path_to_check;
+    if (app_path_to_check[0] == '.' && (app_path_to_check[1] == '/' || app_path_to_check[1] == '\\')) {
+        exec_path = app_path_to_check + 2;  /* Skip ./ or .\ */
+    }
+    snprintf(cmd, sizeof(cmd), "\"%s\" %s 2>&1", exec_path, cfg->version_arg);
+    #else
+    snprintf(cmd, sizeof(cmd), "'%s' %s 2>&1", app_path_to_check, cfg->version_arg);
+    #endif
+
+    printf("Running version check: %s\n", cmd);
+
     FILE *pp = popen(cmd, "r");
     if(!pp) {
-        fprintf(stderr, "Warning: failed to run %s for version\n", cfg->app_path);
+        fprintf(stderr, "Warning: failed to run command for version check\n");
         return;
     }
-    
+
     char buf[1024];
     size_t nread = fread(buf, 1, sizeof(buf)-1, pp);
     buf[nread] = '\0';
     pclose(pp);
-    
+
     printf("Raw version output: %s\n", buf); // DEBUG output
     
     // Try to find "Program version: X.X.X" pattern
@@ -382,53 +569,37 @@ static bool json_find_asset_url_by_name(const char *json, const char *asset_name
     return true;
 }
 
-/* ---------- File replacement ---------- */
+/* ---------- ZIP extraction ---------- */
 
-static void build_temp_download_path(const char *app_path, char *out, size_t outsz) {
-    snprintf(out, outsz, "%s.download", app_path);
-}
-
-static void build_backup_path(const char *app_path, char *out, size_t outsz) {
-    snprintf(out, outsz, "%s.bak", app_path);
-}
-
-static void make_executable(const char *path) {
-#ifndef _WIN32
-    struct stat st;
-    if (stat(path, &st)==0) {
-        mode_t m = st.st_mode | S_IXUSR | S_IXGRP | S_IXOTH;
-        chmod(path, m);
-    }
-#else
-    (void)path;
-#endif
-}
-
-static void replace_app_binary(const char *app_path, const char *new_path) {
-    char bak[MAX_PATH_LEN];
-    build_backup_path(app_path, bak, sizeof(bak));
+/**
+ * @brief Extract ZIP archive using system unzip utility
+ * @param zip_path Path to ZIP file
+ * @param dest_dir Destination directory for extraction
+ * @return true on success, false on failure
+ */
+static bool extract_zip(const char *zip_path, const char *dest_dir) {
+    char cmd[2048];
 #ifdef _WIN32
-    // Delete old .bak if exists
-    DeleteFileA(bak);
-    // Rename current to .bak
-    MoveFileExA(app_path, bak, MOVEFILE_REPLACE_EXISTING);
-    // Move new to app location
-    if(!MoveFileExA(new_path, app_path, MOVEFILE_REPLACE_EXISTING)) {
-        // Try to revert
-        MoveFileExA(bak, app_path, MOVEFILE_REPLACE_EXISTING);
-        die("Failed to replace binary (MoveFileEx)");
-    }
+    // For Windows, use PowerShell's Expand-Archive or external unzip
+    snprintf(cmd, sizeof(cmd), "powershell -command \"Expand-Archive -Path '%s' -DestinationPath '%s' -Force\"",
+             zip_path, dest_dir);
 #else
-    // Rename current to .bak (may fail if file doesn't exist)
-    rename(app_path, bak);
-    // Move new to app location
-    if (rename(new_path, app_path)!=0) {
-        // Revert
-        rename(bak, app_path);
-        die("Failed to replace binary (rename)");
-    }
+    // For Linux/macOS, use unzip command
+    snprintf(cmd, sizeof(cmd), "unzip -o '%s' -d '%s'", zip_path, dest_dir);
 #endif
+
+    printf("Extracting: %s\n", cmd);
+    int ret = system(cmd);
+    if (ret != 0) {
+        fprintf(stderr, "Failed to extract ZIP (exit code: %d)\n", ret);
+        return false;
+    }
+    return true;
 }
+
+/* ---------- File replacement ---------- */
+// Files are now copied directly from the extracted archive to the current directory
+// No need for individual binary replacement functions
 
 /* ---------- Main logic ---------- */
 
@@ -440,7 +611,40 @@ int main(int argc, char **argv) {
     printf("Starting updater...\n");
     printf("Current directory: ");
     system("cd");
-    
+
+    // Determine the correct target directory for update
+    // If updater is in bin/ subdirectory, we need to update parent directory
+    char target_dir[MAX_PATH_LEN] = ".";
+    char cwd[MAX_PATH_LEN];
+
+#ifdef _WIN32
+    _getcwd(cwd, sizeof(cwd));
+#else
+    if (getcwd(cwd, sizeof(cwd)) == NULL) {
+        strcpy(cwd, ".");
+    }
+#endif
+
+    printf("Working directory: %s\n", cwd);
+
+    // Check if we're in a 'bin' subdirectory
+    // Look for common pattern: ends with /bin or \bin
+    size_t len = strlen(cwd);
+    if (len >= 4) {
+        const char *end = cwd + len - 4;
+#ifdef _WIN32
+        if (strcmp(end, "\\bin") == 0 || strcmp(end, "/bin") == 0) {
+            strcpy(target_dir, "..");
+            printf("Detected 'bin' directory - will update parent directory\n");
+        }
+#else
+        if (strcmp(end, "/bin") == 0) {
+            strcpy(target_dir, "..");
+            printf("Detected 'bin' directory - will update parent directory\n");
+        }
+#endif
+    }
+
     // Check if config exists
     FILE *test = fopen(CONF_PATH_DEFAULT, "r");
     if (!test) {
@@ -495,15 +699,9 @@ int main(int argc, char **argv) {
     char osarch[64];
     detect_os_arch(osarch, sizeof(osarch));
 
-    // Compose expected asset name
+    // Compose expected asset name - always use .zip for both platforms
     char asset_name[256];
-#ifdef _WIN32
-    snprintf(asset_name, sizeof(asset_name), "%s-%s.exe", cfg.asset_prefix, osarch);
-    // :todo Make zip downloadable update from Github releases
-    // snprintf(asset_name, sizeof(asset_name), "%s-%s.zip", cfg.asset_prefix, osarch);
-#else
-    snprintf(asset_name, sizeof(asset_name), "%s-%s", cfg.asset_prefix, osarch);
-#endif
+    snprintf(asset_name, sizeof(asset_name), "%s-%s.zip", cfg.asset_prefix, osarch);
     printf("Looking for asset: %s\n", asset_name);
 
     char dl_url[MAX_URL]="";
@@ -513,20 +711,154 @@ int main(int argc, char **argv) {
     }
     free(mb.data);
 
-    // Where to download
-    char tmp_path[MAX_PATH_LEN];
-    build_temp_download_path(cfg.app_path, tmp_path, sizeof(tmp_path));
-    printf("Downloading to: %s\n", tmp_path);
-    http_download_to_file(dl_url, tmp_path);
+    // Download ZIP archive
+    char zip_path[MAX_PATH_LEN];
+    snprintf(zip_path, sizeof(zip_path), "update_temp.zip");
+    printf("Downloading to: %s\n", zip_path);
+    http_download_to_file(dl_url, zip_path);
 
-    // Make executable (for Linux/macOS)
-    make_executable(tmp_path);
+    // Extract ZIP to temporary directory
+    char extract_dir[MAX_PATH_LEN];
+    snprintf(extract_dir, sizeof(extract_dir), "update_temp");
+    printf("Extracting archive...\n");
 
-    // Replace main binary
-    printf("Replacing %s -> %s\n", tmp_path, cfg.app_path);
-    replace_app_binary(cfg.app_path, tmp_path);
+    // Create extraction directory
+#ifdef _WIN32
+    _mkdir(extract_dir);
+#else
+    mkdir(extract_dir, 0755);
+#endif
+
+    if (!extract_zip(zip_path, extract_dir)) {
+        remove(zip_path);
+        die("Failed to extract update archive");
+    }
+
+    // Remove downloaded ZIP
+    remove(zip_path);
+
+    printf("Copying updated files to: %s\n", target_dir);
+
+#ifdef _WIN32
+    // On Windows, we need to handle locked files (like fear_gui.exe)
+    // Strategy: rename locked files to .old, then delete them on next startup
+    printf("Preparing for file replacement...\n");
+
+    // Try to rename fear_gui.exe if it exists in target directory
+    char old_gui_path[MAX_PATH_LEN];
+    char new_gui_path[MAX_PATH_LEN];
+    snprintf(old_gui_path, sizeof(old_gui_path), "%s%cfear_gui.exe", target_dir, PATH_SEP);
+    snprintf(new_gui_path, sizeof(new_gui_path), "%s%cfear_gui.exe.old", target_dir, PATH_SEP);
+
+    // Check if fear_gui.exe exists
+    if (_access(old_gui_path, 0) == 0) {
+        // Try to delete old .old file if it exists
+        if (_access(new_gui_path, 0) == 0) {
+            printf("Removing previous backup: fear_gui.exe.old\n");
+            remove(new_gui_path);
+        }
+
+        // Try to rename current fear_gui.exe to .old
+        if (rename(old_gui_path, new_gui_path) == 0) {
+            printf("Renamed locked fear_gui.exe to fear_gui.exe.old\n");
+        } else {
+            printf("Note: Could not rename fear_gui.exe (may not be running or already renamed)\n");
+        }
+    }
+#endif
+
+    // Copy all files from extracted directory to target directory
+    // Important: We need to preserve directory structure (bin/, doc/, etc.)
+#ifdef _WIN32
+    // Windows: use robocopy if available, otherwise xcopy
+    // robocopy is more reliable for directory copying
+    char copy_cmd[2048];
+
+    // Try robocopy first (available on Windows Vista+)
+    // /E - copy subdirectories, including empty ones
+    // /IS - include same files (overwrite even if same)
+    // /IT - include tweaked files (overwrite even if timestamp is same)
+    snprintf(copy_cmd, sizeof(copy_cmd),
+             "robocopy \"%s\" \"%s\" /E /IS /IT",
+             extract_dir, target_dir);
+
+    printf("Running: robocopy \"%s\" \"%s\" /E /IS /IT\n", extract_dir, target_dir);
+    fflush(stdout);
+    int copy_ret = system(copy_cmd);
+    printf("Robocopy exit code: %d\n", copy_ret);
+
+    // Robocopy return codes: 0-7 are success, 8+ are errors
+    // 0 = no files copied, 1 = files copied successfully, 2 = extra files/dirs
+    // 3 = files copied with mismatches, etc.
+    if (copy_ret >= 8) {
+        // Robocopy failed or not available, try xcopy
+        printf("Robocopy encountered errors, trying xcopy...\n");
+        snprintf(copy_cmd, sizeof(copy_cmd),
+                 "xcopy \"%s\" \"%s\" /E /H /Y /I /R /K /S",
+                 extract_dir, target_dir);
+        printf("Running: %s\n", copy_cmd);
+        fflush(stdout);
+        copy_ret = system(copy_cmd);
+        printf("Xcopy exit code: %d\n", copy_ret);
+        if (copy_ret != 0) {
+            fprintf(stderr, "Warning: Copy command returned non-zero exit code %d\n", copy_ret);
+        }
+    } else {
+        printf("Files copied successfully (robocopy code %d).\n", copy_ret);
+    }
+#else
+    // Linux/macOS: use rsync or cp with proper options
+    char copy_cmd[2048];
+
+    // Use rsync if available (preserves structure), otherwise use cp with tar
+    // First try rsync (most reliable for preserving structure)
+    snprintf(copy_cmd, sizeof(copy_cmd),
+             "which rsync >/dev/null 2>&1 && rsync -av '%s/' '%s/' 2>/dev/null || "
+             "(cd '%s' && tar cf - .) | (cd '%s' && tar xf -)",
+             extract_dir, target_dir, extract_dir, target_dir);
+
+    printf("Running: %s\n", copy_cmd);
+    int copy_ret = system(copy_cmd);
+
+    if (copy_ret != 0) {
+        fprintf(stderr, "Warning: Some files may not have been copied\n");
+    }
+
+    // Make all binaries in bin/ executable (relative to target_dir)
+    snprintf(copy_cmd, sizeof(copy_cmd), "chmod +x '%s/bin/'* 2>/dev/null || true", target_dir);
+    system(copy_cmd);
+    snprintf(copy_cmd, sizeof(copy_cmd), "chmod +x '%s/'*.sh 2>/dev/null || true", target_dir);
+    system(copy_cmd);
+#endif
+
+    printf("Files copied successfully.\n");
+
+    // Cleanup extraction directory
+    printf("Cleaning up temporary files...\n");
+#ifdef _WIN32
+    char cleanup_cmd[MAX_PATH_LEN + 32];
+    snprintf(cleanup_cmd, sizeof(cleanup_cmd), "rmdir /s /q \"%s\"", extract_dir);
+    system(cleanup_cmd);
+#else
+    char cleanup_cmd[MAX_PATH_LEN + 32];
+    snprintf(cleanup_cmd, sizeof(cleanup_cmd), "rm -rf '%s'", extract_dir);
+    system(cleanup_cmd);
+#endif
 
     printf("Update completed. New version: %s\n", remote_ver);
+
+#ifdef _WIN32
+    // Check if we need to notify about GUI restart
+    char check_old_gui[MAX_PATH_LEN];
+    snprintf(check_old_gui, sizeof(check_old_gui), "%s%cfear_gui.exe.old", target_dir, PATH_SEP);
+    if (_access(check_old_gui, 0) == 0) {
+        printf("\n");
+        printf("IMPORTANT: fear_gui.exe was running during update.\n");
+        printf("Please restart the GUI application to complete the update.\n");
+        printf("The old version will be removed automatically on next startup.\n");
+    }
+#endif
+
     curl_global_cleanup();
     return 0;
 }

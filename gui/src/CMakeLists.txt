@@ -100,9 +100,24 @@ qt_add_resources(RESOURCES_FILES
     "resources.qrc"
 )
 
-set(SOURCES 
-    main.cpp 
+set(SOURCES
+    main.cpp
     key_exchange.cpp
+    keyexchangedialog.cpp
+    audiocallmanager.cpp
+    audiocalldialog.cpp
+    backend.cpp
+    updatedialog.cpp
+    mainwindow.cpp
+)
+
+set(HEADERS
+    keyexchangedialog.h
+    audiocallmanager.h
+    audiocalldialog.h
+    backend.h
+    updatedialog.h
+    mainwindow.h
 )
 
 add_executable(${PROJECT_NAME}
