@@ -5,6 +5,7 @@
 ![F.E.A.R. Project](./doc/images/banner_small.png)
 
 **Privacy-focused secure messaging platform with end-to-end encryption**
+
 *Бояться - это нормально...*
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
