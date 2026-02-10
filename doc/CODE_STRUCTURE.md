@@ -1,7 +1,7 @@
 # F.E.A.R. Project - Code Structure Guide
 
 **Last Updated:** October 22, 2025
-**Version:** 0.3.0
+**Version:** 0.4.0
 
 ---
 
@@ -65,6 +65,73 @@ client-console/
 - Message relay (broadcast to room)
 - Client state management
 - Name uniqueness enforcement
+
+---
+
+### 2. Video Call Module (`video_call/`)
+
+Encrypted peer-to-peer video+audio calling over UDP.
+
+#### Structure
+
+```
+video_call/
+├── include/
+│   ├── video_types.h      # Constants, packet types, quality presets
+│   ├── video_capture.h    # Camera capture interface
+│   ├── video_codec.h      # VP8 encoder/decoder interface
+│   ├── video_display.h    # SDL3 display interface
+│   ├── video_fragment.h   # UDP fragmentation/reassembly
+│   └── video_quality.h    # Adaptive bitrate controller
+└── src/
+    ├── video_call.c       # Main orchestration, threads, encryption
+    ├── video_capture.c    # FFmpeg camera capture (dshow/V4L2)
+    ├── video_codec.c      # VP8 encode/decode via libavcodec
+    ├── video_display.c    # SDL3 YUV420P rendering
+    ├── video_fragment.c   # Frame fragmentation/reassembly
+    └── video_quality.c    # Adaptive bitrate control
+```
+
+#### Module Responsibilities
+
+**video_call.c**
+- Main entry point (genkey, listdevices, call, listen, hub commands)
+- Thread management (send, receive, display)
+- AES-256-GCM encryption/decryption of video fragments
+- HELLO handshake protocol for nonce prefix exchange
+- Peer disconnect detection and reconnect handling
+
+**video_capture.c**
+- FFmpeg-based camera capture (dshow on Windows, V4L2 on Linux)
+- MJPEG format request to avoid raw YUYV buffer overflow
+- Resolution downscaling via sws_ctx when camera native resolution exceeds target
+
+**video_codec.c**
+- VP8 encoder (libvpx via libavcodec): realtime deadline, error-resilient mode
+- VP8 decoder with automatic keyframe detection
+- Bitrate control for adaptive quality
+
+**video_display.c**
+- SDL3 window creation and YUV420P texture rendering
+- Dynamic texture recreation on dimension changes
+
+**video_fragment.c**
+- Splits VP8 frames into 1200-byte UDP fragments (max 128 per frame)
+- Reassembles fragments with timeout-based expiry
+- Handles out-of-order and lost fragment scenarios
+
+**video_quality.c**
+- Adaptive bitrate controller with 3 presets (LOW/MEDIUM/HIGH)
+- Stats exchange between peers for quality decisions
+
+#### Video Pipeline
+
+```
+Camera (FFmpeg) → YUV420P (sws_scale) → VP8 encode (libvpx)
+  → Fragment (1200B chunks) → AES-256-GCM encrypt → UDP send
+  → UDP recv → AES-256-GCM decrypt → Reassemble
+  → VP8 decode → SDL3 display (YUV420P texture)
+```
 
 ---
 
@@ -361,6 +428,7 @@ cmake --build .
 build/bin/fear          # Console client/server
 build/bin/key-exchange  # Key exchange utility
 build/bin/audio_call    # Voice call utility
+build/bin/video_call    # Video call utility
 build/bin/updater       # Update manager
 ```
 

@@ -36,12 +36,12 @@ fear-linux-x86_64.zip (или fear-windows-x86_64.zip)
 
    **Для Linux (рекомендуется):**
    ```bash
-   ./pack_release.sh 0.3.0
+   ./pack_release.sh 0.4.0
    ```
 
    **Для Windows (рекомендуется):**
    ```cmd
-   pack_release.bat 0.3.0
+   pack_release.bat 0.4.0
    ```
 
    Скрипт автоматически:
@@ -78,7 +78,7 @@ fear-linux-x86_64.zip (или fear-windows-x86_64.zip)
 3. Создайте новый релиз на GitHub:
    - Перейдите на страницу репозитория
    - Нажмите "Releases" → "Create a new release"
-   - Создайте новый тег: `v0.3.0` (формат: `vX.Y.Z`)
+   - Создайте новый тег: `v0.4.0` (формат: `vX.Y.Z`)
    - Заполните описание релиза
    - Прикрепите ZIP-архивы:
      - `fear-linux-x86_64.zip`
@@ -129,7 +129,7 @@ Updater должен:
 
 Пример:
 ```c
-#define VERSION "0.3.0"
+#define VERSION "0.4.0"
 ```
 
 ### 6. Конфигурация updater.conf

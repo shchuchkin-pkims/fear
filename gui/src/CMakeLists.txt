@@ -106,6 +106,8 @@ set(SOURCES
     keyexchangedialog.cpp
     audiocallmanager.cpp
     audiocalldialog.cpp
+    videocallmanager.cpp
+    videocalldialog.cpp
     backend.cpp
     updatedialog.cpp
     mainwindow.cpp
@@ -115,6 +117,8 @@ set(HEADERS
     keyexchangedialog.h
     audiocallmanager.h
     audiocalldialog.h
+    videocallmanager.h
+    videocalldialog.h
     backend.h
     updatedialog.h
     mainwindow.h

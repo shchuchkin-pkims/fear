@@ -27,6 +27,7 @@ build/
 ├── bin/              ← Console utilities
 │   ├── fear.exe      ← Console client-server
 │   ├── audio_call.exe← Audio calling tool
+│   ├── video_call.exe← Video calling tool
 │   ├── key-exchange  ← Key exchange utility
 │   └── updater.exe   ← Update manager
 └── doc/
@@ -89,6 +90,36 @@ echo "YOUR_KEY" | ./audio_call call IP PORT
 - Select input/output devices
 - Share key with participant securely
 
+### Video Calls
+
+**Console:**
+```bash
+cd build/bin
+
+# Generate video call key
+./video_call genkey
+
+# List cameras and audio devices
+./video_call listdevices
+
+# Start call (key via stdin)
+echo "YOUR_KEY" | ./video_call call IP PORT
+
+# Listen for incoming call
+echo "YOUR_KEY" | ./video_call listen PORT
+
+# Options: quality, camera, no-camera mode
+echo "YOUR_KEY" | ./video_call call IP PORT --quality high --camera "/dev/video0"
+echo "YOUR_KEY" | ./video_call listen PORT --no-camera
+```
+
+**GUI:**
+- Open "Video call" menu → "Start video call"
+- Generate key (auto-copied to clipboard)
+- Select camera (or "No camera" for receive-only)
+- Choose quality preset (LOW/MEDIUM/HIGH)
+- Share key with participant securely
+
 ## Other Commands
 
 **Clean temporary files:**
@@ -105,7 +136,7 @@ build.bat rebuild    # Windows
 
 ## Security Tips 🔒
 
-**v0.3.0+ Security Improvements:**
+**Security Improvements (v0.3.0+):**
 
 1. **Key Generation:**
    - ✅ Keys are **NOT auto-saved to disk** (output to stdout/clipboard only)
@@ -138,3 +169,5 @@ build.bat rebuild    # Windows
 | Run GUI | `cd build && ./fear_gui` | `cd build && fear_gui.exe` |
 | Generate room key | `cd build/bin && ./fear genkey` | `cd build\bin && fear.exe genkey` |
 | Generate audio key | `cd build/bin && ./audio_call genkey` | `cd build\bin && audio_call.exe genkey` |
+| Generate video key | `cd build/bin && ./video_call genkey` | `cd build\bin && video_call.exe genkey` |
+| Install deps (Linux) | `./build.sh deps` | N/A |

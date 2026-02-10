@@ -25,6 +25,8 @@ if(WIN32)
     set(CURL_ROOT "${LIBS_DIR}/curl-8.15.0_5-win64-mingw")
     set(OPUS_ROOT "${LIBS_DIR}/opus-1.5.2")
     set(PORTAUDIO_ROOT "${LIBS_DIR}/portaudio")
+    set(FFMPEG_ROOT "${LIBS_DIR}/ffmpeg-win64")
+    set(SDL3_ROOT "${LIBS_DIR}/SDL3-win64")
 
     # Передача путей в субмодули
     set(LIBS_DIR "${LIBS_DIR}" CACHE PATH "Path to libraries directory")
@@ -32,6 +34,8 @@ if(WIN32)
     set(CURL_ROOT "${CURL_ROOT}" CACHE PATH "Path to curl")
     set(OPUS_ROOT "${OPUS_ROOT}" CACHE PATH "Path to opus")
     set(PORTAUDIO_ROOT "${PORTAUDIO_ROOT}" CACHE PATH "Path to portaudio")
+    set(FFMPEG_ROOT "${FFMPEG_ROOT}" CACHE PATH "Path to FFmpeg")
+    set(SDL3_ROOT "${SDL3_ROOT}" CACHE PATH "Path to SDL3")
 
     # Проверка существования библиотечных директорий
     if(NOT EXISTS "${LIBSODIUM_ROOT}")
@@ -72,11 +76,12 @@ add_subdirectory(client-console)
 add_subdirectory(key-exchange)
 add_subdirectory(updater)
 add_subdirectory(audio_call)
+add_subdirectory(video_call)
 
 # Создание пользовательских целей для удобства
 add_custom_target(build-all
-    DEPENDS fear key-exchange updater audio_call
-    COMMENT "Building all executables: fear.exe, key-exchange.exe, updater.exe, audio_call.exe"
+    DEPENDS fear key-exchange updater audio_call video_call
+    COMMENT "Building all executables: fear.exe, key-exchange.exe, updater.exe, audio_call.exe, video_call.exe"
 )
 
 add_custom_target(clean-all
@@ -111,6 +116,10 @@ set_target_properties(audio_call PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${BIN_DIRECTORY}"
 )
 
+set_target_properties(video_call PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${BIN_DIRECTORY}"
+)
+
 # Автоматическое копирование необходимых файлов при ЛЮБОЙ сборке
 add_custom_target(copy-runtime-files ALL
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
@@ -127,6 +136,41 @@ add_custom_target(copy-runtime-files ALL
         "${DOC_DIRECTORY}/manual.pdf"
     COMMENT "Copying runtime files to output directory"
 )
+
+# Копирование DLL при сборке на Windows (только для динамически слинкованных библиотек)
+if(WIN32)
+    # FFmpeg DLLs — копировать только если есть bin/ с DLL (shared build)
+    set(FFMPEG_BIN_DIR "${FFMPEG_ROOT}/bin")
+    if(EXISTS "${FFMPEG_BIN_DIR}")
+        file(GLOB FFMPEG_DLLS "${FFMPEG_BIN_DIR}/*.dll")
+        if(FFMPEG_DLLS)
+            message(STATUS "Will copy FFmpeg DLLs from ${FFMPEG_BIN_DIR}")
+            foreach(_dll ${FFMPEG_DLLS})
+                get_filename_component(_dll_name "${_dll}" NAME)
+                add_custom_command(TARGET copy-runtime-files POST_BUILD
+                    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                        "${_dll}" "${BIN_DIRECTORY}/${_dll_name}"
+                )
+            endforeach()
+        endif()
+    endif()
+
+    # SDL3 DLL
+    set(SDL3_BIN_DIR "${SDL3_ROOT}/bin")
+    if(EXISTS "${SDL3_BIN_DIR}")
+        file(GLOB SDL3_DLLS "${SDL3_BIN_DIR}/*.dll")
+        if(SDL3_DLLS)
+            message(STATUS "Will copy SDL3 DLLs from ${SDL3_BIN_DIR}")
+            foreach(_dll ${SDL3_DLLS})
+                get_filename_component(_dll_name "${_dll}" NAME)
+                add_custom_command(TARGET copy-runtime-files POST_BUILD
+                    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                        "${_dll}" "${BIN_DIRECTORY}/${_dll_name}"
+                )
+            endforeach()
+        endif()
+    endif()
+endif()
 
 # Информация о проекте
 message(STATUS "Project: ${PROJECT_NAME}")

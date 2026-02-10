@@ -32,6 +32,14 @@ That's it! All executables will be in `build/bin/` directory.
 build.bat
 ```
 
+### Install Dependencies (Linux)
+
+```bash
+./build.sh deps
+```
+
+Installs all required packages including FFmpeg, SDL3, libvpx, Qt6, libsodium, Opus, PortAudio and more. Automatically builds SDL3 from source if not available in repos.
+
 ### Clean Build Artifacts
 
 Remove all temporary files (keeps compiled binaries):
@@ -73,6 +81,7 @@ fear-main/
 │   ├── bin/              ← Console utilities
 │   │   ├── fear.exe      ← Client-server
 │   │   ├── audio_call.exe
+│   │   ├── video_call.exe
 │   │   ├── key-exchange.exe
 │   │   ├── updater.exe
 │   │   └── *.dll, *.conf, etc.
@@ -86,11 +95,19 @@ fear-main/
 ### Linux/Ubuntu
 
 ```bash
+# Automatic (recommended):
+./build.sh deps
+
+# Or manual:
 sudo apt-get update
-sudo apt-get install build-essential cmake git
-sudo apt-get install qt6-base-dev libsodium-dev
-sudo apt-get install libopus-dev portaudio19-dev libcurl4-openssl-dev
+sudo apt-get install build-essential cmake git pkg-config
+sudo apt-get install qt6-base-dev libsodium-dev libcurl4-openssl-dev
+sudo apt-get install libopus-dev portaudio19-dev
+sudo apt-get install libavcodec-dev libavformat-dev libavutil-dev libswscale-dev libavdevice-dev
+sudo apt-get install libvpx-dev libsdl3-dev
 ```
+
+> **Note:** SDL3 may not be in your distro's repos yet. `./build.sh deps` builds it from source automatically if needed.
 
 ### Windows
 

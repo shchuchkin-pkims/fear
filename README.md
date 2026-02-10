@@ -64,6 +64,15 @@
   - Low-latency audio pipeline via PortAudio
   - End-to-end encrypted voice data
 
+- **📹 Encrypted Video Calls**
+  - Real-time VP8 video encoding/decoding via FFmpeg (libvpx)
+  - Hardware-accelerated SDL3 YUV420P rendering
+  - AES-256-GCM encryption per video fragment
+  - Adaptive bitrate with quality presets (LOW/MEDIUM/HIGH)
+  - UDP fragmentation for reliable frame delivery
+  - Peer disconnect detection and automatic reconnect support
+  - "No camera" receive-only mode
+
 - **🔑 Secure Key Exchange**
   - Diffie-Hellman key exchange protocol
   - Safe room key distribution without pre-shared secrets
@@ -89,10 +98,10 @@
 ```
 ┌─────────────────────────────────────────────────────────┐
 │                    Client Layer                         │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐   │
-│  │   GUI App    │  │  Console CLI │  │  Audio Call  │   │
-│  │  (Qt6/C++)   │  │    (C11)     │  │    (C11)     │   │
-│  └──────────────┘  └──────────────┘  └──────────────┘   │
+│  ┌───────────┐ ┌────────────┐ ┌────────────┐ ┌────────────┐│
+│  │  GUI App  │ │Console CLI │ │ Audio Call │ │ Video Call ││
+│  │ (Qt6/C++) │ │   (C11)    │ │   (C11)    │ │   (C11)    ││
+│  └───────────┘ └────────────┘ └────────────┘ └────────────┘│
 └─────────────────────────────────────────────────────────┘
                            │
                            │ Encrypted Channel
@@ -119,11 +128,20 @@
 
 #### Linux (Ubuntu/Debian)
 ```bash
+# Install all dependencies at once:
+./build.sh deps
+
+# Or manually:
 sudo apt-get update
-sudo apt-get install build-essential cmake git
-sudo apt-get install qt6-base-dev libsodium-dev
-sudo apt-get install libopus-dev portaudio19-dev libcurl4-openssl-dev
+sudo apt-get install build-essential cmake git pkg-config
+sudo apt-get install qt6-base-dev libsodium-dev libcurl4-openssl-dev
+sudo apt-get install libopus-dev portaudio19-dev
+sudo apt-get install libavcodec-dev libavformat-dev libavutil-dev libswscale-dev libavdevice-dev
+sudo apt-get install libvpx-dev libsdl3-dev
 ```
+
+> **Note:** SDL3 may not be available in your distro's repos yet. `./build.sh deps` will automatically build it from source if needed.
+
 
 #### Windows
 - **MinGW-w64** (GCC compiler)
@@ -133,7 +151,7 @@ sudo apt-get install libopus-dev portaudio19-dev libcurl4-openssl-dev
 
 #### macOS
 ```bash
-brew install cmake qt6 libsodium opus portaudio curl
+brew install cmake qt6 libsodium opus portaudio curl ffmpeg sdl3 libvpx
 ```
 
 ### Build from Source
@@ -319,6 +337,42 @@ echo "YOUR_KEY" | ./audio_call listen 50000
 - ✅ Secure key input via stdin (v0.3+)
 - ✅ Audio device selection with Host API info (fixes duplicate names)
 
+### Video Calls
+
+Encrypted video communication:
+
+```bash
+cd build/bin
+
+# Generate video call key (outputs to stdout, auto-copied in GUI)
+./video_call genkey
+# Output: a3f1c2e4b5d6...
+
+# List available cameras and audio devices
+./video_call listdevices
+
+# Start call (key via stdin for security)
+echo "YOUR_KEY" | ./video_call call 192.168.1.100 50000
+
+# Or listen for incoming call
+echo "YOUR_KEY" | ./video_call listen 50000
+
+# Options
+echo "YOUR_KEY" | ./video_call call 192.168.1.100 50000 \
+    --quality high \
+    --camera "/dev/video0" \
+    --no-audio
+```
+
+**Features:**
+- ✅ VP8 video codec via FFmpeg (libvpx)
+- ✅ Hardware-accelerated SDL3 display (YUV420P)
+- ✅ AES-256-GCM encryption per fragment with libsodium
+- ✅ Adaptive bitrate control (LOW/MEDIUM/HIGH presets)
+- ✅ Peer disconnect detection with automatic reconnect
+- ✅ "No camera" receive-only mode
+- ✅ GUI integration with camera selection
+
 ### Auto-Updater
 
 The update manager checks for new versions:
@@ -349,6 +403,15 @@ fear-main/
 ├── audio_call/           # Voice call utility (C11)
 │   └── src/
 │       └── audio_call.c
+├── video_call/           # Video call utility (C11)
+│   ├── include/          # Headers (video_types.h, etc.)
+│   └── src/
+│       ├── video_call.c      # Main orchestration, threads, encryption
+│       ├── video_capture.c   # FFmpeg camera capture (dshow/V4L2)
+│       ├── video_codec.c     # VP8 encode/decode
+│       ├── video_display.c   # SDL3 YUV420P rendering
+│       ├── video_fragment.c  # UDP fragmentation/reassembly
+│       └── video_quality.c   # Adaptive bitrate control
 ├── key-exchange/         # Key exchange tool (C11)
 │   └── src/
 │       └── key-exchange.c
@@ -377,6 +440,7 @@ build/
 ├── bin/                  # Console utilities
 │   ├── fear.exe          # Client/server
 │   ├── audio_call.exe    # Voice calls
+│   ├── video_call.exe    # Video calls
 │   ├── key-exchange.exe  # Key exchange
 │   ├── updater.exe       # Update manager
 │   ├── cacert.pem        # CA certificates
@@ -396,6 +460,9 @@ build/
 | **Cryptography** | libsodium (NaCl) | Encryption, signatures, key derivation |
 | **Audio Codec** | Opus | High-quality, low-latency voice |
 | **Audio I/O** | PortAudio | Cross-platform audio interface |
+| **Video Codec** | VP8 (libvpx via FFmpeg) | Real-time video encoding/decoding |
+| **Video Capture** | FFmpeg (libavdevice) | Camera capture (dshow/V4L2) |
+| **Video Display** | SDL3 | Hardware-accelerated YUV rendering |
 | **HTTP Client** | libcurl | Secure update downloads |
 | **Networking** | POSIX sockets, Winsock2 | Client-server communication |
 
@@ -443,7 +510,7 @@ Security vulnerabilities should be reported privately to the maintainers. Please
 
 ## 🗺️ Roadmap
 
-### ✅ Completed (v0.3.0)
+### ✅ Completed (v0.4.0)
 
 - [x] E2E encrypted messaging (console)
 - [x] Client-server architecture
@@ -461,6 +528,14 @@ Security vulnerabilities should be reported privately to the maintainers. Please
   - [x] Deprecation warnings for insecure --key argument
 - [x] **Audio device improvements** (v0.3+):
   - [x] Host API info in device names (fixes duplicates)
+- [x] **Encrypted video calls** (v0.4+):
+  - [x] VP8 video codec with FFmpeg/libvpx
+  - [x] SDL3 hardware-accelerated display
+  - [x] AES-256-GCM per-fragment encryption
+  - [x] Adaptive bitrate (LOW/MEDIUM/HIGH)
+  - [x] Peer disconnect detection and reconnect
+  - [x] "No camera" receive-only mode
+  - [x] GUI integration with camera selection
 
 ### 🚧 In Progress
 
@@ -469,7 +544,6 @@ Security vulnerabilities should be reported privately to the maintainers. Please
 
 ### 📋 Planned
 
-- [ ] Video calling support
 - [ ] Push notification service
 - [ ] Custom UI themes
 - [ ] Multiple encryption protocol support

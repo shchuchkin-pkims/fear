@@ -2,7 +2,7 @@
 
 # Script to create a release ZIP archive for F.E.A.R. project
 # Usage: ./pack_release.sh [version]
-# Example: ./pack_release.sh 0.3.0
+# Example: ./pack_release.sh 0.4.0
 
 set -e
 

@@ -31,7 +31,7 @@
 #include <unistd.h>
 #endif
 
-#define PROGRAM_VERSION "0.3.0"
+#define PROGRAM_VERSION "0.4.0"
 
 /**
  * @brief Print command-line usage information

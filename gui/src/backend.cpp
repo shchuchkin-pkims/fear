@@ -24,6 +24,9 @@ Backend::Backend(QObject *parent) : QObject(parent) {
 
     // Initialize audio call manager
     audioManager = new AudioCallManager(this);
+
+    // Initialize video call manager
+    videoManager = new VideoCallManager(this);
 }
 
 Backend::~Backend() {

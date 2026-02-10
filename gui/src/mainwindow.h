@@ -102,6 +102,11 @@ private slots:
     void onAudioCall();
 
     /**
+     * @brief Opens video call dialog
+     */
+    void onVideoCall();
+
+    /**
      * @brief Opens key exchange dialog
      */
     void onKeyExchange();

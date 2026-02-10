@@ -6,6 +6,7 @@
 #include "mainwindow.h"
 #include "keyexchangedialog.h"
 #include "audiocalldialog.h"
+#include "videocalldialog.h"
 #include "updatedialog.h"
 #include <QMenuBar>
 #include <QToolBar>
@@ -165,6 +166,11 @@ void MainWindow::onFontSettings() {
 
 void MainWindow::onAudioCall() {
     AudioCallDialog dialog(backend->audioManager, this);
+    dialog.exec();
+}
+
+void MainWindow::onVideoCall() {
+    VideoCallDialog dialog(backend->videoManager, this);
     dialog.exec();
 }
 
@@ -548,6 +554,11 @@ void MainWindow::createMenus() {
     QAction *audioCallAct = new QAction("Start audio call", this);
     connect(audioCallAct, &QAction::triggered, this, &MainWindow::onAudioCall);
     audioMenu->addAction(audioCallAct);
+
+    QMenu *videoMenu = menuBar()->addMenu("Video call");
+    QAction *videoCallAct = new QAction("Start video call", this);
+    connect(videoCallAct, &QAction::triggered, this, &MainWindow::onVideoCall);
+    videoMenu->addAction(videoCallAct);
 
     QMenu *keysMenu = menuBar()->addMenu("Keys");
     QAction *genKeys = new QAction("Generate keypair", this);

@@ -10,6 +10,7 @@
 #   ./build.sh          - Build the project
 #   ./build.sh clean    - Clean build artifacts
 #   ./build.sh rebuild  - Clean and rebuild
+#   ./build.sh deps     - Install build dependencies (Ubuntu/Debian)
 # =============================================================================
 
 set -e  # Exit on error
@@ -149,6 +150,33 @@ case "${1:-build}" in
         print_success "All build artifacts cleaned"
         exit 0
         ;;
+    deps)
+        print_header "Installing Build Dependencies"
+        print_info "Installing packages (requires sudo)..."
+        sudo apt-get update
+        sudo apt-get install -y \
+            build-essential cmake pkg-config \
+            libsodium-dev libcurl4-openssl-dev \
+            libopus-dev portaudio19-dev \
+            libavcodec-dev libavformat-dev libavutil-dev libswscale-dev libavdevice-dev \
+            libvpx-dev qt6-base-dev
+        # SDL3 is not yet in Ubuntu repos — check if installed
+        if ! pkg-config --exists sdl3 2>/dev/null; then
+            print_info "SDL3 not found in system packages, building from source..."
+            sudo apt-get install -y libwayland-dev libxkbcommon-dev wayland-protocols libpulse-dev libasound2-dev
+            SDL_TMP=$(mktemp -d)
+            git clone --depth 1 https://github.com/libsdl-org/SDL.git -b release-3.2.x "${SDL_TMP}/SDL"
+            cmake -S "${SDL_TMP}/SDL" -B "${SDL_TMP}/SDL/build" -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr
+            cmake --build "${SDL_TMP}/SDL/build" -j$(nproc)
+            sudo cmake --install "${SDL_TMP}/SDL/build"
+            rm -rf "${SDL_TMP}"
+            print_success "SDL3 built and installed from source"
+        else
+            print_success "SDL3 already installed"
+        fi
+        print_success "All dependencies installed"
+        exit 0
+        ;;
     rebuild)
         clean_build
         ;;
@@ -156,7 +184,7 @@ case "${1:-build}" in
         ;;
     *)
         print_error "Unknown command: $1"
-        echo "Usage: ./build.sh [build|clean|rebuild]"
+        echo "Usage: ./build.sh [build|clean|rebuild|deps]"
         exit 1
         ;;
 esac

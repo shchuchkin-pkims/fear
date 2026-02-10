@@ -1,7 +1,7 @@
 @echo off
 REM Script to create a release ZIP archive for F.E.A.R. project (Windows)
 REM Usage: pack_release.bat [version]
-REM Example: pack_release.bat 0.3.0
+REM Example: pack_release.bat 0.4.0
 
 setlocal enabledelayedexpansion
 

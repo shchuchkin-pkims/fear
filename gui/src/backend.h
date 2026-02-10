@@ -19,6 +19,7 @@
 #include <QSettings>
 #include <QStringList>
 #include "audiocallmanager.h"
+#include "videocallmanager.h"
 
 /**
  * @class Backend
@@ -50,6 +51,7 @@ public:
     QString cliPath;              ///< Path to fear CLI executable
     bool isConnected;             ///< Current connection state
     AudioCallManager *audioManager; ///< Audio call manager instance
+    VideoCallManager *videoManager; ///< Video call manager instance
 
     /**
      * @brief Sets the path to the CLI executable
