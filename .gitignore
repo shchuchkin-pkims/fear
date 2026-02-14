@@ -1,6 +1,7 @@
 # Игнорирование папок
 .vscode
 .build-temp/
+gui/src/.build/
 audio_call/build/
 client-console/build/
 gui/build/
