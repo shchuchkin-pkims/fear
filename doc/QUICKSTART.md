@@ -1,14 +1,13 @@
 # Quick Start Guide
 
-Get started with F.E.A.R. in minutes!
+Get started with F.E.A.R. in minutes.
 
-## Build the Project
+## Build
 
-### One Command Build
-
-**Linux/macOS:**
+**Linux:**
 ```bash
-./build.sh
+./build.sh deps    # install dependencies (first time only)
+./build.sh         # build everything
 ```
 
 **Windows:**
@@ -18,156 +17,136 @@ build.bat
 
 ## What You Get
 
-After build completes:
-
 ```
 build/
-├── fear_gui.exe      ← Main GUI application (with Qt files)
-├── *.dll, platforms/ ← Qt dependencies
-├── bin/              ← Console utilities
-│   ├── fear.exe      ← Console client-server
-│   ├── audio_call.exe← Audio calling tool
-│   ├── video_call.exe← Video calling tool
-│   ├── key-exchange  ← Key exchange utility
-│   └── updater.exe   ← Update manager
-└── doc/
-    └── manual.pdf    ← User manual
+├── fear_gui          # GUI application
+└── bin/
+    ├── fear          # Console client/server
+    ├── audio_call    # Voice call utility
+    ├── video_call    # Video call utility
+    ├── key-exchange  # Key exchange utility
+    └── updater       # Update manager
 ```
 
-## Run the Application
+## GUI Application (Recommended)
 
-### GUI Application (Recommended for beginners)
-
-**Start the GUI:**
 ```bash
-cd build
-./fear_gui          # Linux/macOS
-fear_gui.exe        # Windows
+cd build && ./fear_gui
 ```
 
-**Features:**
-- ✅ Generate keys with automatic clipboard copy
-- ✅ Visual room management
-- ✅ Audio call interface with device selection
-- ✅ File transfer support
-- ✅ No command-line knowledge required
+The GUI provides three connection modes:
 
-### Console Client (Advanced users)
+### Create Room
+1. Menu > Connection > Create Room
+2. Enter server host, port, room name, and your name
+3. Click **Create** — a key is auto-generated and copied to clipboard
+4. Share the key securely with participants
 
-**Basic Commands:**
+### Join Room (ECDH)
+1. Menu > Connection > Join Room
+2. Enter server host, port, room name, and your name
+3. Click **Join** — ECDH key exchange happens automatically
+4. No pre-shared key needed; the room creator's client sends the key securely
+
+### Connect (Manual Key)
+1. Menu > Connection > Connect
+2. Enter all fields including the room key
+3. Click **Connect**
+
+### Other GUI Features
+- Audio calls: Menu > Audio call > Start audio call
+- Video calls: Menu > Video call > Start video call
+- File transfer: Click "Send file" button in chat
+- Key exchange: Menu > Keys > Key exchange
+- Identity: Trusted keys are managed automatically (TOFU)
+
+## Console Client
+
+### Create a Room
+
 ```bash
 cd build/bin
-
-# Generate room key (outputs to stdout)
-./fear genkey
 
 # Start server
 ./fear server --port 7777
 
-# Join room (key via stdin - secure)
-echo "YOUR_KEY" | ./fear client --host IP --port 7777 --room myroom --name Alice
+# Create room (auto-generate key)
+./fear client --host 127.0.0.1 --port 7777 \
+    --room myroom --name Alice --create
+```
+
+The generated key is printed to stdout. Share it securely.
+
+### Join a Room (ECDH)
+
+```bash
+./fear client --host SERVER_IP --port 7777 \
+    --room myroom --name Bob --join
+```
+
+The ECDH exchange happens automatically — no key needed.
+
+### Connect with Known Key
+
+```bash
+# Key via stdin (recommended)
+echo "YOUR_KEY" | ./fear client --host SERVER_IP --port 7777 \
+    --room myroom --name Charlie
+
+# Key from file
+./fear client --host SERVER_IP --port 7777 \
+    --room myroom --name Charlie --key-file room_key.txt
 ```
 
 ### Audio Calls
 
-**Console:**
 ```bash
-cd build/bin
-
-# Generate audio key
+# Generate key
 ./audio_call genkey
 
-# List audio devices (v0.3+: shows Host API to avoid duplicates)
-./audio_call listdevices
+# Listen for call
+echo "KEY" | ./audio_call listen 50000
 
-# Start call (key via stdin)
-echo "YOUR_KEY" | ./audio_call call IP PORT
+# Make a call
+echo "KEY" | ./audio_call call REMOTE_IP 50000
 ```
-
-**GUI:**
-- Open "Audio call" menu → "Start audio call"
-- Generate key (auto-copied to clipboard)
-- Select input/output devices
-- Share key with participant securely
 
 ### Video Calls
 
-**Console:**
 ```bash
-cd build/bin
-
-# Generate video call key
+# Generate key
 ./video_call genkey
 
-# List cameras and audio devices
-./video_call listdevices
+# Listen for call
+echo "KEY" | ./video_call listen 50000
 
-# Start call (key via stdin)
-echo "YOUR_KEY" | ./video_call call IP PORT
+# Make a call
+echo "KEY" | ./video_call call REMOTE_IP 50000
 
-# Listen for incoming call
-echo "YOUR_KEY" | ./video_call listen PORT
-
-# Options: quality, camera, no-camera mode
-echo "YOUR_KEY" | ./video_call call IP PORT --quality high --camera "/dev/video0"
-echo "YOUR_KEY" | ./video_call listen PORT --no-camera
+# Options
+echo "KEY" | ./video_call call REMOTE_IP 50000 --quality high
+echo "KEY" | ./video_call listen 50000 --no-camera
 ```
 
-**GUI:**
-- Open "Video call" menu → "Start video call"
-- Generate key (auto-copied to clipboard)
-- Select camera (or "No camera" for receive-only)
-- Choose quality preset (LOW/MEDIUM/HIGH)
-- Share key with participant securely
+## Build Commands
 
-## Other Commands
+| Task | Linux | Windows |
+|------|-------|---------|
+| Build | `./build.sh` | `build.bat` |
+| Clean | `./build.sh clean` | `build.bat clean` |
+| Rebuild | `./build.sh rebuild` | `build.bat rebuild` |
+| Install deps | `./build.sh deps` | N/A |
 
-**Clean temporary files:**
-```bash
-./build.sh clean     # Linux/macOS
-build.bat clean      # Windows
-```
+## Security Tips
 
-**Rebuild everything:**
-```bash
-./build.sh rebuild   # Linux/macOS
-build.bat rebuild    # Windows
-```
-
-## Security Tips 🔒
-
-**Security Improvements (v0.3.0+):**
-
-1. **Key Generation:**
-   - ✅ Keys are **NOT auto-saved to disk** (output to stdout/clipboard only)
-   - ✅ GUI automatically copies keys to clipboard
-   - ⚠️ Save keys securely if needed (encrypted storage recommended)
-
-2. **Key Input (CLI):**
-   - ✅ **Recommended**: `echo "KEY" | ./fear client ...` (stdin)
-   - ✅ **Alternative**: `--key-file key.txt` (file-based)
-   - ⚠️ **Avoid**: `--key KEY` (visible in process list!)
-
-3. **Audio Devices:**
-   - ✅ Device names include Host API (e.g., "Microphone (WASAPI)")
-   - ✅ Prevents confusion between duplicate device names
+- Use `--create` / `--join` for key exchange — avoids manual key sharing
+- Pass keys via stdin or `--key-file`, not CLI arguments (visible in process lists)
+- Verify peer identity on first connection (TOFU model)
+- Only connect to servers you trust
 
 ## Need Help?
 
 - Full build instructions: [BUILD.md](BUILD.md)
-- Complete documentation: [README.md](../README.md)
-- User manual: Check `build/doc/manual.pdf`
-- Issues: Check GitHub issues page
-
-## Quick Reference
-
-| Task | Command (Linux/macOS) | Command (Windows) |
-|------|----------------------|-------------------|
-| Build | `./build.sh` | `build.bat` |
-| Clean | `./build.sh clean` | `build.bat clean` |
-| Rebuild | `./build.sh rebuild` | `build.bat rebuild` |
-| Run GUI | `cd build && ./fear_gui` | `cd build && fear_gui.exe` |
-| Generate room key | `cd build/bin && ./fear genkey` | `cd build\bin && fear.exe genkey` |
-| Generate audio key | `cd build/bin && ./audio_call genkey` | `cd build\bin && audio_call.exe genkey` |
-| Generate video key | `cd build/bin && ./video_call genkey` | `cd build\bin && video_call.exe genkey` |
-| Install deps (Linux) | `./build.sh deps` | N/A |
+- Code structure: [CODE_STRUCTURE.md](CODE_STRUCTURE.md)
+- User manual: [manual.md](manual.md)
+- Project README: [README.md](../README.md)

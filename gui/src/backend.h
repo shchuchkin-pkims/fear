@@ -37,6 +37,9 @@ class Backend : public QObject {
     Q_OBJECT
 
 public:
+    /** Connection mode for key exchange */
+    enum ConnectMode { MANUAL_KEY, CREATE_ROOM, JOIN_ROOM };
+
     /**
      * @brief Constructs a new backend
      * @param parent Parent QObject (optional)
@@ -54,6 +57,7 @@ public:
     VideoCallManager *videoManager; ///< Video call manager instance
     QString identityFilePath;     ///< Path to Ed25519 identity key file
     bool identityAvailable;       ///< Whether identity key exists
+    QString roomKeyHex;           ///< Room key as 64-char hex (for audio/video calls)
 
     /**
      * @brief Sets the path to the CLI executable
@@ -74,7 +78,8 @@ public:
      * to prevent exposure in process listings.
      */
     bool connectToServer(const QString &host, int port, const QString &room,
-                        const QString &key, const QString &name);
+                        const QString &key, const QString &name,
+                        ConnectMode mode = MANUAL_KEY);
 
     /**
      * @brief Creates a chat server

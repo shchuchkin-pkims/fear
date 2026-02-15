@@ -16,13 +16,20 @@
 #include <QProcess>
 #include <QSettings>
 
-VideoCallDialog::VideoCallDialog(VideoCallManager *videoManager, QWidget *parent)
+VideoCallDialog::VideoCallDialog(VideoCallManager *videoManager, QWidget *parent,
+                                 const QString &roomKeyHex)
     : QDialog(parent), videoManager(videoManager) {
     setWindowTitle("Video Call");
     setMinimumSize(550, 600);
 
     setupUI();
     setupConnections();
+
+    // Auto-fill room key if available, hide key section
+    if (!roomKeyHex.isEmpty() && roomKeyHex.length() == 64) {
+        keyEdit->setText(roomKeyHex);
+        keyGroupBox->setVisible(false);
+    }
 
     refreshDevices();
 
@@ -157,14 +164,14 @@ void VideoCallDialog::setupUI() {
     QVBoxLayout *layout = new QVBoxLayout(this);
 
     // ===== Key section =====
-    QGroupBox *keyGroup = new QGroupBox("Encryption Key", this);
-    QHBoxLayout *keyLayout = new QHBoxLayout(keyGroup);
-    keyEdit = new QLineEdit(keyGroup);
+    keyGroupBox = new QGroupBox("Encryption Key", this);
+    QHBoxLayout *keyLayout = new QHBoxLayout(keyGroupBox);
+    keyEdit = new QLineEdit(keyGroupBox);
     keyEdit->setPlaceholderText("32-byte hex key (64 hex chars)");
-    genKeyButton = new QPushButton("Generate", keyGroup);
+    genKeyButton = new QPushButton("Generate", keyGroupBox);
     keyLayout->addWidget(keyEdit);
     keyLayout->addWidget(genKeyButton);
-    layout->addWidget(keyGroup);
+    layout->addWidget(keyGroupBox);
 
     // ===== Devices section =====
     QGroupBox *devicesGroup = new QGroupBox("Devices", this);

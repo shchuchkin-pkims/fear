@@ -63,7 +63,8 @@ void Backend::setCliPath(const QString &path) {
 }
 
 bool Backend::connectToServer(const QString &host, int port, const QString &room,
-                               const QString &key, const QString &name) {
+                               const QString &key, const QString &name,
+                               ConnectMode mode) {
     if (clientProc) {
         qWarning() << "Client already running";
         return false;
@@ -95,11 +96,18 @@ bool Backend::connectToServer(const QString &host, int port, const QString &room
             this, &Backend::onClientFinished);
 
     // SECURITY: Do NOT pass key via --key argument (visible in process list)
-    // Instead, we pass it via stdin
+    // Instead, we pass it via stdin (for MANUAL_KEY mode)
     QStringList args;
     args << "client" << "--host" << host << "--port" << QString::number(port)
          << "--room" << room << "--name" << name;
-    // NOTE: NO --key argument here for security!
+
+    // Add mode-specific flags
+    if (mode == CREATE_ROOM) {
+        args << "--create";
+    } else if (mode == JOIN_ROOM) {
+        args << "--join";
+    }
+    // NOTE: NO --key argument here for security (MANUAL_KEY passes key via stdin)
 
     // Pass identity file if available
     if (identityAvailable) {
@@ -108,7 +116,7 @@ bool Backend::connectToServer(const QString &host, int port, const QString &room
 
     qDebug() << "Starting client:" << cliPath << "client --host" << host
              << "--port" << port << "--room" << room << "--name" << name
-             << "(key passed via stdin)";
+             << "mode:" << mode;
 
     // Set environment variables
     QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
@@ -124,21 +132,30 @@ bool Backend::connectToServer(const QString &host, int port, const QString &room
         return false;
     }
 
-    // SECURITY: Pass key via stdin (not visible in process list)
-    QByteArray keyData = key.toUtf8() + "\n";
-    qint64 written = clientProc->write(keyData);
-    if (written == -1) {
-        qWarning() << "Failed to write key to stdin";
-        clientProc->kill();
-        clientProc->waitForFinished(1000);
-        delete clientProc;
-        clientProc = nullptr;
-        emit error("Failed to send key to client process");
-        return false;
+    // For MANUAL_KEY mode: pass key via stdin (not visible in process list)
+    // For CREATE_ROOM/JOIN_ROOM: CLI handles key internally, no stdin key needed
+    if (mode == MANUAL_KEY) {
+        // Store room key as hex for audio/video calls
+        QByteArray keyBytes = QByteArray::fromBase64(key.toUtf8(),
+            QByteArray::Base64UrlEncoding | QByteArray::OmitTrailingEquals);
+        if (keyBytes.size() == 32) {
+            roomKeyHex = keyBytes.toHex();
+        }
+
+        QByteArray keyData = key.toUtf8() + "\n";
+        qint64 written = clientProc->write(keyData);
+        if (written == -1) {
+            qWarning() << "Failed to write key to stdin";
+            clientProc->kill();
+            clientProc->waitForFinished(1000);
+            delete clientProc;
+            clientProc = nullptr;
+            emit error("Failed to send key to client process");
+            return false;
+        }
     }
 
     // NOTE: Do NOT close write channel here - we need to keep it open for sending messages
-    // The key has been sent, but we still need stdin for chat messages
 
     // Consider connection successful after process starts
     isConnected = true;
@@ -248,6 +265,7 @@ bool Backend::disconnect() {
         serverProc = nullptr;
     }
     isConnected = false;
+    roomKeyHex.clear();
     emit disconnected();
     return true;
 }
@@ -486,6 +504,23 @@ void Backend::parseClientOutput(const QString &s) {
     for (const QString &l : lines) {
         QString t = l.trimmed();
         if (t.isEmpty()) continue;
+
+        // Capture room key from CLI output (CREATE or JOIN mode)
+        // [create] Room key generated: <b64>
+        // [join] Room key: <b64>
+        {
+            QRegularExpression keyRe("\\[(create|join)\\] Room key(?:\\s+generated)?:\\s+(\\S+)");
+            QRegularExpressionMatch km = keyRe.match(t);
+            if (km.hasMatch()) {
+                QString b64Key = km.captured(2);
+                QByteArray keyBytes = QByteArray::fromBase64(b64Key.toUtf8(),
+                    QByteArray::Base64UrlEncoding | QByteArray::OmitTrailingEquals);
+                if (keyBytes.size() == 32) {
+                    roomKeyHex = keyBytes.toHex();
+                    qDebug() << "Room key captured (" << km.captured(1) << "), hex length:" << roomKeyHex.length();
+                }
+            }
+        }
 
         // Check for user list messages
         if (t.startsWith("[USERS]")) {

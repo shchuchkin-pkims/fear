@@ -50,12 +50,14 @@ static void print_usage(const char *prog) {
         "  %s gen-identity\n"
         "  %s server [--port N]\n"
         "  %s client --host HOST --port N --room ROOM [--key-file FILE] [--name NAME]\n"
-        "           [--identity-file FILE] [--no-sign]\n"
+        "           [--identity-file FILE] [--no-sign] [--create] [--join]\n"
 
         "\nKey input methods (in order of priority):\n"
-        "  1. --key-file FILE    Read key from file (recommended for scripts)\n"
-        "  2. stdin              Read key from standard input (interactive or piped)\n"
-        "  3. --key BASE64       Direct key argument (DEPRECATED - insecure, visible in process list)\n"
+        "  1. --create           Auto-generate room key (first person in room)\n"
+        "  2. --join             Request room key via ECDH exchange (join existing room)\n"
+        "  3. --key-file FILE    Read key from file (recommended for scripts)\n"
+        "  4. stdin              Read key from standard input (interactive or piped)\n"
+        "  5. --key BASE64       Direct key argument (DEPRECATED - insecure, visible in process list)\n"
 
         "\nIdentity (optional Ed25519 signing):\n"
         "  gen-identity          Generate identity keypair (~/.fear/identity)\n"
@@ -215,6 +217,8 @@ int main(int argc, char **argv) {
         const char *keyfile = NULL;
         const char *identity_file = NULL;
         int no_sign = 0;
+        int create_mode = 0;
+        int join_mode = 0;
         uint16_t port = 0;
         int using_deprecated_key_arg = 0;
 
@@ -231,6 +235,8 @@ int main(int argc, char **argv) {
             else if (strcmp(argv[i], "--name") == 0 && i + 1 < argc) name = argv[++i];
             else if (strcmp(argv[i], "--identity-file") == 0 && i + 1 < argc) identity_file = argv[++i];
             else if (strcmp(argv[i], "--no-sign") == 0) no_sign = 1;
+            else if (strcmp(argv[i], "--create") == 0) create_mode = 1;
+            else if (strcmp(argv[i], "--join") == 0) join_mode = 1;
         }
 
         if (!host || !port || !room) { print_usage(argv[0]); return 1; }
@@ -238,46 +244,59 @@ int main(int argc, char **argv) {
         if (strlen(room) > MAX_ROOM - 1) { fprintf(stderr, "room too long (max %d)\n", MAX_ROOM - 1); return 1; }
         if (strlen(name) > MAX_NAME - 1) { fprintf(stderr, "name too long (max %d)\n", MAX_NAME - 1); return 1; }
 
-        // Buffer for key storage
-        static char key_buffer[512];
-        memset(key_buffer, 0, sizeof(key_buffer));
-
-        // Priority 1: Read from --key-file
-        if (keyfile) {
-            if (read_key_from_file(keyfile, key_buffer, sizeof(key_buffer)) != 0) {
-                return 1;
-            }
-            b64 = key_buffer;
-        }
-        // Priority 2: Read from stdin (interactive or piped)
-        else if (!b64) {
-            int is_interactive = isatty(fileno(stdin));
-            if (read_key_from_stdin(key_buffer, sizeof(key_buffer), is_interactive) != 0) {
-                return 1;
-            }
-            b64 = key_buffer;
-        }
-        // Priority 3: --key argument (deprecated, with security warning)
-        else if (using_deprecated_key_arg) {
-            fprintf(stderr, "\n");
-            fprintf(stderr, "WARNING: Using --key argument is insecure!\n");
-            fprintf(stderr, "         The key is visible in process lists (ps, top, Task Manager).\n");
-            fprintf(stderr, "         Use --key-file or stdin instead.\n");
-            fprintf(stderr, "\n");
-        }
-
-        // Decode and validate key
         uint8_t key[CRYPTO_KEYBYTES];
-        int klen = b64_decode(b64, key, sizeof key);
-        if (klen != CRYPTO_KEYBYTES) {
-            fprintf(stderr, "invalid key (must be 32 bytes base64 urlsafe)\n");
-            // Clear sensitive data
-            sodium_memzero(key_buffer, sizeof(key_buffer));
-            return 1;
-        }
+        memset(key, 0, sizeof(key));
 
-        // Clear key buffer before running client
-        sodium_memzero(key_buffer, sizeof(key_buffer));
+        if (create_mode) {
+            // Auto-generate room key
+            if (sodium_init() < 0) { fprintf(stderr, "libsodium init failed\n"); return 1; }
+            randombytes_buf(key, sizeof key);
+            char *b64_key = b64_encode(key, sizeof key);
+            fprintf(stderr, "[create] Room key generated: %s\n", b64_key);
+            free(b64_key);
+        } else if (join_mode) {
+            // Key stays zeroed — run_client will do ECDH exchange
+            fprintf(stderr, "[join] Will request room key via ECDH exchange\n");
+        } else {
+            // Buffer for key storage
+            static char key_buffer[512];
+            memset(key_buffer, 0, sizeof(key_buffer));
+
+            // Priority 1: Read from --key-file
+            if (keyfile) {
+                if (read_key_from_file(keyfile, key_buffer, sizeof(key_buffer)) != 0) {
+                    return 1;
+                }
+                b64 = key_buffer;
+            }
+            // Priority 2: Read from stdin (interactive or piped)
+            else if (!b64) {
+                int is_interactive = isatty(fileno(stdin));
+                if (read_key_from_stdin(key_buffer, sizeof(key_buffer), is_interactive) != 0) {
+                    return 1;
+                }
+                b64 = key_buffer;
+            }
+            // Priority 3: --key argument (deprecated, with security warning)
+            else if (using_deprecated_key_arg) {
+                fprintf(stderr, "\n");
+                fprintf(stderr, "WARNING: Using --key argument is insecure!\n");
+                fprintf(stderr, "         The key is visible in process lists (ps, top, Task Manager).\n");
+                fprintf(stderr, "         Use --key-file or stdin instead.\n");
+                fprintf(stderr, "\n");
+            }
+
+            // Decode and validate key
+            int klen = b64_decode(b64, key, sizeof key);
+            if (klen != CRYPTO_KEYBYTES) {
+                fprintf(stderr, "invalid key (must be 32 bytes base64 urlsafe)\n");
+                sodium_memzero(key_buffer, sizeof(key_buffer));
+                return 1;
+            }
+
+            // Clear key buffer before running client
+            sodium_memzero(key_buffer, sizeof(key_buffer));
+        }
 
         // Load identity for signing (optional)
         uint8_t id_pk[IDENTITY_PK_BYTES], id_sk[IDENTITY_SK_BYTES];
@@ -301,7 +320,8 @@ int main(int argc, char **argv) {
         // Run client
         run_client(host, port, room, name, key,
                    has_identity ? id_pk : NULL,
-                   has_identity ? id_sk : NULL);
+                   has_identity ? id_sk : NULL,
+                   join_mode);
 
         // Clear sensitive data from memory
         sodium_memzero(key, sizeof(key));

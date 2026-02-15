@@ -159,6 +159,11 @@ typedef struct VideoCall {
     int disp_width;
     int disp_height;
     atomic_int disp_new_frame;
+
+    /* Local camera preview (PiP) */
+    uint8_t *local_yuv;
+    int local_width;
+    int local_height;
 #ifdef _WIN32
     CRITICAL_SECTION disp_lock;
 #else
@@ -541,6 +546,27 @@ static THREAD_RET th_vsend_func(void *arg) {
             continue;
         }
 
+        /* Copy local frame for PiP preview */
+#ifdef _WIN32
+        EnterCriticalSection(&vc->disp_lock);
+#else
+        pthread_mutex_lock(&vc->disp_lock);
+#endif
+        if (!vc->local_yuv || vc->local_width != actual_w || vc->local_height != actual_h) {
+            free(vc->local_yuv);
+            vc->local_yuv = (uint8_t *)malloc(yuv_size);
+            vc->local_width = actual_w;
+            vc->local_height = actual_h;
+        }
+        if (vc->local_yuv) {
+            memcpy(vc->local_yuv, yuv_buf, yuv_size);
+        }
+#ifdef _WIN32
+        LeaveCriticalSection(&vc->disp_lock);
+#else
+        pthread_mutex_unlock(&vc->disp_lock);
+#endif
+
         /* Encode VP8 */
         int vp8_size = video_encoder_encode(vc->v_enc, yuv_buf, vp8_buf, VC_MAX_VP8_FRAME);
         if (vp8_size <= 0) continue;
@@ -865,8 +891,9 @@ static THREAD_RET th_disp_func(void *arg) {
             pthread_mutex_lock(&vc->disp_lock);
 #endif
             if (vc->disp_yuv) {
-                video_display_render(vc->display, vc->disp_yuv,
-                                     vc->disp_width, vc->disp_height);
+                video_display_render_pip(vc->display,
+                                         vc->disp_yuv, vc->disp_width, vc->disp_height,
+                                         vc->local_yuv, vc->local_width, vc->local_height);
             }
             atomic_store(&vc->disp_new_frame, 0);
 #ifdef _WIN32
@@ -1025,6 +1052,7 @@ static void video_call_stop(VideoCall *vc) {
 
     if (vc->sock) CLOSESOCK(vc->sock);
     free(vc->disp_yuv);
+    free(vc->local_yuv);
 
 #ifdef _WIN32
     DeleteCriticalSection(&vc->disp_lock);
@@ -1474,8 +1502,9 @@ static int start_video_call(const char *remote_ip, uint16_t remote_port,
                 pthread_mutex_lock(&vc->disp_lock);
 #endif
                 if (vc->disp_yuv) {
-                    video_display_render(vc->display, vc->disp_yuv,
-                                         vc->disp_width, vc->disp_height);
+                    video_display_render_pip(vc->display,
+                                             vc->disp_yuv, vc->disp_width, vc->disp_height,
+                                             vc->local_yuv, vc->local_width, vc->local_height);
                 }
                 atomic_store(&vc->disp_new_frame, 0);
 #ifdef _WIN32

@@ -20,6 +20,7 @@
 #include <QPushButton>
 #include <QLabel>
 #include <QTextEdit>
+#include <QGroupBox>
 #include "audiocallmanager.h"
 
 /**
@@ -45,7 +46,8 @@ public:
      * @param audioManager Manager for audio call processes
      * @param parent Parent widget (optional)
      */
-    explicit AudioCallDialog(AudioCallManager *audioManager, QWidget *parent = nullptr);
+    explicit AudioCallDialog(AudioCallManager *audioManager, QWidget *parent = nullptr,
+                             const QString &roomKeyHex = QString());
 
 private slots:
     /**
@@ -145,6 +147,7 @@ private:
     AudioCallManager *audioManager;  ///< Audio call process manager
 
     // Encryption key widgets
+    QGroupBox *keyGroup;             ///< Key section group box
     QLineEdit *keyEdit;              ///< Encryption key input (64 hex chars)
     QPushButton *genKeyButton;       ///< Generate key button
 

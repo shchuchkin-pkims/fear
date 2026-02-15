@@ -19,6 +19,10 @@ struct VideoDisplay {
     SDL_Texture *texture;
     int tex_width;
     int tex_height;
+    /* Local camera PiP */
+    SDL_Texture *local_texture;
+    int local_tex_width;
+    int local_tex_height;
 };
 
 int video_display_open(VideoDisplay **disp, const char *title,
@@ -99,8 +103,104 @@ int video_display_render(VideoDisplay *disp, const uint8_t *yuv,
     return 0;
 }
 
+int video_display_render_pip(VideoDisplay *disp,
+                             const uint8_t *remote_yuv, int remote_w, int remote_h,
+                             const uint8_t *local_yuv, int local_w, int local_h) {
+    /* Fall back to normal render if no local frame */
+    if (!local_yuv || local_w <= 0 || local_h <= 0)
+        return video_display_render(disp, remote_yuv, remote_w, remote_h);
+
+    if (!disp || !remote_yuv || remote_w <= 0 || remote_h <= 0) return -1;
+
+    /* Recreate remote texture if dimensions changed */
+    if (remote_w != disp->tex_width || remote_h != disp->tex_height) {
+        if (disp->texture) SDL_DestroyTexture(disp->texture);
+        disp->texture = SDL_CreateTexture(disp->renderer, SDL_PIXELFORMAT_IYUV,
+                                           SDL_TEXTUREACCESS_STREAMING,
+                                           remote_w, remote_h);
+        if (!disp->texture) return -1;
+        disp->tex_width = remote_w;
+        disp->tex_height = remote_h;
+    }
+
+    /* Update remote texture */
+    int y_size = remote_w * remote_h;
+    int uv_stride = remote_w / 2;
+    if (!SDL_UpdateYUVTexture(disp->texture, NULL,
+                              remote_yuv, remote_w,
+                              remote_yuv + y_size, uv_stride,
+                              remote_yuv + y_size + y_size / 4, uv_stride)) {
+        return -1;
+    }
+
+    /* Recreate local PiP texture if dimensions changed */
+    if (local_w != disp->local_tex_width || local_h != disp->local_tex_height) {
+        if (disp->local_texture) SDL_DestroyTexture(disp->local_texture);
+        disp->local_texture = SDL_CreateTexture(disp->renderer, SDL_PIXELFORMAT_IYUV,
+                                                 SDL_TEXTUREACCESS_STREAMING,
+                                                 local_w, local_h);
+        if (!disp->local_texture) {
+            /* Non-fatal: render remote only */
+            disp->local_tex_width = 0;
+            disp->local_tex_height = 0;
+            SDL_RenderClear(disp->renderer);
+            SDL_RenderTexture(disp->renderer, disp->texture, NULL, NULL);
+            SDL_RenderPresent(disp->renderer);
+            return 0;
+        }
+        disp->local_tex_width = local_w;
+        disp->local_tex_height = local_h;
+    }
+
+    /* Update local texture */
+    int ly_size = local_w * local_h;
+    int luv_stride = local_w / 2;
+    SDL_UpdateYUVTexture(disp->local_texture, NULL,
+                          local_yuv, local_w,
+                          local_yuv + ly_size, luv_stride,
+                          local_yuv + ly_size + ly_size / 4, luv_stride);
+
+    /* Render composited frame */
+    SDL_RenderClear(disp->renderer);
+
+    /* Remote: full window */
+    SDL_RenderTexture(disp->renderer, disp->texture, NULL, NULL);
+
+    /* PiP: 1/4 window width, aspect-ratio preserved, bottom-right with margin */
+    int win_w, win_h;
+    SDL_GetWindowSize(disp->window, &win_w, &win_h);
+
+    int pip_w = win_w / 4;
+    int pip_h = (pip_w * local_h) / local_w;
+    int margin = 10;
+    int border = 2;
+
+    /* Dark border */
+    SDL_FRect border_rect = {
+        (float)(win_w - pip_w - margin - border),
+        (float)(margin - border),
+        (float)(pip_w + border * 2),
+        (float)(pip_h + border * 2)
+    };
+    SDL_SetRenderDrawColor(disp->renderer, 32, 32, 32, 255);
+    SDL_RenderFillRect(disp->renderer, &border_rect);
+
+    /* PiP video */
+    SDL_FRect pip_rect = {
+        (float)(win_w - pip_w - margin),
+        (float)margin,
+        (float)pip_w,
+        (float)pip_h
+    };
+    SDL_RenderTexture(disp->renderer, disp->local_texture, NULL, &pip_rect);
+
+    SDL_RenderPresent(disp->renderer);
+    return 0;
+}
+
 void video_display_close(VideoDisplay *disp) {
     if (!disp) return;
+    if (disp->local_texture) SDL_DestroyTexture(disp->local_texture);
     if (disp->texture) SDL_DestroyTexture(disp->texture);
     if (disp->renderer) SDL_DestroyRenderer(disp->renderer);
     if (disp->window) SDL_DestroyWindow(disp->window);

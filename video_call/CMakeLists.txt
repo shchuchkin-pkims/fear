@@ -117,10 +117,12 @@ if(WIN32)
             message(STATUS "  Found libvpx at: ${LIBVPX_ROOT}")
         endif()
 
-        # zlib — FFmpeg may need it for internal compression
-        find_library(ZLIB_LIB NAMES libz.a z PATHS "${FFMPEG_LIB_DIR}" "${CMAKE_SOURCE_DIR}/lib/zlib/lib")
+        # zlib — FFmpeg needs it (id3v2, etc.)
+        find_library(ZLIB_LIB NAMES libz.a z PATHS "${FFMPEG_LIB_DIR}" "${CMAKE_SOURCE_DIR}/lib/zlib/lib" NO_CMAKE_FIND_ROOT_PATH)
         if(ZLIB_LIB)
             list(APPEND FFMPEG_LIBS "${ZLIB_LIB}")
+        else()
+            list(APPEND FFMPEG_LIBS z)
         endif()
 
         # liblzma — FFmpeg may use it
@@ -129,9 +131,20 @@ if(WIN32)
             list(APPEND FFMPEG_LIBS "${LZMA_LIB}")
         endif()
 
-        # Windows system libraries required by static FFmpeg (dshow, mf, etc.)
+        # iconv — required by libavcodec (subtitle recoding)
+        find_library(ICONV_LIB NAMES libiconv.a iconv
+            PATHS "C:/msys64/mingw64/lib" "${MINGW_PREFIX}/lib"
+        )
+        if(ICONV_LIB)
+            list(APPEND FFMPEG_LIBS "${ICONV_LIB}")
+        else()
+            message(STATUS "libiconv not found by find_library, using -liconv")
+            list(APPEND FFMPEG_LIBS iconv)
+        endif()
+
+        # Windows system libraries required by static FFmpeg (dshow, mf, tls, etc.)
         list(APPEND FFMPEG_LIBS
-            bcrypt secur32 strmiids mfplat mfuuid oleaut32 shlwapi
+            bcrypt secur32 ncrypt crypt32 strmiids mfplat mfuuid oleaut32 shlwapi
             user32 gdi32 advapi32 shell32
         )
     else()

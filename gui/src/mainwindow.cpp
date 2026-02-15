@@ -215,12 +215,12 @@ void MainWindow::handleFileOffer(const QString &sender, const QString &filename,
 }
 
 void MainWindow::onAudioCall() {
-    AudioCallDialog dialog(backend->audioManager, this);
+    AudioCallDialog dialog(backend->audioManager, this, backend->roomKeyHex);
     dialog.exec();
 }
 
 void MainWindow::onVideoCall() {
-    VideoCallDialog dialog(backend->videoManager, this);
+    VideoCallDialog dialog(backend->videoManager, this, backend->roomKeyHex);
     dialog.exec();
 }
 
@@ -306,7 +306,7 @@ void MainWindow::onConnect() {
     // Room key - SECURE MODE (not saved)
     QLineEdit *keyEdit = new QLineEdit(&dialog);
     // SECURITY: Never load key from settings (it should not be stored on disk)
-    keyEdit->setPlaceholderText("Enter room key (not saved for security)");
+    keyEdit->setPlaceholderText("Room key (leave empty for auto exchange)");
     formLayout->addRow("Room key:", keyEdit);
 
     // User name
@@ -314,18 +314,41 @@ void MainWindow::onConnect() {
     nameEdit->setText(appSettings->value("last/name", "").toString());
     formLayout->addRow("Your name:", nameEdit);
 
-    // Buttons
+    // Buttons: Create Room | Join Room | Connect (manual key) | Cancel
     QHBoxLayout *buttonLayout = new QHBoxLayout();
+    QPushButton *createButton = new QPushButton("Create Room", &dialog);
+    QPushButton *joinButton = new QPushButton("Join Room", &dialog);
     QPushButton *connectButton = new QPushButton("Connect", &dialog);
     QPushButton *cancelButton = new QPushButton("Cancel", &dialog);
+    createButton->setToolTip("Auto-generate room key and connect as room creator");
+    joinButton->setToolTip("Join existing room via automatic key exchange");
+    connectButton->setToolTip("Connect with manually entered room key");
+    buttonLayout->addWidget(createButton);
+    buttonLayout->addWidget(joinButton);
     buttonLayout->addWidget(connectButton);
     buttonLayout->addWidget(cancelButton);
 
     formLayout->addRow(buttonLayout);
 
-    // Connect buttons
-    connect(connectButton, &QPushButton::clicked, &dialog, &QDialog::accept);
+    // Track which button was clicked
+    Backend::ConnectMode selectedMode = Backend::MANUAL_KEY;
+
+    auto doConnect = [&](Backend::ConnectMode mode) {
+        selectedMode = mode;
+        dialog.accept();
+    };
+
+    connect(createButton, &QPushButton::clicked, [&]() { doConnect(Backend::CREATE_ROOM); });
+    connect(joinButton, &QPushButton::clicked, [&]() { doConnect(Backend::JOIN_ROOM); });
+    connect(connectButton, &QPushButton::clicked, [&]() { doConnect(Backend::MANUAL_KEY); });
     connect(cancelButton, &QPushButton::clicked, &dialog, &QDialog::reject);
+
+    // Enable/disable Connect button based on key field
+    auto updateConnectState = [&]() {
+        connectButton->setEnabled(!keyEdit->text().trimmed().isEmpty());
+    };
+    connect(keyEdit, &QLineEdit::textChanged, [&]() { updateConnectState(); });
+    updateConnectState();
 
     // Show dialog
     if (dialog.exec() == QDialog::Accepted) {
@@ -346,23 +369,30 @@ void MainWindow::onConnect() {
             return;
         }
 
-        if (key.isEmpty()) {
-            QMessageBox::warning(this, "Connect", "Room key is required to join private rooms.");
-            return;
-        }
-
         if (name.isEmpty()) {
             QMessageBox::warning(this, "Connect", "Your name cannot be empty.");
             return;
         }
 
+        // For MANUAL_KEY mode, key is required
+        if (selectedMode == Backend::MANUAL_KEY && key.isEmpty()) {
+            QMessageBox::warning(this, "Connect", "Room key is required for manual connect.");
+            return;
+        }
+
         // Show progress indicator
-        QProgressDialog progress("Connecting to server...", "Cancel", 0, 0, this);
+        QString progressMsg;
+        switch (selectedMode) {
+            case Backend::CREATE_ROOM: progressMsg = "Creating room..."; break;
+            case Backend::JOIN_ROOM: progressMsg = "Joining room (waiting for key exchange)..."; break;
+            default: progressMsg = "Connecting to server..."; break;
+        }
+        QProgressDialog progress(progressMsg, "Cancel", 0, 0, this);
         progress.setWindowModality(Qt::WindowModal);
         progress.show();
         QApplication::processEvents();
 
-        bool success = backend->connectToServer(host, port, room, key, name);
+        bool success = backend->connectToServer(host, port, room, key, name, selectedMode);
 
         progress.close();
 
@@ -370,7 +400,7 @@ void MainWindow::onConnect() {
             appSettings->setValue("last/host", host);
             appSettings->setValue("last/port", port);
             appSettings->setValue("last/room", room);
-            // SECURITY: DO NOT save key to disk (removed: appSettings->setValue("last/key", key);)
+            // SECURITY: DO NOT save key to disk
             appSettings->setValue("last/name", name);
             QMessageBox::information(this, "Connect", "Connected successfully.");
         } else {

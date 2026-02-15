@@ -37,6 +37,7 @@
 #else
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <libgen.h>
 #endif
 
 /* Identity signing state (module-level) */
@@ -52,6 +53,274 @@ static int send_signed_file_message(sock_t s, const char *room, const char *name
                                     const char *filename, size_t file_size, uint32_t crc,
                                     const uint8_t id_sk[IDENTITY_SK_BYTES],
                                     const uint8_t id_pk[IDENTITY_PK_BYTES]);
+
+/* Module-level room key pointer (set in run_client, used by KEY_REQUEST handler) */
+static const uint8_t *g_room_key = NULL;
+static sock_t g_sock = -1;
+static const char *g_room = NULL;
+static const char *g_name = NULL;
+
+/**
+ * @brief Send a zero-nonce service frame (unencrypted payload)
+ *
+ * Used for KEY_REQUEST and KEY_RESPONSE messages that use the same
+ * wire format as normal frames but with a zero nonce to indicate
+ * they are service messages (not encrypted).
+ */
+static int send_service_frame(sock_t s, const char *room, const char *name,
+                               uint8_t msg_type, const uint8_t *payload, size_t payload_len) {
+    uint16_t room_len = (uint16_t)strlen(room);
+    uint16_t name_len = (uint16_t)strlen(name);
+    uint8_t zero_nonce[CRYPTO_NPUBBYTES];
+    memset(zero_nonce, 0, sizeof zero_nonce);
+
+    size_t flen = 2 + room_len + 2 + name_len + 2 + CRYPTO_NPUBBYTES + 1 + 4 + payload_len;
+    uint8_t *frame = (uint8_t*)malloc(flen);
+    if (!frame) return -1;
+
+    uint8_t *w = frame;
+    wr_u16(w, room_len); w += 2; memcpy(w, room, room_len); w += room_len;
+    wr_u16(w, name_len); w += 2; memcpy(w, name, name_len); w += name_len;
+    wr_u16(w, (uint16_t)CRYPTO_NPUBBYTES); w += 2;
+    memcpy(w, zero_nonce, CRYPTO_NPUBBYTES); w += CRYPTO_NPUBBYTES;
+    *w++ = msg_type;
+    wr_u32(w, (uint32_t)payload_len); w += 4;
+    memcpy(w, payload, payload_len);
+
+    int rc = send_all(s, frame, flen);
+    free(frame);
+    return rc;
+}
+
+/**
+ * @brief Perform ECDH key exchange as a joiner
+ *
+ * Generates an ephemeral X25519 keypair, sends a KEY_REQUEST,
+ * then waits for a KEY_RESPONSE containing the room key
+ * encrypted with crypto_box.
+ *
+ * @param s Connected socket
+ * @param room Room name
+ * @param name Our username
+ * @param key_out Buffer to receive 32-byte room key
+ * @return 0 on success, -1 on failure/timeout
+ */
+static int ecdh_join_room(sock_t s, const char *room, const char *name, uint8_t key_out[32]) {
+    unsigned char my_pk[crypto_box_PUBLICKEYBYTES];
+    unsigned char my_sk[crypto_box_SECRETKEYBYTES];
+    crypto_box_keypair(my_pk, my_sk);
+
+    /* Send KEY_REQUEST with our ephemeral public key */
+    if (send_service_frame(s, room, name, MSG_TYPE_KEY_REQUEST, my_pk, sizeof my_pk) < 0) {
+        sodium_memzero(my_sk, sizeof my_sk);
+        return -1;
+    }
+    printf("[join] Waiting for room key from existing member...\n");
+    fflush(stdout);
+
+    /* Blocking recv loop with 30s timeout */
+#ifdef _WIN32
+    DWORD tv = 30000;
+#else
+    struct timeval tv;
+    tv.tv_sec = 30;
+    tv.tv_usec = 0;
+#endif
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tv, sizeof tv);
+
+    int result = -1;
+    size_t my_name_len = strlen(name);
+
+    while (1) {
+        /* Read frame header: room */
+        uint8_t hdr2[2];
+        if (recv_all(s, hdr2, 2) < 0) break;
+        uint16_t room_len = rd_u16(hdr2);
+        if (room_len > MAX_ROOM) break;
+        char *room_in = (char*)malloc(room_len + 1);
+        if (!room_in) break;
+        if (recv_all(s, room_in, room_len) < 0) { free(room_in); break; }
+        room_in[room_len] = '\0';
+
+        /* name */
+        uint8_t nlenbuf[2];
+        if (recv_all(s, nlenbuf, 2) < 0) { free(room_in); break; }
+        uint16_t name_len = rd_u16(nlenbuf);
+        if (name_len > MAX_NAME) { free(room_in); break; }
+        char *sender = (char*)malloc(name_len + 1);
+        if (!sender) { free(room_in); break; }
+        if (recv_all(s, sender, name_len) < 0) { free(room_in); free(sender); break; }
+        sender[name_len] = '\0';
+
+        /* nonce */
+        uint8_t npbuf[2];
+        if (recv_all(s, npbuf, 2) < 0) { free(room_in); free(sender); break; }
+        uint16_t nonce_len = rd_u16(npbuf);
+        if (nonce_len != CRYPTO_NPUBBYTES) { free(room_in); free(sender); break; }
+        uint8_t nonce[CRYPTO_NPUBBYTES];
+        if (recv_all(s, nonce, nonce_len) < 0) { free(room_in); free(sender); break; }
+
+        /* type + clen + cipher */
+        uint8_t type_buf[1];
+        if (recv_all(s, type_buf, 1) < 0) { free(room_in); free(sender); break; }
+        uint8_t clenbuf[4];
+        if (recv_all(s, clenbuf, 4) < 0) { free(room_in); free(sender); break; }
+        uint32_t clen = rd_u32(clenbuf);
+        if (clen > MAX_FRAME) { free(room_in); free(sender); break; }
+        uint8_t *payload = (uint8_t*)malloc(clen);
+        if (!payload) { free(room_in); free(sender); break; }
+        if (recv_all(s, payload, clen) < 0) { free(room_in); free(sender); free(payload); break; }
+
+        /* Check if this is a KEY_RESPONSE service message for us */
+        int is_zero_nonce = 1;
+        for (int i = 0; i < CRYPTO_NPUBBYTES; i++) {
+            if (nonce[i] != 0) { is_zero_nonce = 0; break; }
+        }
+
+        if (type_buf[0] == MSG_TYPE_KEY_RESPONSE && is_zero_nonce &&
+            strcmp(room_in, room) == 0) {
+            /* Parse: [name_len(2)][name][eph_pk(32)][nonce(24)][cipher(48)]
+             * Optional signed tail: [id_pk(32)][sig(64)] */
+            size_t base_len = crypto_box_PUBLICKEYBYTES + crypto_box_NONCEBYTES +
+                              (32 + crypto_box_MACBYTES);
+            size_t min_len = 2 + 0 + base_len;
+            if (clen >= min_len) {
+                const uint8_t *p = payload;
+                uint16_t target_len = rd_u16(p); p += 2;
+
+                if (target_len <= clen - min_len &&
+                    target_len == my_name_len &&
+                    memcmp(p, name, target_len) == 0) {
+
+                    p += target_len;
+                    const uint8_t *responder_pk = p; p += crypto_box_PUBLICKEYBYTES;
+                    const uint8_t *box_nonce = p; p += crypto_box_NONCEBYTES;
+                    const uint8_t *box_cipher = p; p += (32 + crypto_box_MACBYTES);
+                    size_t box_cipher_len = 32 + crypto_box_MACBYTES;
+
+                    /* Check for identity signature (anti-MITM) */
+                    size_t consumed = 2 + target_len + base_len;
+                    size_t remaining = clen - consumed;
+                    int sig_verified = 0;
+
+                    if (remaining >= IDENTITY_PK_BYTES + IDENTITY_SIG_BYTES) {
+                        const uint8_t *id_pk = p;
+                        const uint8_t *sig = p + IDENTITY_PK_BYTES;
+                        if (identity_verify(responder_pk, crypto_box_PUBLICKEYBYTES,
+                                            sig, id_pk) == 0) {
+                            sig_verified = 1;
+                            /* TOFU check the responder's identity */
+                            tofu_result_t tofu = identity_tofu_check(
+                                g_known_keys_path, sender, id_pk);
+                            char fp_buf[IDENTITY_FINGERPRINT_LEN];
+                            identity_pk_fingerprint(id_pk, fp_buf);
+                            if (tofu == TOFU_KEY_MATCH || tofu == TOFU_KEY_MATCH_VERIFIED) {
+                                printf("[join] Key exchange verified: %s [%s]\n",
+                                       sender, fp_buf);
+                            } else if (tofu == TOFU_NEW_KEY) {
+                                printf("[join] New identity for '%s': %s (trusted on first use)\n",
+                                       sender, fp_buf);
+                            } else if (tofu == TOFU_KEY_CONFLICT) {
+                                printf("\n*** WARNING: Identity key for '%s' has CHANGED! ***\n", sender);
+                                printf("*** This could indicate a MITM attack! ***\n");
+                                printf("*** Fingerprint: %s ***\n\n", fp_buf);
+                            }
+                        } else {
+                            fprintf(stderr, "[join] WARNING: Signature verification FAILED for '%s'!\n", sender);
+                        }
+                    }
+
+                    if (crypto_box_open_easy(key_out, box_cipher, box_cipher_len,
+                                              box_nonce, responder_pk, my_sk) == 0) {
+                        char *b64_key = b64_encode(key_out, 32);
+                        printf("[join] Room key received from '%s'%s\n", sender,
+                               sig_verified ? " (identity verified)" : " (unsigned)");
+                        if (b64_key) {
+                            printf("[join] Room key: %s\n", b64_key);
+                            free(b64_key);
+                        }
+                        fflush(stdout);
+                        result = 0;
+                    } else {
+                        fprintf(stderr, "[join] Failed to decrypt room key\n");
+                    }
+                    free(room_in); free(sender); free(payload);
+                    break;
+                }
+            }
+        }
+
+        free(room_in);
+        free(sender);
+        free(payload);
+    }
+
+    /* Restore blocking mode (no timeout) */
+#ifdef _WIN32
+    tv = 0;
+#else
+    tv.tv_sec = 0;
+    tv.tv_usec = 0;
+#endif
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tv, sizeof tv);
+
+    sodium_memzero(my_sk, sizeof my_sk);
+    return result;
+}
+
+/**
+ * @brief Handle an incoming KEY_REQUEST by sending the room key
+ *
+ * Called from recv_and_decrypt when a KEY_REQUEST service message is received.
+ * Generates an ephemeral X25519 keypair and encrypts the room key for the joiner.
+ */
+static void handle_key_request(sock_t s, const char *room, const char *myname,
+                                const uint8_t *room_key, const char *joiner_name,
+                                const uint8_t *joiner_pk) {
+    unsigned char my_pk[crypto_box_PUBLICKEYBYTES];
+    unsigned char my_sk[crypto_box_SECRETKEYBYTES];
+    crypto_box_keypair(my_pk, my_sk);
+
+    unsigned char box_nonce[crypto_box_NONCEBYTES];
+    randombytes_buf(box_nonce, sizeof box_nonce);
+
+    unsigned char box_cipher[32 + crypto_box_MACBYTES];
+    if (crypto_box_easy(box_cipher, room_key, 32, box_nonce, joiner_pk, my_sk) != 0) {
+        sodium_memzero(my_sk, sizeof my_sk);
+        return;
+    }
+
+    /* If we have an identity key, sign our ephemeral X25519 public key
+     * to prove we are who we claim (anti-MITM).
+     * Payload: [name_len(2)][name][eph_pk(32)][nonce(24)][cipher(48)][id_pk(32)][sig(64)] */
+    size_t jname_len = strlen(joiner_name);
+    size_t sig_extra = g_has_identity ? (IDENTITY_PK_BYTES + IDENTITY_SIG_BYTES) : 0;
+    size_t payload_len = 2 + jname_len + crypto_box_PUBLICKEYBYTES +
+                          crypto_box_NONCEBYTES + sizeof box_cipher + sig_extra;
+    uint8_t *payload = (uint8_t*)malloc(payload_len);
+    if (!payload) { sodium_memzero(my_sk, sizeof my_sk); return; }
+
+    uint8_t *w = payload;
+    wr_u16(w, (uint16_t)jname_len); w += 2;
+    memcpy(w, joiner_name, jname_len); w += jname_len;
+    memcpy(w, my_pk, crypto_box_PUBLICKEYBYTES); w += crypto_box_PUBLICKEYBYTES;
+    memcpy(w, box_nonce, crypto_box_NONCEBYTES); w += crypto_box_NONCEBYTES;
+    memcpy(w, box_cipher, sizeof box_cipher); w += sizeof box_cipher;
+
+    if (g_has_identity) {
+        memcpy(w, g_identity_pk, IDENTITY_PK_BYTES); w += IDENTITY_PK_BYTES;
+        /* Sign the ephemeral public key with our Ed25519 identity key */
+        identity_sign(my_pk, crypto_box_PUBLICKEYBYTES, g_identity_sk, w);
+    }
+
+    send_service_frame(s, room, myname, MSG_TYPE_KEY_RESPONSE, payload, payload_len);
+
+    sodium_memzero(my_sk, sizeof my_sk);
+    free(payload);
+    printf("[key-exchange] Sent room key to '%s'%s\n", joiner_name,
+           g_has_identity ? " (signed)" : "");
+    fflush(stdout);
+}
 
 typedef struct {
     FILE *fp;
@@ -154,11 +423,24 @@ int send_file_message(sock_t s, const char *room, const char *name,
 }
 
 
-void handle_file_transfer(const char *filename, const uint8_t key[32], 
+void handle_file_transfer(const char *filename, const uint8_t key[32],
                          const char *room, const char *name, sock_t s) {
+    /* Extract basename to avoid leaking directory structure */
+    char *tmp = strdup(filename);
+    const char *base_name;
+#ifdef _WIN32
+    const char *bs = strrchr(tmp, '\\');
+    const char *fs = strrchr(tmp, '/');
+    const char *sep = (bs > fs) ? bs : fs;
+    base_name = sep ? sep + 1 : tmp;
+#else
+    base_name = basename(tmp);
+#endif
+
     FILE *file = fopen(filename, "rb");
     if (!file) {
         printf("Cannot open file: %s\n", filename);
+        free(tmp);
         return;
     }
 
@@ -169,6 +451,7 @@ void handle_file_transfer(const char *filename, const uint8_t key[32],
     if (file_size == 0) {
         fclose(file);
         printf("File is empty: %s\n", filename);
+        free(tmp);
         return;
     }
 
@@ -177,6 +460,7 @@ void handle_file_transfer(const char *filename, const uint8_t key[32],
     if (!file_data) {
         fclose(file);
         printf("Memory error\n");
+        free(tmp);
         return;
     }
 
@@ -185,7 +469,9 @@ void handle_file_transfer(const char *filename, const uint8_t key[32],
 
     if (bytes_read != file_size) {
         printf("File read error: expected %zu bytes, got %zu\n", file_size, bytes_read);
+        sodium_memzero(file_data, file_size);
         free(file_data);
+        free(tmp);
         return;
     }
 
@@ -195,14 +481,16 @@ void handle_file_transfer(const char *filename, const uint8_t key[32],
     int file_rc;
     if (g_has_identity) {
         file_rc = send_signed_file_message(s, room, name, key, MSG_TYPE_FILE_START,
-                                           NULL, 0, filename, file_size, file_crc,
+                                           NULL, 0, base_name, file_size, file_crc,
                                            g_identity_sk, g_identity_pk);
     } else {
         file_rc = send_file_message(s, room, name, key, MSG_TYPE_FILE_START,
-                                    NULL, 0, filename, file_size, file_crc);
+                                    NULL, 0, base_name, file_size, file_crc);
     }
     if (file_rc < 0) {
+        sodium_memzero(file_data, file_size);
         free(file_data);
+        free(tmp);
         printf("Failed to send file start\n");
         return;
     }
@@ -246,7 +534,9 @@ void handle_file_transfer(const char *filename, const uint8_t key[32],
     }
     printf("\nFile sent successfully: %s\n", filename);
 
+    sodium_memzero(file_data, file_size);
     free(file_data);
+    free(tmp);
 }
 
 void receive_file(const char *temp_path, size_t total_size,
@@ -822,6 +1112,18 @@ int recv_and_decrypt(sock_t s, const char *room, const uint8_t *key, const char 
         memcpy(plain, cipher, clen);
         plen = clen;
         ok = 0;
+    } else if (is_service_message && same_room && msg_type == MSG_TYPE_KEY_REQUEST) {
+        /* KEY_REQUEST from a joiner — auto-respond with room key */
+        if (clen == crypto_box_PUBLICKEYBYTES && g_room_key != NULL &&
+            strcmp(name, myname) != 0) {
+            handle_key_request(s, room, myname, g_room_key, name, cipher);
+        }
+        free(room_in); free(name); free(cipher); free(ad); free(plain);
+        return 0;
+    } else if (is_service_message && same_room && msg_type == MSG_TYPE_KEY_RESPONSE) {
+        /* KEY_RESPONSE — ignore in normal recv loop (handled by ecdh_join_room) */
+        free(room_in); free(name); free(cipher); free(ad); free(plain);
+        return 0;
     } else if (same_room && !is_service_message) {
         // Обычное зашифрованное сообщение
         ok = aes_gcm_decrypt(cipher, clen, ad, ad_len, nonce, key, plain, &plen);
@@ -1056,7 +1358,8 @@ DWORD WINAPI input_thread(LPVOID param) {
 #endif
 
 void run_client(const char *host, uint16_t port, const char *room, const char *name,
-                const uint8_t key[32], const uint8_t *id_pk, const uint8_t *id_sk) {
+                const uint8_t key[32], const uint8_t *id_pk, const uint8_t *id_sk,
+                int join_mode) {
     if (sodium_init() < 0) { fprintf(stderr, "libsodium init failed\n"); exit(1); }
 
     /* Store identity in module globals */
@@ -1083,17 +1386,36 @@ void run_client(const char *host, uint16_t port, const char *room, const char *n
     sock_t s = dial_tcp(host, port);
     printf("[client] connected to %s:%u, Room name: %s\n", host, port, room);
 
+    /* Use a local copy of the key so we can overwrite it in join mode */
+    uint8_t active_key[CRYPTO_KEYBYTES];
+    memcpy(active_key, key, CRYPTO_KEYBYTES);
+
+    if (join_mode) {
+        /* ECDH key exchange: get room key from existing member */
+        if (ecdh_join_room(s, room, name, active_key) != 0) {
+            fprintf(stderr, "[join] Key exchange failed (timeout or error)\n");
+            close_socket(s);
+            return;
+        }
+    }
+
+    /* Store globals for KEY_REQUEST handler */
+    g_room_key = active_key;
+    g_sock = s;
+    g_room = room;
+    g_name = name;
+
     // Отправляем пустое сообщение для регистрации на сервере
     const char *join_msg = "";
-    if (send_ciphertext(s, room, name, key, (uint8_t*)join_msg, strlen(join_msg)) < 0) {
+    if (send_ciphertext(s, room, name, active_key, (uint8_t*)join_msg, strlen(join_msg)) < 0) {
         fprintf(stderr, "[client] failed to register with server\n");
         close_socket(s);
-        exit(1);
+        return;
     }
 
     // Send identity announcement if we have an identity
     if (g_has_identity) {
-        send_identity_announce(s, room, name, key, g_identity_sk, g_identity_pk);
+        send_identity_announce(s, room, name, active_key, g_identity_sk, g_identity_pk);
     }
 
     printf("Commands: /sendfile <path>, /accept [save_path], /reject. Ctrl+C to exit.\n");
@@ -1103,7 +1425,7 @@ void run_client(const char *host, uint16_t port, const char *room, const char *n
     ctx.s = s;
     ctx.room = room;
     ctx.name = name;
-    ctx.key = key;
+    ctx.key = active_key;
     HANDLE hThread = CreateThread(NULL, 0, input_thread, &ctx, 0, NULL);
     if (!hThread) { fprintf(stderr, "thread create failed\n"); exit(1); }
     for (;;) {
@@ -1125,7 +1447,7 @@ void run_client(const char *host, uint16_t port, const char *room, const char *n
         int r = select(maxfd, &rfds, NULL, NULL, NULL);
         if (r < 0) { if (errno == EINTR) continue; break; }
         if (FD_ISSET(s, &rfds)) {
-            int rc = recv_and_decrypt(s, room, key, name);
+            int rc = recv_and_decrypt(s, room, active_key, name);
             if (rc < 0) { printf("[client] disconnected\n"); break; }
         }
         if (FD_ISSET(STDIN_FILENO, &rfds)) {
@@ -1139,7 +1461,7 @@ void run_client(const char *host, uint16_t port, const char *room, const char *n
 
             // File transfer commands
             if (strncmp(line, "/sendfile ", 10) == 0) {
-                handle_file_transfer(line + 10, key, room, name, s);
+                handle_file_transfer(line + 10, active_key, room, name, s);
                 free(line);
                 continue;
             }
@@ -1163,7 +1485,7 @@ void run_client(const char *host, uint16_t port, const char *room, const char *n
                     memcpy(g_identity_sk, new_sk, IDENTITY_SK_BYTES);
                     g_has_identity = 1;
                     sodium_memzero(new_sk, IDENTITY_SK_BYTES);
-                    send_identity_announce(s, room, name, key, g_identity_sk, g_identity_pk);
+                    send_identity_announce(s, room, name, active_key, g_identity_sk, g_identity_pk);
                     printf("[identity] Reloaded. New fingerprint sent to room.\n");
                 } else {
                     printf("[identity] Failed to reload identity.\n");
@@ -1174,11 +1496,11 @@ void run_client(const char *host, uint16_t port, const char *room, const char *n
 
             int rc;
             if (g_has_identity) {
-                rc = send_signed_ciphertext(s, room, name, key,
+                rc = send_signed_ciphertext(s, room, name, active_key,
                                             (uint8_t*)line, len,
                                             g_identity_sk, g_identity_pk);
             } else {
-                rc = send_ciphertext(s, room, name, key, (uint8_t*)line, len);
+                rc = send_ciphertext(s, room, name, active_key, (uint8_t*)line, len);
             }
             if (rc < 0) {
                 printf("send failed\n");
@@ -1190,5 +1512,7 @@ void run_client(const char *host, uint16_t port, const char *room, const char *n
         }
     }
 #endif
+    sodium_memzero(active_key, sizeof active_key);
+    g_room_key = NULL;
     close_socket(s);
 }

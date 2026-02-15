@@ -1,556 +1,315 @@
-# F.E.A.R. Project - Руководство пользователя
+# F.E.A.R. Project — User Manual
+
 ## Fully Encrypted Anonymous Routing
 
 ---
 
-**Версия документации:** 1.1 (v0.4.0)
-**Дата:** Октябрь 2025
-**Автор:** Shchuchkin E. Yu.
+**Version:** 1.2 (v0.4.1)
+**Author:** Shchuchkin E. Yu.
 
 ---
+
 <div align="center">
 
 ![F.E.A.R. Project](./images/logo.png)
 </div>
 
-## Содержание
+## Table of Contents
 
-1. [Введение](#введение)
-2. [Архитектура и безопасность](#архитектура-и-безопасность)
-3. [Требования к системе](#требования-к-системе)
-4. [Сборка проекта](#сборка-проекта)
-5. [Описание программ](#описание-программ)
-6. [Быстрый старт](#быстрый-старт)
-7. [Подробное руководство](#подробное-руководство)
-8. [Безопасный обмен ключами](#безопасный-обмен-ключами)
-9. [Аудиозвонки](#аудиозвонки)
-10. [Видеозвонки](#видеозвонки)
-11. [Передача файлов](#передача-файлов)
-11. [Устранение неполадок](#устранение-неполадок)
-12. [Часто задаваемые вопросы](#часто-задаваемые-вопросы)
+1. [Introduction](#introduction)
+2. [Architecture and Security](#architecture-and-security)
+3. [System Requirements](#system-requirements)
+4. [Building the Project](#building-the-project)
+5. [Programs](#programs)
+6. [Quick Start Scenarios](#quick-start-scenarios)
+7. [Detailed Usage](#detailed-usage)
+8. [ECDH Key Exchange](#ecdh-key-exchange)
+9. [Identity Verification](#identity-verification)
+10. [Audio Calls](#audio-calls)
+11. [Video Calls](#video-calls)
+12. [File Transfer](#file-transfer)
+13. [Troubleshooting](#troubleshooting)
+14. [FAQ](#faq)
 
-<div style="page-break-after: always;"></div>
 ---
 
-## Введение
+## Introduction
 
-**F.E.A.R. (Fully Encrypted Anonymous Routing)** — это кроссплатформенный мессенджер с открытым исходным кодом, разработанный для обеспечения максимальной конфиденциальности и безопасности коммуникаций.
+**F.E.A.R. (Fully Encrypted Anonymous Routing)** is a cross-platform open-source messenger designed for maximum privacy and security.
 
-### Ключевые особенности
+### Key Features
 
-- **Сквозное шифрование (E2EE):** Все сообщения шифруются на устройстве отправителя и расшифровываются только на устройстве получателя
-- **Защита от прослушивания:** Сервер не имеет доступа к содержимому сообщений
-- **Комнаты с паролями:** Доступ к комнате имеют только пользователи, знающие правильный ключ
-- **Безопасный обмен ключами:** Встроенный механизм обмена ключами по протоколу Диффи-Хеллмана
-- **Передача файлов:** Отправка файлов с шифрованием и проверкой целостности
-- **Аудиозвонки:** Зашифрованные голосовые вызовы
-- **Видеозвонки:** Зашифрованные видеовызовы (VP8 + AES-256-GCM + SDL3)
-- **Открытый исходный код:** Полная прозрачность реализации
+- **End-to-end encryption (E2EE):** All messages are encrypted on the sender's device and decrypted only on the recipient's device
+- **Zero-knowledge server:** The server cannot access message content, keys, or decrypted data
+- **ECDH key exchange:** Automatic key distribution via X25519 — no pre-shared secrets needed
+- **Identity verification:** Ed25519 keypairs with Trust On First Use (TOFU) model
+- **Encrypted voice calls:** Opus codec with AES-256-GCM over UDP
+- **Encrypted video calls:** VP8 codec with AES-256-GCM, SDL3 display, adaptive bitrate
+- **File transfer:** Encrypted file sharing with CRC32 integrity verification
+- **Open source:** Full transparency for audit and verification
 
-### Что нового в v0.4.0
+### What's New in v0.4.1
 
-**📹 Видеозвонки:**
+**ECDH Key Exchange:**
+- Automatic room key generation and distribution — no manual key sharing required
+- CLI: `--create` (generate key) and `--join` (receive key via ECDH)
+- GUI: Create Room / Join Room / Connect buttons
+- X25519 ephemeral keypairs with Ed25519-signed responses (MITM protection)
 
-- ✅ **Зашифрованные видеозвонки P2P**: VP8 (libvpx) + AES-256-GCM + SDL3
-  - Три пресета качества: LOW (320x240@15fps), MEDIUM (640x480@25fps), HIGH (1280x720@30fps)
-  - Адаптивный битрейт с автоматической подстройкой
-  - UDP фрагментация кадров (до 128 фрагментов по 1200 байт)
-  - Обнаружение отключения пира (таймаут 5 сек) + автоматическое переподключение
-  - Режим "Без камеры" — только прием видео (`--no-camera`)
-  - Интеграция с GUI: выбор камеры, качества, кнопка "No camera (receive only)"
+**Identity Verification:**
+- Each client generates a persistent Ed25519 keypair
+- Peer public keys are saved on first contact (TOFU)
+- Key mismatch on reconnection triggers a security warning
 
-### Что нового в v0.3.0
+**Android v0.4.1:**
+- Full feature parity: ECDH, identity, video calls, file transfer
+- Light and dark theme toggle
+- Push notifications for background messages
 
-**🔒 Улучшения безопасности:**
-
-- ✅ **Безопасная генерация ключей**: Ключи больше НЕ сохраняются на диск автоматически
-  - `fear genkey` и `audio_call genkey` выводят ключи только в stdout
-  - GUI автоматически копирует ключи в буфер обмена
-  - Пользователь сам решает, сохранять ли ключ (можно перенаправить вывод)
-
-- ✅ **Безопасная передача ключей в CLI**: Защита от утечки через списки процессов
-  - Новый параметр `--key-file FILE` для чтения ключей из файлов
-  - Поддержка передачи ключей через stdin: `echo "KEY" | fear client ...`
-  - Параметр `--key` в командной строке помечен как устаревший (insecure)
-
-**🎙️ Исправления аудиозвонков:**
-
-- ✅ **Устранены дублирующиеся имена аудиоустройств**:
-  - Добавлена информация о Host API в названия устройств
-  - Формат: "Device Name (Host API)"
-  - Легко различить одно устройство через разные API (MME, WASAPI, DirectSound)
-
-**📚 Документация:**
-
-- ✅ Полностью обновлена документация с примерами безопасного использования
-- ✅ Добавлены рекомендации по лучшим практикам безопасности
-
-<div style="page-break-after: always;"></div>
 ---
 
-## Архитектура и безопасность
+## Architecture and Security
 
-### Модель безопасности
+### Security Model
 
-F.E.A.R. использует клиент-серверную архитектуру с **сквозным шифрованием**:
-
-```
-[Клиент 1] <--зашифровано--> [Сервер] <--зашифровано--> [Клиент 2]
-                                  |
-                           (не видит контент)
-```
-
-**Важно:** Сервер выполняет только функции маршрутизации и **НЕ имеет доступа** к:
-- Содержимому сообщений
-- Ключам шифрования комнат
-- Расшифрованным данным
-
-### Криптографические алгоритмы
-
-#### 1. AES-256-GCM (Advanced Encryption Standard)
-
-**Назначение:** Шифрование всех сообщений в комнатах
-
-**Параметры:**
-- Длина ключа: 256 бит (32 байта)
-- Режим: GCM (Galois/Counter Mode)
-- Длина nonce: 96 бит (12 байт)
-- Длина тега аутентификации: 128 бит (16 байт)
-
-**Как это работает:**
-```
-Открытый текст + Ключ комнаты + Nonce → AES-256-GCM → Зашифрованный текст + Тег
-```
-
-AES-256-GCM обеспечивает:
-- **Конфиденциальность:** Данные невозможно прочитать без ключа
-- **Аутентификацию:** Невозможно подделать или изменить сообщение незаметно
-- **Защиту от повторов:** Каждое сообщение использует уникальный nonce
-
-#### 2. Curve25519 (Elliptic Curve Diffie-Hellman)
-
-**Назначение:** Безопасный обмен ключами между пользователями
-
-**Параметры:**
-- Эллиптическая кривая: Curve25519
-- Длина публичного ключа: 32 байта
-- Длина секретного ключа: 32 байта
-
-**Протокол обмена:**
-```
-Пользователь A генерирует: (публичный_A, секретный_A)
-Пользователь B генерирует: (публичный_B, секретный_B)
-
-A отправляет публичный_A → B
-B отправляет публичный_B → A
-
-Общий секрет A = ECDH(секретный_A, публичный_B)
-Общий секрет B = ECDH(секретный_B, публичный_A)
-
-Общий_секрет_A == Общий_секрет_B
-```
-
-Curve25519 защищает от:
-- Атак "человек посередине" (если обмен выполнен по защищенному каналу)
-- Компрометации ключей шифрования при перехвате сетевого трафика
-
-#### 3. XChaCha20-Poly1305
-
-**Назначение:** Шифрование сообщений при обмене ключами
-
-**Параметры:**
-- Алгоритм: XChaCha20 (потоковое шифрование)
-- Аутентификация: Poly1305 MAC
-- Длина nonce: 192 бит (24 байта)
-- Длина ключа: 256 бит (32 байта)
-
-Используется в модуле key-exchange для защиты ключа комнаты при передаче через открытый канал.
-
-#### 4. CRC32 (Cyclic Redundancy Check)
-
-**Назначение:** Проверка целостности передаваемых файлов
-
-CRC32 не является криптографическим алгоритмом, но обеспечивает:
-- Обнаружение случайных ошибок при передаче
-- Проверку, что файл был передан полностью и без повреждений
-
-### Структура протокола
-
-Каждое сообщение в F.E.A.R. имеет следующий формат:
+F.E.A.R. uses a client-server architecture with end-to-end encryption:
 
 ```
-[2 байта: длина_имени_комнаты]
-[имя_комнаты]
-[2 байта: длина_имени_отправителя]
-[имя_отправителя]
-[2 байта: длина_nonce]
-[nonce (12 байт)]
-[1 байт: тип_сообщения]
-[4 байта: длина_зашифрованных_данных]
-[зашифрованные_данные + тег_аутентификации]
+[Client A] <——encrypted——> [Server] <——encrypted——> [Client B]
+                              |
+                    (cannot read content)
 ```
 
-**Типы сообщений:**
-- `0` - Текстовое сообщение
-- `1` - Начало передачи файла
-- `2` - Фрагмент файла
-- `3` - Конец передачи файла
-- `4` - Список участников (служебное)
-<div style="page-break-after: always;"></div>
+The server performs routing only and has **no access to:**
+- Message content
+- Room encryption keys
+- Decrypted data
+
+### Cryptographic Algorithms
+
+#### AES-256-GCM
+
+**Purpose:** Encryption of all messages, audio, and video data
+
+| Parameter | Value |
+|-----------|-------|
+| Key size | 256 bits (32 bytes) |
+| Mode | GCM (Galois/Counter Mode) |
+| Nonce size | 96 bits (12 bytes) |
+| Auth tag | 128 bits (16 bytes) |
+
+AES-256-GCM provides:
+- **Confidentiality:** Data is unreadable without the key
+- **Authentication:** Tampering is detected via the auth tag
+- **Replay protection:** Each message uses a unique nonce
+
+#### X25519 (ECDH Key Exchange)
+
+**Purpose:** Secure room key distribution without pre-shared secrets
+
+The ECDH protocol allows two parties to derive a shared secret over an insecure channel. Combined with Ed25519 signatures, it prevents man-in-the-middle attacks.
+
+#### Ed25519
+
+**Purpose:** Identity signing and verification
+
+Each client maintains a persistent Ed25519 keypair. During ECDH key exchange, the room creator signs the response with their identity key. Peers can verify authenticity.
+
+#### BLAKE2b (Key Derivation)
+
+**Purpose:** Deriving audio and video subkeys from the room master key
+
+- Audio subkey: `crypto_kdf(id=1, ctx="fearaudi", master_key)`
+- Video subkey: `crypto_kdf(id=2, ctx="fearvide", master_key)`
+
+#### CRC32
+
+**Purpose:** File transfer integrity verification (non-cryptographic)
+
+### Protocol Format
+
+Every TCP message follows this wire format:
+
+```
+[2 bytes: room_len]
+[room name]
+[2 bytes: name_len]
+[sender name]
+[2 bytes: nonce_len]
+[nonce (12 bytes)]
+[1 byte: message_type]
+[4 bytes: ciphertext_len]
+[ciphertext + auth_tag]
+```
+
+**Message types:**
+| Type | Name | Description |
+|------|------|-------------|
+| 0 | TEXT | Encrypted text message |
+| 1 | FILE_START | File transfer metadata |
+| 2 | FILE_CHUNK | File data chunk (8KB) |
+| 3 | FILE_END | File transfer completion |
+| 4 | USER_LIST | Room participants (service, zero nonce) |
+| 15 | KEY_REQUEST | ECDH key request (service, zero nonce) |
+| 16 | KEY_RESPONSE | ECDH key response (service, zero nonce) |
+
 ---
 
-## Требования к системе
+## System Requirements
 
-### Минимальные требования
+### Minimum Requirements
 
-- **Операционная система:**
-  - Windows 10/11 (64-bit)
-  - Linux (Ubuntu 20.04+, Debian 11+, Fedora 35+)
-  - macOS 10.15+ (Catalina или новее)
+- **OS:** Windows 10/11 (64-bit) or Linux (Ubuntu 20.04+, Debian 11+)
+- **CPU:** Intel Core i3 / AMD Ryzen 3 or equivalent
+- **RAM:** 2 GB
+- **Disk:** 200 MB free space
+- **Network:** Internet or LAN connection
 
-- **Процессор:** Intel Core i3 / AMD Ryzen 3 или эквивалент
-- **Оперативная память:** 2 ГБ
-- **Свободное место на диске:** 200 МБ
-- **Сеть:** Подключение к Интернету или локальной сети
+### Build Requirements
 
-### Для сборки из исходников
+- Git, CMake 3.15+, C++17 compiler (GCC 8+, MinGW-w64 8+)
+- **Libraries:** libsodium, Qt 6.2+, PortAudio, Opus, FFmpeg, libvpx, SDL3
 
-- **Git** (для клонирования репозитория)
-- **CMake** версии 3.15 или выше
-- **Компилятор C++17:**
-  - GCC 8+ (Linux)
-  - Clang 7+ (macOS/Linux)
-  - MSVC 2019+ (Windows)
-  - MinGW-w64 8+ (Windows)
-
-- **Библиотеки:**
-  - **libsodium** (криптография)
-  - **Qt 6.2+** (графический интерфейс)
-  - **PortAudio** (аудио)
-  - **Opus** (кодек для аудио)
-  - **FFmpeg** (libavcodec, libavformat, libavutil, libswscale, libavdevice — захват и кодирование видео)
-  - **libvpx** (VP8 видеокодек, через FFmpeg)
-  - **SDL3** (аппаратно-ускоренное отображение видео)
-
-- **Система управления пакетами (опционально):**
-  - vcpkg
-  - Conan
-<div style="page-break-after: always;"></div>
 ---
 
-## Сборка проекта
+## Building the Project
 
 ### Linux
 
-#### Установка зависимостей (Ubuntu/Debian)
-
 ```bash
-# Автоматическая установка (рекомендуется):
+# Install dependencies (Ubuntu/Debian)
 ./build.sh deps
 
-# Или вручную:
-sudo apt update
-sudo apt install -y git cmake build-essential pkg-config \
-    libsodium-dev qt6-base-dev portaudio19-dev libopus-dev \
-    libcurl4-openssl-dev \
-    libavcodec-dev libavformat-dev libavutil-dev libswscale-dev libavdevice-dev \
-    libvpx-dev libsdl3-dev
+# Build
+./build.sh
 ```
-
-> **Примечание:** SDL3 может быть недоступен в репозитории вашего дистрибутива. Команда `./build.sh deps` автоматически соберет его из исходников при необходимости.
-
-#### Установка зависимостей (Fedora)
-
-```bash
-sudo dnf install -y git cmake gcc-c++ libsodium-devel \
-    qt6-qtbase-devel portaudio-devel opus-devel
-```
-
-#### Сборка
-
-```bash
-# Клонирование репозитория
-git clone https://github.com/shchuchkin-pkims/fear.git
-cd fear
-
-# Сборка всех компонентов
-make
-
-# Или сборка с помощью CMake вручную
-mkdir build
-cd build
-cmake ..
-cmake --build . --config Release
-```
-
-Исполняемые файлы будут расположены в:
-- `client-console/fear` - консольный клиент/сервер
-- `gui/fear-gui` - графический интерфейс
-- `key-exchange/key-exchanger` - утилита обмена ключами
-- `audio_call/audio_call` - утилита аудиозвонков
-- `updater/updater` - утилита обновления
 
 ### Windows
 
-#### Установка зависимостей
-
-1. Установите **Visual Studio 2019/2022** с поддержкой C++
-2. Установите **CMake** (https://cmake.org/download/)
-3. Установите **Qt 6** (https://www.qt.io/download)
-4. Установите **vcpkg** для управления библиотеками:
-
-```cmd
-git clone https://github.com/microsoft/vcpkg.git
-cd vcpkg
-bootstrap-vcpkg.bat
-vcpkg integrate install
-vcpkg install libsodium:x64-windows portaudio:x64-windows opus:x64-windows
+```batch
+build.bat
 ```
 
-#### Сборка
+See [BUILD.md](BUILD.md) for detailed instructions, Windows library setup, and troubleshooting.
 
-```cmd
-git clone https://github.com/shchuchkin-pkims/fear.git
-cd fear
+### Build Output
 
-mkdir build
-cd build
-cmake .. -DCMAKE_TOOLCHAIN_FILE=C:/path/to/vcpkg/scripts/buildsystems/vcpkg.cmake
-cmake --build . --config Release
+```
+build/
+├── fear_gui          # GUI application
+└── bin/
+    ├── fear          # Console client/server
+    ├── audio_call    # Voice call utility
+    ├── video_call    # Video call utility
+    ├── key-exchange  # Key exchange utility
+    └── updater       # Update manager
 ```
 
-### macOS
-
-#### Установка зависимостей
-
-```bash
-# Установка Homebrew (если не установлен)
-/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-
-# Установка зависимостей
-brew install git cmake libsodium qt@6 portaudio opus ffmpeg sdl3 libvpx
-```
-
-#### Сборка
-
-```bash
-git clone https://github.com/shchuchkin-pkims/fear.git
-cd fear
-
-mkdir build
-cd build
-cmake .. -DCMAKE_PREFIX_PATH=$(brew --prefix qt@6)
-cmake --build . --config Release
-```
-<div style="page-break-after: always;"></div>
 ---
 
-## Описание программ
+## Programs
 
-F.E.A.R. Project состоит из нескольких исполняемых модулей:
+### 1. fear (Console Client/Server)
 
-### 1. fear / fear.exe (Консольный клиент/сервер)
+**Location:** `build/bin/fear`
 
-**Расположение:** `client-console/fear` или `bin/fear.exe`
-
-**Назначение:** Основная консольная утилита для запуска сервера, подключения клиента и генерации ключей
-
-#### Команды
-
-##### Генерация ключа комнаты
+#### Generate Room Key
 
 ```bash
-fear genkey
+./fear genkey
 ```
 
-**Описание:** Генерирует криптографически стойкий 256-битный ключ в формате base64 URL-safe
-
-**Пример вывода (v0.3.0+):**
+Output:
 ```
 z6aK3_k9I7rmpy6Sn-84QZ9Yc0p3T7VhzReWCKE0x4I
 Room key generated successfully.
-IMPORTANT: Copy the key above to clipboard and share it securely.
+IMPORTANT: Copy the key above and share it securely.
            The key is NOT saved to disk for security reasons.
 ```
 
-**Улучшения безопасности (v0.3.0+):**
-- ✅ Ключ выводится в **stdout** (первая строка)
-- ✅ Информационные сообщения выводятся в **stderr**
-- ✅ Ключ **НЕ сохраняется автоматически** на диск
-- ✅ Пользователь может перенаправить вывод: `fear genkey > my_key.txt`
-- ✅ В GUI ключ автоматически копируется в буфер обмена
+The key is output to stdout only. In the GUI, it is automatically copied to clipboard.
 
-**Важно:** Скопируйте ключ в безопасное место. Он потребуется всем участникам комнаты.
-
-##### Запуск сервера
+#### Start Server
 
 ```bash
-fear server --port <порт>
+./fear server --port 7777
 ```
 
-**Аргументы:**
-- `--port` (обязательно) - TCP порт для прослушивания (1024-65535)
+The server requires no keys — it only relays encrypted data.
 
-**Примеры:**
+#### Connect as Client
+
+Three connection modes are available:
+
+**Create Room (auto-generate key):**
 ```bash
-# Запуск на порту 7777
-fear server --port 7777
-
-# Запуск на порту 8888
-fear server --port 8888
+./fear client --host SERVER_IP --port 7777 \
+    --room myroom --name Alice --create
 ```
 
-**Вывод при успешном запуске:**
-```
-[server] listening on 0.0.0.0:7777
-```
-
-**Примечания:**
-- Сервер не требует ключей шифрования
-- Сервер не хранит сообщения (передача в реальном времени)
-- Для доступа из интернета необбходима настройка маршрутизатора (проброс портов)
-
-##### Подключение клиента
-
+**Join Room (ECDH key exchange):**
 ```bash
-fear client --host <адрес> --port <порт> --room <комната> [--key-file <файл> | --key <ключ>] --name <имя>
+./fear client --host SERVER_IP --port 7777 \
+    --room myroom --name Bob --join
 ```
 
-**Аргументы:**
-- `--host` (обязательно) - IP-адрес или доменное имя сервера
-- `--port` (обязательно) - TCP порт сервера
-- `--room` (обязательно) - Имя комнаты (1-255 символов)
-- `--key-file <файл>` - **Рекомендуется:** Файл с ключом шифрования комнаты
-- `--key <ключ>` - ⚠️ **Устаревший:** Ключ в командной строке (виден в списке процессов!)
-- `--name` (обязательно) - Ваше имя пользователя (1-255 символов)
-
-**Примеры (безопасные методы v0.3.0+):**
-
+**Connect with known key (stdin — recommended):**
 ```bash
-# Способ 1: Передача ключа через stdin (НАИБОЛЕЕ БЕЗОПАСНЫЙ)
-echo "z6aK3_k9I7rmpy6Sn-84QZ9Yc0p3T7VhzReWCKE0x4I" | fear client \
-    --host 127.0.0.1 --port 7777 \
-    --room testroom --name Alice
-
-# Способ 2: Чтение ключа из файла (РЕКОМЕНДУЕТСЯ)
-fear client --host 127.0.0.1 --port 7777 \
-    --room testroom \
-    --key-file room_key.txt \
-    --name Alice
-
-# Способ 3: Интерактивный ввод через stdin
-fear client --host example.com --port 7777 \
-    --room myroom --name Bob
-# Программа предложит ввести ключ: Enter room key:
+echo "YOUR_KEY" | ./fear client --host SERVER_IP --port 7777 \
+    --room myroom --name Charlie
 ```
 
-**⚠️ Устаревший небезопасный метод (НЕ рекомендуется):**
+**Connect with key file:**
 ```bash
-# ВНИМАНИЕ: Ключ виден в списке процессов (ps aux, top)!
-# Используйте только для тестирования
-fear client --host 127.0.0.1 --port 7777 \
-    --room testroom \
-    --key z6aK3_k9I7rmpy6Sn-84QZ9Yc0p3T7VhzReWCKE0x4I \
-    --name Alice
+./fear client --host SERVER_IP --port 7777 \
+    --room myroom --name Charlie --key-file room_key.txt
 ```
 
-**Вывод при успешном подключении:**
-```
-[client] connected to 127.0.0.1:7777, Room name: testroom
-Type messages and press Enter. Use '/sendfile filename' to send files. Ctrl+C to exit.
-```
+**Arguments:**
+| Argument | Required | Description |
+|----------|----------|-------------|
+| `--host` | Yes | Server IP or hostname |
+| `--port` | Yes | Server TCP port (1024-65535) |
+| `--room` | Yes | Room name (1-255 chars) |
+| `--name` | Yes | Your username (1-255 chars) |
+| `--create` | No | Auto-generate key, create room |
+| `--join` | No | Join via ECDH key exchange |
+| `--key-file` | No | Read key from file |
 
-**Использование:**
-- Введите сообщение и нажмите Enter для отправки
-- Команда `/sendfile путь/к/файлу` - отправка файла
-- Ctrl+C для выхода
+**In-chat commands:**
+- Type text and press Enter to send a message
+- `/sendfile path/to/file` to send a file
+- Ctrl+C to exit
 
-**Важные ограничения:**
-- Имя пользователя должно быть уникальным в пределах одной комнаты
-- Все участники комнаты должны использовать один и тот же ключ
-- Неправильный ключ не позволит расшифровать сообщения
+### 2. fear_gui (GUI Application)
 
----
+**Location:** `build/fear_gui`
 
-### 2. fear-gui / fear-gui.exe (Графический интерфейс)
-
-**Расположение:** `gui/fear-gui` или `bin/fear-gui.exe`
-
-**Назначение:** Графическое приложение с удобным интерфейсом для работы с мессенджером
-
-#### Запуск
-
-**Linux/macOS:**
+Launch:
 ```bash
-./fear-gui
+cd build && ./fear_gui    # Linux
+fear_gui.exe              # Windows
 ```
 
-**Windows:**
-```cmd
-fear-gui.exe
-```
-Или просто двойной клик по исполняемому файлу.
+**Connection modes:**
+- **Create Room:** Menu > Connection > Create Room — auto-generates key, copies to clipboard
+- **Join Room:** Menu > Connection > Join Room — ECDH exchange, no key needed
+- **Connect:** Menu > Connection > Connect — enter all fields manually
 
-#### Возможности
+**Features:**
+- Chat with message history
+- User list panel
+- File transfer button
+- Audio calls: Menu > Audio call > Start audio call
+- Video calls: Menu > Video call > Start video call
+- Key exchange: Menu > Keys > Key exchange
+- Update check: Menu > Help > Check for updates
 
-- **Простое подключение:** Диалоговое окно с полями для ввода параметров
-- **Генерация ключей:** Встроенная функция генерации ключей комнат
-- **История чата:** Сохранение истории сообщений в сессии
-- **Список участников:** Отображение всех подключенных пользователей
-- **Отправка файлов:** Кнопка для выбора и отправки файлов
-- **Настройки шрифта:** Изменение размера и начертания текста в чате
-- **Аудиозвонки:** Запуск зашифрованных голосовых вызовов
-- **Обмен ключами:** Встроенный модуль безопасного обмена ключами
+### 3. key-exchange (Key Exchange Utility)
 
-#### Основные действия
+**Location:** `build/bin/key-exchange`
 
-**Создание сервера:**
-1. Меню → Connection → Create server
-2. Укажите порт (например, 7777)
-3. Нажмите "Create Server"
-
-**Подключение к комнате:**
-1. Меню → Connection → Connect
-2. Заполните поля:
-   - Host: адрес сервера
-   - Port: порт сервера
-   - Room name: имя комнаты
-   - Room key: ключ шифрования (можно сгенерировать через Keys → Generate keypair)
-   - Your name: ваше имя
-3. Нажмите "Connect"
-
-**Отправка сообщения:**
-1. Введите текст в нижнее поле
-2. Нажмите "Send" или Enter
-
-**Отправка файла:**
-1. Кнопка "Send file" над окном чата
-2. Выберите файл
-3. Файл автоматически отправится всем участникам комнаты
-
-**Аудиозвонок:**
-1. Меню → Audio call → Start audio call
-2. Сгенерируйте ключ или введите существующий
-3. Для исходящего вызова: укажите IP и порт собеседника, нажмите "Start Call"
-4. Для входящего вызова: нажмите "Start Listening", сообщите свой IP и порт звонящему
-
----
-
-### 3. key-exchanger / key-exchanger.exe (Обмен ключами)
-
-**Расположение:** `key-exchange/key-exchanger` или `bin/key-exchanger.exe`
-
-**Назначение:** Консольная утилита для безопасного обмена ключами комнаты по протоколу Диффи-Хеллмана на эллиптических кривых (Curve25519)
-
-#### Запуск
-
-```bash
-key-exchanger
-```
-
-Программа интерактивная и предлагает выбор действий.
-
-#### Главное меню
+Interactive utility for Curve25519 (ECDH) key exchange:
 
 ```
 === F.E.A.R. Key Exchange ===
@@ -558,1036 +317,371 @@ key-exchanger
 2. Encrypt message
 3. Decrypt message
 4. Exit
-Choose option:
 ```
 
-#### Сценарий использования
+**Workflow:**
+1. Both users generate keypairs (option 1)
+2. Exchange public keys over any channel
+3. User A encrypts the room key with User B's public key (option 2)
+4. User B decrypts the room key (option 3)
 
-**Шаг 1. Пользователь A генерирует ключевую пару**
+Public keys can be shared openly. The secret key must never be transmitted.
 
-```
-Choose option: 1
-Your public key (share with partner):
-a1b2c3d4e5f6...
+### 4. audio_call (Voice Calls)
 
-Your secret key (keep private!):
-x9y8z7w6v5u4...
-```
+**Location:** `build/bin/audio_call`
 
-**Шаг 2. Пользователь A отправляет свой публичный ключ пользователю B** (через любой канал)
+```bash
+# Generate key
+./audio_call genkey
 
-**Шаг 3. Пользователь B генерирует свою ключевую пару и получает публичный ключ A**
+# List audio devices
+./audio_call listdevices
 
-```
-Choose option: 1
-```
+# Listen for incoming call
+echo "KEY" | ./audio_call listen 50000
 
-**Шаг 4. Пользователь A шифрует ключ комнаты**
-
-```
-Choose option: 2
-Enter your secret key:
-x9y8z7w6v5u4...
-
-Enter partner's public key:
-[публичный ключ B]
-
-Enter message to encrypt:
-z6aK3_k9I7rmpy6Sn-84QZ9Yc0p3T7VhzReWCKE0x4I
-
-Encrypted message:
-f4e3d2c1b0a9...
+# Make a call
+echo "KEY" | ./audio_call call REMOTE_IP 50000
 ```
 
-**Шаг 5. Пользователь A отправляет зашифрованное сообщение пользователю B**
+**Specs:** Opus codec, 48 kHz, adaptive bitrate, AES-256-GCM encryption.
 
-**Шаг 6. Пользователь B расшифровывает ключ комнаты**
+### 5. video_call (Video Calls)
 
+**Location:** `build/bin/video_call`
+
+```bash
+# Generate key
+./video_call genkey
+
+# List cameras and audio devices
+./video_call listdevices
+
+# Listen for incoming call
+echo "KEY" | ./video_call listen 50000
+
+# Make a call
+echo "KEY" | ./video_call call REMOTE_IP 50000
+
+# Options
+echo "KEY" | ./video_call call REMOTE_IP 50000 --quality high
+echo "KEY" | ./video_call listen 50000 --no-camera
 ```
-Choose option: 3
-Enter your secret key:
-[секретный ключ B]
 
-Enter partner's public key:
-a1b2c3d4e5f6...
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--quality low\|medium\|high` | Video quality preset (default: medium) |
+| `--camera DEVICE` | Camera device |
+| `--no-camera` | Receive-only mode (no camera) |
+| `--no-video` | Audio only |
+| `--no-audio` | Video only |
+| `--width N --height N` | Custom resolution |
+| `--fps N` | Custom framerate |
+| `--bitrate N` | Custom bitrate (kbps) |
 
-Enter encrypted message:
-f4e3d2c1b0a9...
+### 6. updater (Update Manager)
 
-Decrypted message:
-z6aK3_k9I7rmpy6Sn-84QZ9Yc0p3T7VhzReWCKE0x4I
+**Location:** `build/bin/updater`
+
+```bash
+./updater
 ```
 
-**Важно:**
-- Секретный ключ НИКОГДА не передается никому
-- Публичные ключи можно передавать по открытым каналам
-- Даже если злоумышленник перехватит оба публичных ключа и зашифрованное сообщение, он не сможет расшифровать ключ комнаты
+Checks for new versions, downloads, and applies updates.
 
 ---
 
-### 4. audio_call / audio_call.exe (Аудиозвонки)
+## Quick Start Scenarios
 
-**Расположение:** `audio_call/audio_call` или `bin/audio_call.exe`
+### Scenario 1: Two Users on LAN
 
-**Назначение:** Утилита для зашифрованных голосовых вызовов P2P (peer-to-peer)
-
-#### Команды
-
-##### Генерация ключа для звонка
-
+**Step 1:** Alice generates a key and starts the server:
 ```bash
-audio_call genkey
-```
-
-**Вывод (v0.3.0+):**
-```
-b1aae1360b0e242c18bad535b1179133789c60d8fc3063a259f25b7bcab9a938
-Audio call key generated successfully.
-IMPORTANT: Copy the key above to clipboard and share it securely.
-           The key is NOT saved to disk for security reasons.
-```
-
-**Улучшения безопасности (v0.3.0+):**
-- ✅ Ключ выводится в **stdout** (hex формат, 64 символа)
-- ✅ Ключ **НЕ сохраняется автоматически** в файл `audio_key.txt`
-- ✅ В GUI ключ автоматически копируется в буфер обмена
-- ✅ Можно перенаправить: `audio_call genkey > my_audio_key.txt`
-
-##### Список аудиоустройств (v0.3.0+)
-
-```bash
-audio_call listdevices
-```
-
-**Вывод:**
-```
-Available audio devices:
-Default input: 0
-Default output: 1
-
-Device 0: Микрофон (WASAPI)
-  Host API: WASAPI
-  Max input channels: 2
-  Max output channels: 0
-  Default sample rate: 48000 Hz
-
-Device 1: Динамики (MME)
-  Host API: MME
-  Max input channels: 0
-  Max output channels: 2
-  Default sample rate: 44100 Hz
-```
-
-**Изменения (v0.3.0+):**
-- ✅ **Исправлена проблема дублирующихся имен устройств**
-- ✅ Имена устройств теперь включают **Host API** в скобках
-- ✅ Формат: `Device N: Name (Host API)`
-- ✅ Позволяет различить одно и то же физическое устройство через разные API (MME, DirectSound, WASAPI на Windows; ALSA, PulseAudio, JACK на Linux)
-
-##### Ожидание входящего вызова (режим прослушивания)
-
-```bash
-audio_call listen <локальный_порт> [<ключ>]
-```
-
-**Аргументы:**
-- `<локальный_порт>` - UDP порт для прослушивания (1024-65535)
-- `[<ключ>]` - (опционально) 256-битный ключ в hex-формате (64 символа)
-
-**Примеры (v0.3.0+ безопасные методы):**
-
-```bash
-# Способ 1: Ключ через stdin (РЕКОМЕНДУЕТСЯ)
-echo "b1aae136..." | audio_call listen 50000
-
-# Способ 2: Интерактивный ввод
-audio_call listen 50000
-# Программа предложит: Enter audio key:
-
-# Способ 3: Ключ в командной строке (устаревший, небезопасный)
-audio_call listen 50000 b1aae1360b0e242c...
-```
-
-**Вывод:**
-```
-Listening on UDP port 50000
-Waiting for incoming call...
-```
-
-##### Исходящий вызов
-
-```bash
-audio_call call <удаленный_IP> <удаленный_порт> [<ключ>] [локальный_порт]
-```
-
-**Аргументы:**
-- `<удаленный_IP>` - IP-адрес собеседника
-- `<удаленный_порт>` - UDP порт собеседника
-- `[<ключ>]` - (опционально) 256-битный ключ в hex-формате (64 символа)
-- `[локальный_порт]` - (опционально) локальный UDP порт
-
-**Примеры (v0.3.0+ безопасные методы):**
-```bash
-# Способ 1: Ключ через stdin (РЕКОМЕНДУЕТСЯ)
-echo "b1aae136..." | audio_call call 192.168.1.100 50000
-
-# Способ 2: С указанием локального порта
-echo "b1aae136..." | audio_call call 192.168.1.100 50000 50001
-
-# Способ 3: Интерактивный ввод
-audio_call call 192.168.1.100 50000
-# Программа предложит: Enter audio key:
-
-# Способ 4: Ключ в командной строке (устаревший, небезопасный)
-audio_call call 192.168.1.100 50000 b1aae1360b0e242c... 50001
-```
-
-**Технические характеристики:**
-- Кодек: Opus (высокое качество, низкая задержка)
-- Частота дискретизации: 48 кГц
-- Битрейт: адаптивный (8-128 кбит/с)
-- Шифрование: XChaCha20-Poly1305
-- Задержка: < 50 мс (при хорошем соединении)
-
-**Примечания:**
-- Оба участника должны использовать один и тот же ключ
-- Требуется прямое соединение или настроенный NAT traversal
-- Для работы через интернет может потребоваться проброс портов на роутере
-
----
-
-### 5. updater / updater.exe (Обновление)
-
-**Расположение:** `updater/updater` или `bin/updater.exe`
-
-**Назначение:** Автоматическое обновление F.E.A.R. до последней версии с GitHub
-
-#### Запуск
-
-```bash
-updater
-```
-
-Программа автоматически:
-1. Проверяет текущую версию
-2. Загружает последний релиз с GitHub
-3. Распаковывает файлы
-4. Обновляет исполняемые файлы
-5. Предлагает перезапустить приложение
-
-**Использование через GUI:**
-1. Меню → Help → Check for updates
-2. Нажмите "Check Version"
-3. Если доступно обновление, нажмите "Update"
-4. Дождитесь завершения обновления
-5. Перезапустите приложение
-
-**Примечание:** Для корректной работы требуется подключение к интернету.
-<div style="page-break-after: always;"></div>
----
-
-## Быстрый старт
-
-### Сценарий 1: Два пользователя в локальной сети
-
-**Цель:** Alice и Bob хотят безопасно общаться через локальную сеть.
-
-**Шаг 1:** Alice генерирует ключ комнаты
-
-```bash
-cd bin
 ./fear genkey
-```
+# Output: z6aK3_k9I7rmpy6Sn-84QZ9Yc0p3T7VhzReWCKE0x4I
 
-Результат: `z6aK3_k9I7rmpy6Sn-84QZ9Yc0p3T7VhzReWCKE0x4I`
-
-**Шаг 2:** Alice запускает сервер
-
-```bash
 ./fear server --port 7777
 ```
 
-**Шаг 3:** Alice узнает свой IP-адрес
-
+**Step 2:** Alice connects and creates a room:
 ```bash
-# Linux/macOS
-ip addr show  # или ifconfig
-
-# Windows
-ipconfig
+./fear client --host 127.0.0.1 --port 7777 \
+    --room myroom --name Alice --create
 ```
 
-Предположим IP: `192.168.1.10`
+**Step 3:** Alice shares her IP (e.g., 192.168.1.10) and the key with Bob.
 
-**Шаг 4:** Alice сообщает Bob:
-- IP-адрес: `192.168.1.10`
-- Порт: `7777`
-- Ключ комнаты: `z6aK3_k9I7rmpy6Sn-84QZ9Yc0p3T7VhzReWCKE0x4I`
+**Step 4:** Bob joins:
+```bash
+echo "z6aK3_k9I7rmpy6Sn-84QZ9Yc0p3T7VhzReWCKE0x4I" | \
+    ./fear client --host 192.168.1.10 --port 7777 \
+    --room myroom --name Bob
+```
 
-**Шаг 5:** Alice подключается к своему серверу
+They can now chat securely.
 
+### Scenario 2: ECDH Key Exchange (No Pre-Shared Key)
+
+**Step 1:** Alice starts the server and creates a room:
+```bash
+./fear server --port 7777
+./fear client --host 127.0.0.1 --port 7777 \
+    --room myroom --name Alice --create
+```
+
+**Step 2:** Alice tells Bob the server IP, port, and room name (no key needed).
+
+**Step 3:** Bob joins via ECDH:
 ```bash
 ./fear client --host 192.168.1.10 --port 7777 \
-    --room myroom \
-    --key z6aK3_k9I7rmpy6Sn-84QZ9Yc0p3T7VhzReWCKE0x4I \
-    --name Alice
+    --room myroom --name Bob --join
 ```
 
-**Шаг 6:** Bob подключается к серверу Alice
+The key exchange happens automatically. Bob receives the room key via encrypted ECDH channel.
 
-```bash
-./fear client --host 192.168.1.10 --port 7777 \
-    --room myroom \
-    --key z6aK3_k9I7rmpy6Sn-84QZ9Yc0p3T7VhzReWCKE0x4I \
-    --name Bob
-```
+### Scenario 3: GUI Usage
 
-**Шаг 7:** Alice и Bob могут общаться!
-
-Alice печатает: `Привет, Bob!` [Enter]
-Bob видит: `[12:34:56] Alice: Привет, Bob!`
+1. Launch `fear_gui`
+2. Menu > Connection > Create Room
+3. Fill in server, port, room, name — click **Create**
+4. Key is auto-generated and copied to clipboard
+5. Share key with participant (or have them use **Join Room**)
+6. Participant: Menu > Connection > Join Room — click **Join**
+7. Chat, send files, start audio/video calls
 
 ---
 
-### Сценарий 2: Безопасный обмен ключом через интернет
+## ECDH Key Exchange
 
-**Цель:** Alice и Bob хотят обменяться ключом комнаты безопасно, не доверяя каналу связи.
+### How It Works
 
-**Шаг 1:** Alice генерирует ключ комнаты (но пока не отправляет его)
+When `--create` is used, the client generates a random room key. When another client connects with `--join`:
 
-```bash
-./fear genkey
-```
+1. Joiner sends `KEY_REQUEST` with their ephemeral X25519 public key
+2. Creator generates their own ephemeral X25519 keypair
+3. Creator encrypts the room key using `crypto_box` (shared secret from X25519)
+4. Creator signs the response with their Ed25519 identity key
+5. Creator sends `KEY_RESPONSE` with encrypted key + signature
+6. Joiner verifies the Ed25519 signature and decrypts the room key
 
-Результат: `z6aK3_k9I7rmpy6Sn-84QZ9Yc0p3T7VhzReWCKE0x4I`
+**Security guarantees:**
+- The room key never travels in plaintext
+- Ed25519 signature prevents man-in-the-middle attacks
+- Ephemeral keypairs provide forward secrecy for the exchange
 
-**Шаг 2:** Alice генерирует ключевую пару для обмена
-
-```bash
-./key-exchanger
-```
-
-```
-Choose option: 1
-
-Your public key: a1b2c3d4e5f6...
-Your secret key: x9y8z7w6v5u4...
-```
-
-Alice сохраняет секретный ключ у себя!
-
-**Шаг 3:** Alice отправляет Bob свой публичный ключ (например, через email, Telegram, и т.д.)
-
-**Шаг 4:** Bob генерирует свою ключевую пару
-
-```bash
-./key-exchanger
-Choose option: 1
-
-Your public key: m1n2o3p4q5r6...
-Your secret key: s7t8u9v0w1x2...
-```
-
-**Шаг 5:** Bob отправляет Alice свой публичный ключ
-
-**Шаг 6:** Alice шифрует ключ комнаты
-
-```bash
-./key-exchanger
-Choose option: 2
-
-Enter your secret key: x9y8z7w6v5u4...
-Enter partner's public key: m1n2o3p4q5r6...
-Enter message to encrypt: z6aK3_k9I7rmpy6Sn-84QZ9Yc0p3T7VhzReWCKE0x4I
-
-Encrypted message: f4e3d2c1b0a9...
-```
-
-**Шаг 7:** Alice отправляет зашифрованное сообщение Bob
-
-**Шаг 8:** Bob расшифровывает ключ комнаты
-
-```bash
-./key-exchanger
-Choose option: 3
-
-Enter your secret key: s7t8u9v0w1x2...
-Enter partner's public key: a1b2c3d4e5f6...
-Enter encrypted message: f4e3d2c1b0a9...
-
-Decrypted message: z6aK3_k9I7rmpy6Sn-84QZ9Yc0p3T7VhzReWCKE0x4I
-```
-
-**Шаг 9:** Теперь и Alice, и Bob знают ключ комнаты и могут безопасно общаться!
-
-**Важно:** Даже если злоумышленник перехватил все сообщения (публичные ключи и зашифрованный текст), он НЕ СМОЖЕТ восстановить ключ комнаты без секретных ключей.
-<div style="page-break-after: always;"></div>
 ---
 
-## Подробное руководство
+## Identity Verification
 
-### Работа с комнатами
+### TOFU (Trust On First Use)
 
-#### Создание комнаты
+Each F.E.A.R. client generates a persistent Ed25519 keypair stored in `.fear/identity/`. When connecting to a peer for the first time, their public key is saved locally. On subsequent connections, the key is compared:
 
-Комната создается автоматически при первом подключении клиента. Просто выберите уникальное имя комнаты и сгенерируйте ключ:
+- **Match:** Connection proceeds normally
+- **Mismatch:** Security warning — the peer's identity may have changed (or an attacker is present)
 
-```bash
-# Генерация ключа
-./fear genkey
+### Trusted Keys Management
 
-# Подключение создает комнату
-./fear client --host <сервер> --port <порт> \
-    --room mynewroom \
-    --key <ваш_ключ> \
-    --name <ваше_имя>
-```
+In the GUI, trusted keys can be managed via Menu > Keys > Trusted keys.
 
-#### Подключение к существующей комнате
-
-Для подключения к существующей комнате вам нужны:
-1. Адрес и порт сервера
-2. Имя комнаты
-3. Правильный ключ шифрования
-
-```bash
-./fear client --host server.example.com --port 7777 \
-    --room existingroom \
-    --key z6aK3_k9I7rmpy6Sn-84QZ9Yc0p3T7VhzReWCKE0x4I \
-    --name NewUser
-```
-
-**Важно:** Если вы используете неправильный ключ, вы не сможете расшифровать сообщения других участников (будет ошибка дешифрования).
-
-#### Множественные комнаты
-
-Один сервер может обслуживать неограниченное количество комнат одновременно. Каждая комната полностью изолирована:
-
-```bash
-# Пользователь в комнате "work"
-./fear client --host server.com --port 7777 \
-    --room work --key <ключ1> --name Alice
-
-# Другой пользователь в комнате "friends"
-./fear client --host server.com --port 7777 \
-    --room friends --key <ключ2> --name Bob
-```
-
-Alice и Bob не увидят сообщения друг друга, даже находясь на одном сервере.
-
-### Управление пользователями
-
-#### Уникальность имен
-
-Имя пользователя должно быть уникальным в пределах одной комнаты. Если два пользователя с одинаковым именем попытаются подключиться к одной комнате, второй получит отказ в подключении:
-
-```
-[server] client rejected: name 'Alice' already exists in room 'testroom'
-```
-
-**Решение:** Выберите другое имя или дождитесь, пока первый пользователь отключится.
-
-#### Список участников
-
-В GUI-версии список участников отображается в левой панели "Contacts". Список автоматически обновляется при подключении/отключении пользователей.
-
-В консольной версии используйте команду:
-
-```
-[USERS] Room participants (3): Alice, Bob, Charlie
-```
-
-Эта информация появляется автоматически при подключении нового пользователя.
-<div style="page-break-after: always;"></div>
 ---
 
-## Безопасный обмен ключами
+## Audio Calls
 
-### Зачем нужен обмен ключами?
+### Requirements
 
-Главная проблема любого шифрования — как безопасно передать ключ собеседнику? Если вы отправите ключ комнаты по незащищенному каналу (email, SMS, социальные сети), злоумышленник может его перехватить.
+- Microphone and speakers/headphones
+- Direct network connection between peers (or port forwarding)
+- Low network latency (< 100ms recommended)
 
-**Решение:** Протокол Диффи-Хеллмана на эллиптических кривых (ECDH) позволяет двум сторонам выработать общий секрет через незащищенный канал без передачи самого секрета.
+### Setup via GUI
 
-### Как работает ECDH (упрощенно)
+1. Menu > Audio call > Start audio call
+2. Generate key (auto-copied to clipboard) or enter existing key
+3. Select audio input/output devices
+4. **Receiver:** Enter local port, click "Start Listening"
+5. **Caller:** Enter remote IP and port, click "Start Call"
 
-1. Alice и Bob генерируют пары ключей: (публичный, секретный)
-2. Alice и Bob обмениваются **только публичными ключами**
-3. Alice комбинирует свой секретный ключ с публичным ключом Bob → получает общий секрет
-4. Bob комбинирует свой секретный ключ с публичным ключом Alice → получает тот же общий секрет
-5. Злоумышленник, перехвативший оба публичных ключа, **не может** вычислить общий секрет (вычислительно невозможно)
+### Setup via Console
 
-### Практическое использование
-
-#### Через консольную утилиту
-
-См. [Сценарий 2](#сценарий-2-безопасный-обмен-ключом-через-интернет) выше.
-
-#### Через GUI
-
-1. Откройте GUI: `./fear-gui`
-2. Меню → Keys → Key exchange
-3. Нажмите "Generate Key Pair"
-4. Скопируйте ваш Public key и отправьте собеседнику
-5. Получите Public key собеседника
-6. **Для отправки ключа комнаты:**
-   - Введите Message to send: (ваш ключ комнаты)
-   - Введите Friend's public key
-   - Нажмите "Encrypt"
-   - Отправьте Encrypted message собеседнику
-7. **Для получения ключа комнаты:**
-   - Введите Encrypted message от собеседника
-   - Введите Sender's public key
-   - Нажмите "Decrypt"
-   - Используйте Decrypted message как ключ комнаты
-
-### Лучшие практики
-
-✅ **Рекомендуется:**
-- Проверяйте публичные ключи собеседника по дополнительному каналу связи (телефонный звонок, личная встреча)
-- Используйте key-exchanger для каждой новой комнаты
-- Регулярно меняйте ключи комнат (например, раз в неделю)
-- **v0.3.0+**: Передавайте ключи через stdin или --key-file, а не через аргументы командной строки
-- **v0.3.0+**: Используйте автоматическое копирование в буфер обмена в GUI
-
-❌ **Избегайте:**
-- Отправки ключей комнаты в открытом виде
-- Переиспользования одного ключа для разных групп людей
-- ~~Хранения ключей в незашифрованных файлах на диске~~ **v0.3.0**: Ключи больше не сохраняются автоматически!
-- **v0.3.0+**: Передачи ключей через параметр --key (виден в списке процессов)
-<div style="page-break-after: always;"></div>
----
-
-## Аудиозвонки
-
-### Требования для аудиозвонков
-
-- Микрофон и динамики/наушники
-- Прямое сетевое соединение между участниками (или настроенный NAT traversal)
-- Низкая задержка сети (< 100 мс для комфортного разговора)
-
-### Настройка звонка
-
-#### Способ 1: Через GUI
-
-1. Откройте GUI обоих участников
-2. Меню → Audio call → Start audio call
-3. Один участник (A) нажимает "Generate" для создания ключа
-4. Участник A сообщает ключ участнику B (можно через key-exchanger для безопасности)
-5. Участник B вводит полученный ключ
-6. **Участник B (принимающий):**
-   - Вводит свой Local Port (например, 50000)
-   - Нажимает "Start Listening"
-   - Сообщает свой IP и порт участнику A
-7. **Участник A (звонящий):**
-   - Вводит Remote IP участника B
-   - Вводит Remote Port участника B (50000)
-   - Вводит свой Local Port (например, 50001)
-   - Нажимает "Start Call"
-8. Звонок установлен!
-
-#### Способ 2: Через консоль
-
-**Участник B (принимающий):**
+**Receiver:**
 ```bash
-# Генерируем ключ
 ./audio_call genkey
-# Результат: a1b2c3d4e5f6...
-
-# Запускаем прослушивание
-./audio_call listen 50000 a1b2c3d4e5f6...
+echo "KEY" | ./audio_call listen 50000
 ```
 
-**Участник B сообщает участнику A:**
-- IP: 192.168.1.100
-- Порт: 50000
-- Ключ: a1b2c3d4e5f6...
-
-**Участник A (звонящий):**
+**Caller:**
 ```bash
-./audio_call call 192.168.1.100 50000 a1b2c3d4e5f6... 50001
+echo "KEY" | ./audio_call call 192.168.1.100 50000
 ```
 
-### Устранение проблем со звуком
+Both parties must use the same key.
 
-**Проблема:** Нет звука, но соединение установлено
-
-**Решение:**
-1. Проверьте микрофон и динамики в системных настройках
-2. Убедитесь, что микрофон не заглушен
-3. Проверьте, что выбраны правильные аудиоустройства
-4. В Linux проверьте настройки ALSA/PulseAudio
-
-**Проблема:** Высокая задержка или прерывания
-
-**Решение:**
-1. Проверьте задержку сети: `ping <IP_собеседника>`
-2. Используйте проводное подключение вместо Wi-Fi
-3. Закройте программы, потребляющие интернет (торренты, стримы)
-4. Проверьте настройки QoS на роутере
-
-**Проблема:** Не удается установить соединение
-
-**Решение:**
-1. Убедитесь, что оба используют один и тот же ключ
-2. Проверьте, что порты открыты в файерволе
-3. Для подключения через интернет настройте проброс портов (Port Forwarding) на роутере
-4. Рассмотрите использование VPN для прямого соединения
-<div style="page-break-after: always;"></div>
 ---
 
-## Видеозвонки
+## Video Calls
 
-### Требования для видеозвонков
+### Requirements
 
-- Веб-камера (опционально — есть режим "без камеры")
-- Микрофон и динамики/наушники
-- Прямое сетевое соединение между участниками (или настроенный NAT traversal)
+- Webcam (optional — "no camera" mode available)
+- Microphone and speakers/headphones
+- Direct network connection between peers
 
-### Технические характеристики
+### Quality Presets
 
-- Видеокодек: VP8 (libvpx через FFmpeg)
-- Отображение: SDL3 (аппаратно-ускоренное YUV420P)
-- Шифрование: AES-256-GCM на каждый фрагмент
-- UDP фрагментация: до 128 фрагментов по 1200 байт (макс. ~150 КБ на кадр)
-- Адаптивный битрейт: автоматическая подстройка качества
-
-**Пресеты качества:**
-
-| Пресет | Разрешение | FPS | Битрейт |
+| Preset | Resolution | FPS | Bitrate |
 |--------|-----------|-----|---------|
-| LOW | 320x240 | 15 | 200 кбит/с |
-| MEDIUM | 640x480 | 25 | 500 кбит/с |
-| HIGH | 1280x720 | 30 | 1500 кбит/с |
+| LOW | 320x240 | 15 | 200 kbps |
+| MEDIUM | 640x480 | 25 | 500 kbps |
+| HIGH | 1280x720 | 30 | 1500 kbps |
 
-### 6. video_call / video_call.exe (Видеозвонки)
+### Setup via GUI
 
-**Расположение:** `video_call/video_call` или `bin/video_call.exe`
+1. Menu > Video call > Start video call
+2. Generate key or enter existing key
+3. Select camera (or "No camera" for receive-only)
+4. Choose quality preset
+5. **Receiver:** Click "Start Listening"
+6. **Caller:** Enter remote IP and port, click "Start Call"
 
-**Назначение:** Утилита для зашифрованных видеозвонков P2P (peer-to-peer)
+### Setup via Console
 
-#### Команды
-
-##### Генерация ключа для видеозвонка
-
+**Receiver:**
 ```bash
-video_call genkey
+echo "KEY" | ./video_call listen 50000 --quality medium
 ```
 
-##### Список устройств
-
+**Caller:**
 ```bash
-video_call listdevices
+echo "KEY" | ./video_call call 192.168.1.100 50000 --quality medium
 ```
 
-Выводит доступные камеры и аудиоустройства.
-
-##### Ожидание входящего вызова
-
-```bash
-# Ключ через stdin (РЕКОМЕНДУЕТСЯ)
-echo "YOUR_KEY" | video_call listen 50000
-
-# С опциями
-echo "YOUR_KEY" | video_call listen 50000 --quality high --camera "/dev/video0"
-
-# Без камеры (только прием видео)
-echo "YOUR_KEY" | video_call listen 50000 --no-camera
-```
-
-##### Исходящий вызов
-
-```bash
-# Ключ через stdin (РЕКОМЕНДУЕТСЯ)
-echo "YOUR_KEY" | video_call call 192.168.1.100 50000
-
-# С опциями
-echo "YOUR_KEY" | video_call call 192.168.1.100 50000 \
-    --quality high \
-    --camera "video=GENERAL WEBCAM" \
-    --no-audio
-```
-
-**Доступные опции:**
-- `--quality low|medium|high` — пресет качества (по умолчанию: medium)
-- `--camera DEVICE` — устройство камеры
-- `--no-camera` — режим без камеры (только прием видео)
-- `--no-video` — отключить видео (только аудио)
-- `--no-audio` — отключить аудио (только видео)
-- `--width N --height N` — пользовательское разрешение
-- `--fps N` — пользовательская частота кадров
-- `--bitrate N` — пользовательский битрейт (кбит/с)
-- `--audio-input N` — ID аудиоустройства ввода
-- `--audio-output N` — ID аудиоустройства вывода
-
-### Настройка видеозвонка
-
-#### Способ 1: Через GUI
-
-1. Откройте GUI обоих участников
-2. Меню → Video call → Start video call
-3. Один участник (A) нажимает "Generate" для создания ключа
-4. Участник A сообщает ключ участнику B
-5. Участник B вводит полученный ключ
-6. Выберите камеру (или "No camera" для режима только приема)
-7. Выберите качество (Low/Medium/High)
-8. **Участник B (принимающий):** нажимает "Start Listening"
-9. **Участник A (звонящий):** вводит IP и порт, нажимает "Start Call"
-10. Видеозвонок установлен!
-
-#### Способ 2: Через консоль
-
-**Участник B (принимающий):**
-```bash
-./video_call genkey
-# Результат: a1b2c3d4e5f6...
-
-echo "a1b2c3d4e5f6..." | ./video_call listen 50000 --quality medium
-```
-
-**Участник A (звонящий):**
-```bash
-echo "a1b2c3d4e5f6..." | ./video_call call 192.168.1.100 50000 --quality medium
-```
-
-### Особенности работы
-
-- **Обнаружение отключения:** Если пир не отправляет данные более 5 секунд, отображается черный кадр
-- **Переподключение:** При повторном подключении пира автоматически сбрасываются декодер и буфер, видео начинается с нового ключевого кадра
-- **Режим "Без камеры":** Позволяет принимать видео от собеседника, не имея камеры. Выберите "No camera (receive only)" в GUI или используйте `--no-camera` в консоли
-
-<div style="page-break-after: always;"></div>
----
-
-## Передача файлов
-
-### Отправка файла
-
-#### Через GUI
-
-1. Подключитесь к комнате
-2. Нажмите кнопку "Send file" над окном чата
-3. Выберите файл в диалоговом окне
-4. Файл автоматически отправится всем участникам комнаты
-
-#### Через консоль
-
-```bash
-# Во время работы клиента введите команду:
-/sendfile /путь/к/файлу.txt
-
-# Пример (Linux/macOS):
-/sendfile /home/user/Documents/report.pdf
-
-# Пример (Windows):
-/sendfile C:\Users\User\Documents\report.pdf
-```
-
-### Получение файла
-
-Файлы автоматически сохраняются в папку `Downloads` в директории программы:
-
-```
-fear/
-├── bin/
-│   ├── fear.exe
-│   └── Downloads/          ← Полученные файлы здесь
-│       ├── report.pdf
-│       └── photo.jpg
-```
-
-### Проверка целостности
-
-F.E.A.R. автоматически проверяет целостность файлов с помощью CRC32:
-
-**При отправке:**
-```
-Sending file: report.pdf (1024000 bytes)
-Progress: 1024000/1024000 bytes (100.0%)
-File sent successfully: report.pdf
-```
-
-**При получении:**
-```
-Receiving file: report.pdf (1024000 bytes)
-Progress: 1024000/1024000 bytes (100.0%)
-File received successfully: report.pdf
-```
-
-**Если файл поврежден:**
-```
-File corrupted: report.pdf (CRC mismatch)
-```
-
-В этом случае попросите отправителя переотправить файл.
-
-### Ограничения
-
-- Максимальный размер файла: ограничен только доступной памятью
-- Размер чанка: 8192 байт (оптимизирован для сетевой передачи)
-- Файлы передаются **зашифрованными** с использованием того же ключа комнаты
-<div style="page-break-after: always;"></div>
----
-
-## Устранение неполадок
-
-### Проблемы подключения
-
-#### Ошибка: "Connection refused"
-
-**Причина:** Сервер не запущен или указан неправильный адрес/порт
-
-**Решение:**
-1. Убедитесь, что сервер запущен: `./fear server --port 7777`
-2. Проверьте правильность IP-адреса и порта
-3. Проверьте файервол на сервере
-4. Попробуйте подключиться с самого сервера: `--host 127.0.0.1`
-
-#### Ошибка: "Failed to register with server"
-
-**Причина:** Проблема при отправке первого сообщения серверу
-
-**Решение:**
-1. Проверьте сетевое соединение
-2. Убедитесь, что ключ корректный (44 символа base64)
-3. Перезапустите клиент
-
-#### Ошибка: "Name already exists in room"
-
-**Причина:** Пользователь с таким именем уже в комнате
-
-**Решение:**
-1. Выберите другое имя пользователя
-2. Или попросите другого пользователя отключиться
-
-### Проблемы с шифрованием
-
-#### Сообщения не расшифровываются
-
-**Признаки:**
-- Сообщения других пользователей не появляются
-- Или отображаются как мусор/ошибка
-
-**Причина:** Неправильный ключ комнаты
-
-**Решение:**
-1. Убедитесь, что все участники используют ТОЧНО ОДИН И ТОТ ЖЕ ключ
-2. Проверьте, что ключ не был поврежден при копировании (должен быть ровно 44 символа)
-3. Пересоздайте ключ и раздайте его снова
-
-### Проблемы с производительностью
-
-#### Высокая нагрузка на процессор
-
-**Причина:** Шифрование/дешифрование — вычислительно интенсивные операции
-
-**Решение:**
-1. Используйте более современный процессор с AES-NI инструкциями
-2. Ограничьте количество одновременно открытых комнат
-3. Используйте GUI вместо консоли (меньше перерисовок)
-
-#### Задержки при передаче файлов
-
-**Причина:** Ограничения сети или шифрование больших объемов данных
-
-**Решение:**
-1. Используйте проводное подключение
-2. Разделите большие файлы на части
-3. Сжимайте файлы перед отправкой (ZIP/7z)
-
-### Проблемы сборки
-
-#### Ошибка: "libsodium not found"
-
-**Решение (Ubuntu/Debian):**
-```bash
-sudo apt install libsodium-dev
-```
-
-**Решение (Fedora):**
-```bash
-sudo dnf install libsodium-devel
-```
-
-**Решение (Windows с vcpkg):**
-```cmd
-vcpkg install libsodium:x64-windows
-```
-
-#### Ошибка: "Qt6 not found"
-
-**Решение (Linux):**
-```bash
-# Ubuntu/Debian
-sudo apt install qt6-base-dev
-
-# Fedora
-sudo dnf install qt6-qtbase-devel
-```
-
-**Решение (Windows):**
-Скачайте и установите Qt с официального сайта: https://www.qt.io/download
-
-**Решение (macOS):**
-```bash
-brew install qt@6
-cmake .. -DCMAKE_PREFIX_PATH=$(brew --prefix qt@6)
-```
-<div style="page-break-after: always;"></div>
----
-
-## Часто задаваемые вопросы
-
-### Общие вопросы
-
-**Q: Является ли F.E.A.R. полностью анонимным?**
-
-A: F.E.A.R. обеспечивает конфиденциальность **содержимого** сообщений, но не скрывает факт коммуникации. Сервер и сетевые наблюдатели могут видеть:
-- IP-адреса участников
-- Время подключения/отключения
-- Размер передаваемых данных
-
-Для полной анонимности используйте F.E.A.R. через VPN или Tor.
-
-**Q: Можно ли восстановить удаленные сообщения?**
-
-A: Нет. F.E.A.R. не хранит историю сообщений на сервере. Сообщения существуют только в памяти клиентов во время сессии.
-
-**Q: Нужно ли доверять серверу?**
-
-A: Сервер НЕ МОЖЕТ прочитать ваши сообщения благодаря E2EE. Однако сервер может:
-- Видеть метаданные (кто, когда, с кем общается)
-- Сохранять зашифрованные сообщения (но не расшифровать их)
-- Блокировать пользователей
-
-Для максимальной безопасности используйте **собственный сервер**.
-
-**Q: Можно ли использовать F.E.A.R. для групповых чатов?**
-
-A: Да! Неограниченное количество пользователей может подключиться к одной комнате. Все сообщения зашифрованы одним ключом комнаты.
-
-### Технические вопросы
-
-**Q: Какой алгоритм используется для шифрования?**
-
-A: AES-256-GCM (Advanced Encryption Standard, 256-битный ключ, режим Galois/Counter Mode). Это один из самых надежных и быстрых алгоритмов симметричного шифрования.
-
-**Q: Как часто нужно менять ключи?**
-
-A: Рекомендуется менять ключ комнаты:
-- При добавлении нового участника (для сохранения PFS - Perfect Forward Secrecy)
-- При удалении участника
-- Минимум раз в месяц для долгосрочных комнат
-
-**Q: (v0.3.0+) Почему ключи больше не сохраняются автоматически?**
-
-A: Это улучшение безопасности:
-- ✅ Предотвращает случайное сохранение ключей в открытом виде
-- ✅ Пользователь сознательно решает, где и как хранить ключи
-- ✅ Снижает риск компрометации через файлы на диске
-- ✅ GUI автоматически копирует ключ в буфер обмена для удобства
-- ℹ️ Вы всё ещё можете сохранить: `fear genkey > my_key.txt`
-
-**Q: (v0.3.0+) Почему --key параметр помечен как небезопасный?**
-
-A: Аргументы командной строки видны в списке процессов (`ps aux`, `top`, диспетчер задач). Любой пользователь системы или malware может увидеть ваш ключ. Используйте stdin или --key-file вместо этого.
-
-**Q: Поддерживается ли видео?**
-
-A: Да! Начиная с v0.4, F.E.A.R. поддерживает зашифрованные видеозвонки с использованием VP8 (libvpx), SDL3 для отображения и AES-256-GCM для шифрования каждого фрагмента. Доступны три пресета качества (LOW/MEDIUM/HIGH) и адаптивный битрейт. Подробнее см. раздел [Видеозвонки](#видеозвонки).
-
-**Q: Можно ли запустить несколько серверов?**
-
-A: Да, но они будут независимыми. F.E.A.R. не поддерживает федерацию серверов (пока).
-
-**Q: Работает ли F.E.A.R. на мобильных устройствах?**
-
-A: Мобильное приложение для Android/iOS находится в разработке. Следите за обновлениями на GitHub.
-
-### Безопасность
-
-**Q: Может ли правительство/спецслужбы взломать F.E.A.R.?**
-
-A: При правильном использовании AES-256 невозможно взломать методом перебора (потребуются миллиарды лет). Однако возможны атаки:
-- Взлом конечных устройств (вирусы, кейлоггеры)
-- Компрометация ключей
-- Атаки "человек посередине" при обмене ключами
-
-**Защита:** Используйте антивирус, храните ключи в безопасности, проверяйте публичные ключи собеседников.
-
-**Q: Безопасно ли использовать F.E.A.R. на работе?**
-
-A: С технической точки зрения — да (E2EE). С юридической — зависит от политики компании. F.E.A.R. не предназначен для обхода корпоративных политик.
-
-**Q: Что делать, если ключ комнаты был скомпрометирован?**
-
-A:
-1. Немедленно сгенерируйте новый ключ: `./fear genkey`
-2. Сообщите новый ключ всем доверенным участникам (используя key-exchanger)
-3. Создайте новую комнату с новым именем
-4. НЕ используйте старую комнату
-
-**Q: Логирует ли F.E.A.R. сообщения на диск?**
-
-A: Нет, по умолчанию логирование отключено. Сообщения существуют только в памяти во время работы программы.
+### Features
+
+- **Peer disconnect detection:** If no data for 5 seconds, a black frame is displayed
+- **Auto reconnect:** When a peer reconnects, decoder and fragment buffer reset automatically
+- **No camera mode:** Receive video without sending — use `--no-camera` or select in GUI
 
 ---
 
-## Лицензия
+## File Transfer
 
-F.E.A.R. Project распространяется под лицензией **MIT**.
+### Sending a File
 
-Это означает:
-- ✅ Свободное использование в коммерческих и некоммерческих целях
-- ✅ Модификация исходного кода
-- ✅ Распространение копий
-- ✅ Использование в закрытых проектах
+**GUI:** Click "Send file" button, select file.
 
-**Условие:** Сохранение копирайта и лицензии в исходниках.
+**Console:**
+```bash
+/sendfile /path/to/file.pdf
+```
+
+### Receiving a File
+
+Files are automatically saved to the `Downloads/` directory.
+
+### Integrity Verification
+
+F.E.A.R. verifies file integrity using CRC32 checksums. Corrupted files are automatically deleted.
+
+### Limitations
+
+- Chunk size: 8192 bytes
+- Files are encrypted with the room key
+- No file size limit (bounded by available memory)
 
 ---
 
-## Контакты и поддержка
+## Troubleshooting
+
+### Connection Issues
+
+**"Connection refused":**
+- Verify the server is running
+- Check IP address and port
+- Check firewall settings
+
+**"Name already exists in room":**
+- Choose a different username
+- Wait for the previous session to disconnect
+
+### Encryption Issues
+
+**Messages not decrypting:**
+- All participants must use the same room key
+- Verify key was not corrupted during copy (should be 44 Base64 chars)
+- Regenerate key and redistribute
+
+### Call Issues
+
+**No audio/video:**
+- Check microphone/camera permissions
+- Verify correct device is selected
+- Check firewall allows UDP traffic on the call port
+
+**High latency:**
+- Use wired connection instead of Wi-Fi
+- Close bandwidth-intensive applications
+- Check network latency: `ping REMOTE_IP`
+
+### Build Issues
+
+See [BUILD.md](BUILD.md) for detailed troubleshooting.
+
+---
+
+## FAQ
+
+**Q: Is F.E.A.R. fully anonymous?**
+
+A: F.E.A.R. provides confidentiality of message content but does not hide the fact of communication. The server and network observers can see IP addresses, connection times, and data volumes. For full anonymity, use F.E.A.R. over VPN or Tor.
+
+**Q: Do I need to trust the server?**
+
+A: The server cannot read your messages (E2EE). However, it can see metadata (who communicates with whom, when). For maximum security, run your own server.
+
+**Q: How often should keys be changed?**
+
+A: Change the room key when adding or removing participants, and periodically for long-term rooms. With `--create` / `--join`, each room session can use a fresh key easily.
+
+**Q: What if a room key is compromised?**
+
+A: Generate a new key (`./fear genkey`), create a new room, and redistribute the key to trusted participants only.
+
+**Q: Does F.E.A.R. log messages?**
+
+A: No. Messages exist only in memory during the session. The server does not store messages.
+
+**Q: Can I use group chats?**
+
+A: Yes. Any number of users can join a room. All messages are encrypted with the shared room key.
+
+**Q: Is there a mobile app?**
+
+A: Yes. An Android client is available at [fear-mobile](https://github.com/shchuchkin-pkims/fear-mobile). It is fully compatible with the desktop server and supports all features including ECDH, identity verification, audio/video calls, file transfer, themes, and push notifications.
+
+---
+
+## License
+
+F.E.A.R. Project is distributed under the **MIT License**.
+
+---
+
+## Contact
 
 **GitHub:** https://github.com/shchuchkin-pkims/fear
-**Email:** shchuchkin-pkims@yandex.ru
 **Issues:** https://github.com/shchuchkin-pkims/fear/issues
 
-### Как сообщить об ошибке
+### Reporting Bugs
 
-1. Откройте issue на GitHub
-2. Опишите проблему:
-   - Версия F.E.A.R.
-   - Операционная система
-   - Шаги для воспроизведения
-   - Ожидаемое поведение
-   - Фактическое поведение
-3. Приложите логи (если есть)
-
-### Как предложить улучшение
-
-1. Откройте issue с тегом "enhancement"
-2. Опишите предлагаемую функцию
-3. Объясните, как она улучшит F.E.A.R.
+1. Open a GitHub issue
+2. Include: F.E.A.R. version, OS, steps to reproduce, expected vs actual behavior
+3. Attach logs if available
 
 ---
 
-## Благодарности
-
-F.E.A.R. использует следующие открытые библиотеки:
-
-- **libsodium** - Современная криптографическая библиотека
-- **PortAudio** - Кроссплатформенная аудиобиблиотека
-- **Opus** - Высококачественный аудиокодек
-- **FFmpeg** - Мультимедийный фреймворк (захват камеры, VP8 кодирование)
-- **SDL3** - Кроссплатформенная мультимедийная библиотека (отображение видео)
-- **libvpx** - VP8/VP9 видеокодек
-- **CMake** - Система сборки
-
-Спасибо всем контрибьюторам и пользователям за поддержку проекта!
-
----
-
-**Оставайтесь анонимными. Оставайтесь в безопасности.**
-**Щучкин Е. Ю.**
-**F.E.A.R. Project © 2025**
+**Stay Anonymous. Stay Secure.**
+**Shchuchkin E. Yu.**
+**F.E.A.R. Project**

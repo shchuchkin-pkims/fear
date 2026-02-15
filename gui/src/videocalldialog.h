@@ -34,7 +34,8 @@ class VideoCallDialog : public QDialog {
     Q_OBJECT
 
 public:
-    explicit VideoCallDialog(VideoCallManager *videoManager, QWidget *parent = nullptr);
+    explicit VideoCallDialog(VideoCallManager *videoManager, QWidget *parent = nullptr,
+                             const QString &roomKeyHex = QString());
 
 private slots:
     void onGenerateKey();
@@ -57,6 +58,7 @@ private:
     VideoCallManager *videoManager;
 
     // Key section
+    QGroupBox *keyGroupBox;
     QLineEdit *keyEdit;
     QPushButton *genKeyButton;
 

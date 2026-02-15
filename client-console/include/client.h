@@ -30,7 +30,8 @@ int send_ciphertext(sock_t s, const char *room, const char *name, const uint8_t 
                    const uint8_t *plaintext, size_t plen);
 int recv_and_decrypt(sock_t s, const char *room, const uint8_t *key, const char *myname);
 void run_client(const char *host, uint16_t port, const char *room, const char *name,
-                const uint8_t key[32], const uint8_t *id_pk, const uint8_t *id_sk);
+                const uint8_t key[32], const uint8_t *id_pk, const uint8_t *id_sk,
+                int join_mode);
 void print_local_message(const char *name, const char *msg);
 
 #endif

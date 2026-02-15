@@ -1,218 +1,130 @@
-# 🛡️ TODO.md — План работ по проекту F.E.A.R. Project
+# Roadmap
 
-> Документ для фиксации задач, идей и планов по развитию проекта.
-> Используется как центральный список дел для всех компонентов системы.
+## Release History
 
----
-
-## 📋 Формат задач
-
-- **[ ]** — задача не начата  
-- **[~]** — в процессе  
-- **[x]** — выполнено  
-
-**Приоритеты:**  
-- 🟥 Высокий — критично для релиза  
-- 🟨 Средний — желательно выполнить  
-- 🟩 Низкий — улучшения, оптимизация  
+| Version | Highlights | Status |
+|---------|-----------|--------|
+| **v0.1** | Basic messaging, key exchange, GUI | Done |
+| **v0.2** | Encrypted audio calls (Opus + AES-GCM) | Done |
+| **v0.3** | Secure key handling, file transfer, auto-updater, mobile app | Done |
+| **v0.4** | Encrypted video calls (VP8 + SDL3 + AES-GCM) | Done |
+| **v0.4.1** | ECDH key exchange, Ed25519 identity (TOFU), Android v0.4.1 | Done |
+| **v1.0** | CI/CD, security hardening, full testing | Planned |
 
 ---
 
-## 🧩 1. Архитектура и инфраструктура проекта
+## Completed
 
-- 🟥 **[x]** Определить архитектуру проекта (клиент–сервер, peer-to-peer, гибрид)
-- 🟥 **[x]** Разработать протокол обмена ключами (Curve25519)
-- 🟨 **[ ]** Описать структуру модулей (core, crypto, transport, audio, UI)
-- 🟨 **[ ]** Настроить сборку проекта для всех платформ (Windows / Linux / Android)
-- 🟩 **[ ]** Автоматизировать сборку через GitHub Actions / CI
+### v0.4.1 — ECDH & Identity
+- [x] ECDH key exchange (X25519 + crypto_box) — `--create` / `--join` modes
+- [x] Ed25519 identity verification with TOFU model
+- [x] GUI: Create Room / Join Room / Connect buttons
+- [x] Android app updated to v0.4.1 (ECDH, identity, video calls, themes, push notifications)
 
----
+### v0.4.0 — Video Calls
+- [x] VP8 video codec via FFmpeg (libvpx)
+- [x] SDL3 hardware-accelerated YUV420P display
+- [x] AES-256-GCM encryption per fragment
+- [x] UDP fragmentation/reassembly (1200B chunks, up to 128 per frame)
+- [x] Adaptive bitrate (LOW/MEDIUM/HIGH presets)
+- [x] Peer disconnect detection (5s timeout) + auto reconnect
+- [x] "No camera" receive-only mode
+- [x] GUI integration with camera/quality selection
 
-## 🔐 2. Криптография и безопасность
+### v0.3.0 — Security & Features
+- [x] AES-256-GCM encryption (upgraded from XSalsa20)
+- [x] Secure key generation (stdout only, not saved to disk)
+- [x] GUI auto-copy keys to clipboard
+- [x] Secure key input via stdin / `--key-file` (deprecate `--key` argument)
+- [x] File transfer with CRC32 integrity verification
+- [x] Auto-updater
+- [x] Audio device Host API in names (fixes duplicates)
+- [x] Android mobile app (initial release)
 
-- 🟥 **[x]** Реализовать модуль генерации ключей (с использованием libsodium)
-- 🟥 **[x]** Шифрование сообщений (AES-256-GCM / ChaCha20-Poly1305)
-- 🟥 **[x]** Реализовать безопасный обмен ключами между клиентами
-- 🟥 **[x]** **v0.3.0**: Улучшения безопасности генерации и передачи ключей:
-  - **[x]** Ключи НЕ сохраняются на диск автоматически (только stdout/clipboard)
-  - **[x]** GUI автоматически копирует ключи в буфер обмена
-  - **[x]** CLI: передача ключей через stdin вместо аргументов командной строки
-  - **[x]** Добавлен параметр --key-file для безопасного чтения ключей из файлов
-  - **[x]** Предупреждения о небезопасности при использовании --key в командной строке
-- 🟥 **[ ]** Отработать проблемы выявленные в рамках аудита безопасности
-- 🟥 **[ ]** Цифровая подпись и аутентификация сообщений (Ed25519)
-- 🟨 **[ ]** Безопасное хранение ключей на клиенте (secure storage)
-- 🟩 **[ ]** Реализовать механизм автоматического обновления ключей (rekeying)
-- 🟩 **[ ]** Проверка целостности бинарных файлов (hash/signature check)
+### v0.2.0 — Audio Calls
+- [x] Encrypted voice calls (Opus + PortAudio + AES-GCM over UDP)
 
----
-
-## 🌐 3. Сеть и передача данных
-
-- 🟥 **[x]** Реализовать базовый сетевой транспорт (TCP/UDP)
-- 🟥 **[~]** Добавить шифрованный канал (TLS или custom crypto layer)
-- 🟥 **[ ]** Синхронизация сообщений между устройствами
-- 🟨 **[ ]** Поддержка NAT traversal (ICE/STUN/TURN)
-- 🟩 **[ ]** Реализовать P2P-соединения для аудиозвонков
-- 🟩 **[ ]** Оптимизировать буферизацию и QoS при плохом соединении
-
----
-
-## 🎙️ 4. Аудио и звонки
-
-- 🟥 **[x]** Интегрировать аудиобиблиотеки (PortAudio + Opus)
-- 🟥 **[x]** Реализовать шифрованный аудиоканал (AES-256-GCM)
-- 🟥 **[x]** **v0.3.0**: Исправлена проблема дублирующихся имен аудиоустройств:
-  - **[x]** Добавлена информация о Host API в названия устройств
-  - **[x]** Формат: "Device Name (Host API)" - например "Microphone (WASAPI)"
-  - **[x]** GUI корректно отображает уникальные имена устройств
-- 🟨 **[ ]** Оптимизация буфера и устранение задержек
-- 🟩 **[ ]** Добавить поддержку шумоподавления и автоуровня
-- 🟥 **[x]** Видеозвонки (VP8 + SDL3 + AES-256-GCM):
-  - **[x]** VP8 видеокодек через FFmpeg (libvpx)
-  - **[x]** SDL3 аппаратно-ускоренное отображение (YUV420P)
-  - **[x]** AES-256-GCM шифрование фрагментов
-  - **[x]** UDP фрагментация/сборка кадров
-  - **[x]** Адаптивный битрейт (LOW/MEDIUM/HIGH)
-  - **[x]** Обнаружение отключения пира и переподключение
-  - **[x]** Режим "Без камеры" (только прием)
-  - **[x]** Интеграция с GUI (выбор камеры, качества)
+### v0.1.0 — Foundation
+- [x] Client-server architecture with room-based chat
+- [x] E2E encrypted messaging
+- [x] Qt6 GUI application
+- [x] Console client/server
+- [x] Diffie-Hellman key exchange utility
 
 ---
 
-## 💬 5. Пользовательский интерфейс
+## In Progress
 
-- 🟨 **[x]** Реализовать прототип GUI для обмена ключами
-- 🟨 **[~]** Реализовать основной чат (список диалогов, окно сообщений)
-- 🟨 **[ ]** Добавить индикацию шифрования и статусов соединения
-- 🟩 **[ ]** Настройки (ключи, сервер, шифрование)
+- [ ] Documentation updates and localization
+- [ ] Security audit remediation (see SECURITY_AUDIT.md)
 
----
+## Planned
 
-## 🧠 6. Логика приложения (core)
+### Security
+- [ ] Secure key storage on client (system keychain integration)
+- [ ] Automatic key rotation (rekeying)
+- [ ] Binary signature verification
 
-- 🟥 **[x]** Реализовать модель данных сообщений
-- 🟥 **[~]** Разделение логики на модули (crypto, net, storage, ui)
-- 🟨 **[ ]** Обработка ошибок и аварийных ситуаций
-- 🟩 **[ ]** Система логирования с уровнями (debug/info/warn/error)
-- 🟩 **[ ]** Добавить unit-тесты для ключевых модулей
+### Networking
+- [ ] NAT traversal (ICE/STUN/TURN)
+- [ ] TLS for TCP transport layer
 
----
+### Quality
+- [ ] CI/CD pipeline (GitHub Actions)
+- [ ] Unit tests for cryptographic functions
+- [ ] Load testing for server and calls
 
-## 🔄 7. Обновления и сопровождение
-
-- 🟥 **[x]** Реализовать updater.exe (проверка обновлений)
-- 🟨 **[~]** Добавить поддержку загрузки .zip с заменой файлов
-- 🟩 **[ ]** Проверка подписи обновлений
-- 🟩 **[ ]** Автоматическая очистка временных файлов после обновления
-
----
-
-## 🧪 8. Тестирование и аудит
-
-- 🟥 **[ ]** Провести независимый аудит безопасности кода
-- 🟥 **[ ]** Провести модульное тестирование всех криптографических функций
-- 🟨 **[ ]** Нагрузочное тестирование сети и звонков
+### Features
+- [ ] Noise suppression and auto-level for audio
+- [ ] iOS mobile app
 
 ---
 
-## 📦 9. Документация
+## Changelog
 
-- 🟥 **[~]** Документация API
-- 🟨 **[x]** Создать README.md с обзором проекта
-- 🟨 **[ ]** Добавить SECURITY.md (описание криптоалгоритмов и защиты)
-- 🟩 **[ ]** Добавить схему архитектуры и взаимодействия модулей
+### v0.4.1
 
----
+**ECDH Key Exchange:**
+- MSG_TYPE_KEY_REQUEST (15) / MSG_TYPE_KEY_RESPONSE (16) service messages
+- X25519 ephemeral keypairs + crypto_box for key transport
+- Ed25519 signature on ECDH response prevents MITM
+- CLI: `--create` (auto-gen key), `--join` (ECDH exchange)
+- GUI: Create Room / Join Room / Connect buttons
 
-## 🚀 10. Релизы и планы
+**Identity Verification:**
+- Ed25519 keypair generation and persistent storage (`.fear/identity/`)
+- Trust On First Use (TOFU) — first-seen pubkey is saved, mismatch = warning
+- Peer verification during calls (guarded against spam)
 
-| Версия   | Цель релиза                                                               | Статус         | Комментарий                       |
-|:---------|:--------------------------------------------------------------------------|:---------------|:----------------------------------|
-| **v0.1** | Проверка реализации: обмен ключами, отправка сообщений, базовый UI        | ✅ Завершен    | Основная функциональность         |
-| **v0.2** | Аудиозвонки и исправления ошибок                                          | ✅ Завершен    | Аудиозвонки                       |
-| **v0.3** | Изменение алгоритмов криптографии (AES-256-GCM, Curve25519),              | ✅ Завершен    | **Улучшения безопасности:**       |
-|          | автообновление, мобильное приложение, улучшение GUI, передача файлов,     |                | ✅ Безопасная генерация ключей    |
-|          | автоматизированная сборка, **улучшения безопасности обработки ключей**    |                | ✅ Исправлены дубликаты устройств |
-| **v0.4** | Зашифрованные видеозвонки (VP8 + SDL3 + AES-256-GCM)                     | ✅ Завершен    | ✅ Видеозвонки P2P                |
-|          |                                                                           |                | ✅ Адаптивный битрейт             |
-|          |                                                                           |                | ✅ GUI с выбором камеры           |
-| **v1.0** | Полный релиз, CI/CD, кроссплатформенность, улучшение безопасности         | ⏳ Планируется | После тестирования безопасности   |
+**Android v0.4.1:**
+- ECDH key exchange (Create Room / Join Room)
+- Identity verification
+- Video calls
+- Light/dark theme toggle
+- Push notifications for background messages
+- Recent hosts dropdown
 
----
+### v0.4.0
 
-## 🧭 Примечания и идеи
+**Video Calls:**
+- VP8 video codec via FFmpeg (libvpx), SDL3 YUV420P display
+- AES-256-GCM per-fragment encryption, UDP fragmentation
+- Adaptive bitrate (LOW: 320x240@15fps, MEDIUM: 640x480@25fps, HIGH: 1280x720@30fps)
+- Peer disconnect detection (5s timeout), auto reconnect
+- "No camera" receive-only mode, GUI camera/quality selection
 
-- 💡 Разработка приложения для iOS
+### v0.3.0
 
----
+**Security:**
+- Keys output to stdout only (not auto-saved to disk)
+- GUI auto-copies keys to clipboard
+- Secure key input via stdin / `--key-file`
+- `--key` CLI argument deprecated (visible in process lists)
 
----
+**Audio:**
+- Host API info in device names (e.g., "Microphone (WASAPI)")
+- Fixes duplicate device names across APIs
 
-## 📝 Changelog v0.4.0 (Последние изменения)
-
-### 📹 Видеозвонки
-
-- ✅ **Зашифрованные видеозвонки P2P**:
-  - VP8 видеокодек через FFmpeg (libvpx)
-  - SDL3 аппаратно-ускоренное отображение YUV420P
-  - AES-256-GCM шифрование каждого фрагмента
-  - UDP фрагментация (1200 байт, до 128 фрагментов на кадр)
-  - Адаптивный битрейт (LOW/MEDIUM/HIGH пресеты)
-  - Обнаружение отключения пира + автоматическое переподключение
-  - Режим "Без камеры" (receive-only) — `--no-camera`
-  - Интеграция с GUI: выбор камеры, качества
-  - MJPEG запрос для dshow (Windows) — предотвращение переполнения буфера
-  - Даунскейлинг через sws_ctx при несовпадении разрешения камеры
-
----
-
-## 📝 Changelog v0.3.0
-
-### 🔒 Безопасность
-
-- ✅ **Генерация ключей**: Ключи больше НЕ сохраняются на диск автоматически
-  - `fear genkey` и `audio_call genkey` выводят ключи в stdout
-  - GUI автоматически копирует сгенерированные ключи в буфер обмена
-  - Добавлены предупреждения о безопасности при генерации
-
-- ✅ **Передача ключей (CLI)**: Защита от утечки через списки процессов
-  - Новый параметр `--key-file FILE` для чтения ключей из файлов
-  - Поддержка stdin для передачи ключей: `echo "KEY" | fear client ...`
-  - Предупреждения при использовании небезопасного `--key` параметра
-  - Применено для `fear`, `audio_call` и GUI backend
-
-### 🎙️ Аудиозвонки
-
-- ✅ **Исправлены дублирующиеся имена устройств**:
-  - Добавлена информация о Host API в названия устройств
-  - Формат: "Device Name (Host API)"
-  - Пример: "Микрофон (MME)", "Микрофон (WASAPI)" - теперь различимы
-  - GUI корректно парсит и отображает уникальные имена
-
-### 📚 Документация
-
-- ✅ Обновлен README.md с новыми инструкциями по безопасности
-- ✅ Обновлен QUICKSTART.md с примерами безопасного использования
-- ✅ Обновлен TODO.md с текущим статусом задач
-
----
-
-### 📹 Видеозвонки
-
-- ✅ **Видеозвонки P2P** (v0.4):
-  - **[x]** VP8 видеокодек через FFmpeg (libvpx)
-  - **[x]** SDL3 аппаратно-ускоренное отображение YUV420P
-  - **[x]** AES-256-GCM шифрование каждого фрагмента
-  - **[x]** UDP фрагментация (1200 байт, до 128 фрагментов на кадр)
-  - **[x]** Адаптивный битрейт (LOW: 320x240@15fps, MEDIUM: 640x480@25fps, HIGH: 1280x720@30fps)
-  - **[x]** Обнаружение отключения пира (таймаут 5 сек) + черный кадр
-  - **[x]** Переподключение: сброс декодера и фрагмент-ресивера при новом nonce prefix
-  - **[x]** Режим "Без камеры" (receive-only) — `--no-camera`
-  - **[x]** Интеграция с GUI: выбор камеры, качества, кнопка "No camera"
-  - **[x]** MJPEG запрос для dshow (Windows) — предотвращение переполнения буфера
-  - **[x]** Даунскейлинг через sws_ctx при несовпадении разрешения камеры
-
----
-
-_Последнее обновление: {{10.02.2026}}_
+**Other:**
+- File transfer with encryption and CRC32 verification
+- Auto-updater with version checks

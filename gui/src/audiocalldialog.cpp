@@ -15,13 +15,20 @@
 #include <QFileInfo>
 #include <QProcess>
 
-AudioCallDialog::AudioCallDialog(AudioCallManager *audioManager, QWidget *parent)
+AudioCallDialog::AudioCallDialog(AudioCallManager *audioManager, QWidget *parent,
+                                 const QString &roomKeyHex)
     : QDialog(parent), audioManager(audioManager) {
     setWindowTitle("Audio Call");
     setMinimumSize(500, 450);
 
     setupUI();
     setupConnections();
+
+    // Auto-fill room key if available, hide key section
+    if (!roomKeyHex.isEmpty() && roomKeyHex.length() == 64) {
+        keyEdit->setText(roomKeyHex);
+        keyGroup->setVisible(false);
+    }
 
     // Load audio devices list when dialog opens
     refreshAudioDevices();
@@ -110,7 +117,7 @@ void AudioCallDialog::setupUI() {
     QVBoxLayout *layout = new QVBoxLayout(this);
 
     // ===== Key section =====
-    QGroupBox *keyGroup = new QGroupBox("Encryption Key", this);
+    keyGroup = new QGroupBox("Encryption Key", this);
     QHBoxLayout *keyLayout = new QHBoxLayout(keyGroup);
     keyEdit = new QLineEdit(keyGroup);
     keyEdit->setPlaceholderText("32-byte hex key");
