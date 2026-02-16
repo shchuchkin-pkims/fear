@@ -130,6 +130,17 @@ typedef struct AudioCall {
     struct sockaddr_in peer;
     int peer_set;
 
+    /* Relay mode */
+    int relay_mode;
+    char relay_room[256];
+    char relay_name[256];
+    socket_t tcp_sock;      /* TCP socket for relay (0 = unused) */
+#ifdef _WIN32
+    CRITICAL_SECTION tcp_send_lock;
+#else
+    pthread_mutex_t tcp_send_lock;
+#endif
+
     uint8_t key[AES_GCM_KEY_LEN];
     uint8_t local_nonce_prefix[NONCE_PREFIX_LEN];
     uint8_t remote_nonce_prefix[NONCE_PREFIX_LEN];
@@ -168,6 +179,9 @@ typedef struct AudioCall {
 
 /* ------------------------- HELLO handshake -------------------------------- */
 
+/* Forward declaration (defined after TCP relay helpers) */
+static int ac_send_packet(AudioCall *c, const uint8_t *data, int len);
+
 static int send_hello(AudioCall *c) {
     if (c->has_identity) {
         /* Signed HELLO: [0x7F][prefix(4)][flags(1)][pk(32)][sig(64)] */
@@ -179,17 +193,13 @@ static int send_hello(AudioCall *c) {
         identity_sign(c->local_nonce_prefix, NONCE_PREFIX_LEN,
                       c->identity_sk,
                       pkt + 1 + NONCE_PREFIX_LEN + 1 + IDENTITY_PK_BYTES);
-        int r = sendto(c->sock, (const char*)pkt, (int)sizeof(pkt), 0,
-                       (struct sockaddr*)&c->peer, sizeof(c->peer));
-        return (r == (int)sizeof(pkt)) ? 0 : -1;
+        return ac_send_packet(c, pkt, (int)sizeof(pkt));
     } else {
         /* Unsigned HELLO: [0x7F][prefix(4)] */
         uint8_t pkt[1 + NONCE_PREFIX_LEN];
         pkt[0] = PKT_VER_HELLO;
         memcpy(pkt + 1, c->local_nonce_prefix, NONCE_PREFIX_LEN);
-        int r = sendto(c->sock, (const char*)pkt, (int)sizeof(pkt), 0,
-                       (struct sockaddr*)&c->peer, sizeof(c->peer));
-        return (r == (int)sizeof(pkt)) ? 0 : -1;
+        return ac_send_packet(c, pkt, (int)sizeof(pkt));
     }
 }
 static int handle_hello(AudioCall *c, const uint8_t *buf, size_t len) {
@@ -233,6 +243,195 @@ static int handle_hello(AudioCall *c, const uint8_t *buf, size_t len) {
     return 0;
 }
 
+/* ===== UDP relay registration ===== */
+
+static int send_udp_registration(AudioCall *c) {
+    /* Packet: [0xFE][2 room_len LE][room][2 name_len LE][name] */
+    uint16_t room_len = (uint16_t)strlen(c->relay_room);
+    uint16_t name_len = (uint16_t)strlen(c->relay_name);
+    size_t pkt_len = 1 + 2 + room_len + 2 + name_len;
+    uint8_t pkt[1 + 2 + 256 + 2 + 256];
+
+    pkt[0] = 0xFE;
+    pkt[1] = (uint8_t)(room_len & 0xFF);
+    pkt[2] = (uint8_t)((room_len >> 8) & 0xFF);
+    memcpy(pkt + 3, c->relay_room, room_len);
+    pkt[3 + room_len] = (uint8_t)(name_len & 0xFF);
+    pkt[3 + room_len + 1] = (uint8_t)((name_len >> 8) & 0xFF);
+    memcpy(pkt + 3 + room_len + 2, c->relay_name, name_len);
+
+    int r = sendto(c->sock, (const char *)pkt, (int)pkt_len, 0,
+                   (struct sockaddr *)&c->peer, sizeof(c->peer));
+    return (r == (int)pkt_len) ? 0 : -1;
+}
+
+/* ===== TCP relay helpers ===== */
+
+#define MSG_TYPE_MEDIA_RELAY 17
+#define TCP_NONCE_LEN 12
+
+static int tcp_send_all(socket_t fd, const void *buf, size_t len) {
+    const uint8_t *p = (const uint8_t *)buf;
+    size_t sent = 0;
+    while (sent < len) {
+        int n = send(fd, (const char *)(p + sent), (int)(len - sent), 0);
+        if (n <= 0) return -1;
+        sent += (size_t)n;
+    }
+    return 0;
+}
+
+static int tcp_recv_all(socket_t fd, void *buf, size_t len) {
+    uint8_t *p = (uint8_t *)buf;
+    size_t got = 0;
+    while (got < len) {
+        int n = recv(fd, (char *)(p + got), (int)(len - got), 0);
+        if (n <= 0) return -1;
+        got += (size_t)n;
+    }
+    return 0;
+}
+
+static int tcp_relay_connect(AudioCall *c, const char *ip, uint16_t port) {
+    c->tcp_sock = (socket_t)socket(AF_INET, SOCK_STREAM, 0);
+    if (c->tcp_sock == (socket_t)SOCK_ERR) {
+        fprintf(stderr, "TCP socket() failed\n");
+        return -1;
+    }
+    struct sockaddr_in srv;
+    memset(&srv, 0, sizeof(srv));
+    srv.sin_family = AF_INET;
+    srv.sin_port = htons(port);
+    if (inet_pton(AF_INET, ip, &srv.sin_addr) != 1) {
+        fprintf(stderr, "TCP inet_pton failed for %s\n", ip);
+        CLOSESOCK(c->tcp_sock); c->tcp_sock = 0;
+        return -1;
+    }
+    if (connect(c->tcp_sock, (struct sockaddr *)&srv, sizeof(srv)) < 0) {
+        fprintf(stderr, "TCP connect failed to %s:%u\n", ip, port);
+        CLOSESOCK(c->tcp_sock); c->tcp_sock = 0;
+        return -1;
+    }
+    printf("TCP relay connected to %s:%u\n", ip, port);
+    return 0;
+}
+
+static int tcp_relay_register(AudioCall *c) {
+    uint16_t room_len = (uint16_t)strlen(c->relay_room);
+    uint16_t name_len = (uint16_t)strlen(c->relay_name);
+    size_t frame_len = 2 + room_len + 2 + name_len + 2 + TCP_NONCE_LEN + 1 + 4 + 1;
+    uint8_t *frame = (uint8_t *)calloc(1, frame_len);
+    if (!frame) return -1;
+
+    uint8_t *w = frame;
+    w[0] = room_len & 0xFF; w[1] = (room_len >> 8) & 0xFF; w += 2;
+    memcpy(w, c->relay_room, room_len); w += room_len;
+    w[0] = name_len & 0xFF; w[1] = (name_len >> 8) & 0xFF; w += 2;
+    memcpy(w, c->relay_name, name_len); w += name_len;
+    w[0] = TCP_NONCE_LEN; w[1] = 0; w += 2;
+    memset(w, 0, TCP_NONCE_LEN); w += TCP_NONCE_LEN;
+    *w++ = MSG_TYPE_MEDIA_RELAY; /* media relay registration */
+    w[0] = 1; w[1] = 0; w[2] = 0; w[3] = 0; w += 4;
+    *w++ = 0;
+
+    int ret = tcp_send_all(c->tcp_sock, frame, frame_len);
+    free(frame);
+    if (ret == 0) printf("TCP relay registered: room=%s name=%s\n",
+                         c->relay_room, c->relay_name);
+    return ret;
+}
+
+static int tcp_relay_send_media(AudioCall *c, const uint8_t *media, int media_len) {
+    uint16_t room_len = (uint16_t)strlen(c->relay_room);
+    uint16_t name_len = (uint16_t)strlen(c->relay_name);
+    size_t frame_len = 2 + room_len + 2 + name_len + 2 + TCP_NONCE_LEN + 1 + 4 + (size_t)media_len;
+    uint8_t *frame = (uint8_t *)malloc(frame_len);
+    if (!frame) return -1;
+
+    uint8_t *w = frame;
+    w[0] = room_len & 0xFF; w[1] = (room_len >> 8) & 0xFF; w += 2;
+    memcpy(w, c->relay_room, room_len); w += room_len;
+    w[0] = name_len & 0xFF; w[1] = (name_len >> 8) & 0xFF; w += 2;
+    memcpy(w, c->relay_name, name_len); w += name_len;
+    w[0] = TCP_NONCE_LEN; w[1] = 0; w += 2;
+    memset(w, 0, TCP_NONCE_LEN); w += TCP_NONCE_LEN;
+    *w++ = MSG_TYPE_MEDIA_RELAY;
+    w[0] = (uint8_t)(media_len & 0xFF);
+    w[1] = (uint8_t)((media_len >> 8) & 0xFF);
+    w[2] = (uint8_t)((media_len >> 16) & 0xFF);
+    w[3] = (uint8_t)((media_len >> 24) & 0xFF);
+    w += 4;
+    memcpy(w, media, media_len);
+
+#ifdef _WIN32
+    EnterCriticalSection(&c->tcp_send_lock);
+#else
+    pthread_mutex_lock(&c->tcp_send_lock);
+#endif
+    int ret = tcp_send_all(c->tcp_sock, frame, frame_len);
+#ifdef _WIN32
+    LeaveCriticalSection(&c->tcp_send_lock);
+#else
+    pthread_mutex_unlock(&c->tcp_send_lock);
+#endif
+    free(frame);
+    return ret;
+}
+
+static int tcp_relay_recv_media(AudioCall *c, uint8_t *out, int out_size) {
+    for (;;) {
+        uint8_t hdr2[2];
+        uint8_t skip[512];
+
+        if (tcp_recv_all(c->tcp_sock, hdr2, 2) < 0) return -1;
+        uint16_t room_len = (uint16_t)(hdr2[0] | (hdr2[1] << 8));
+        if (room_len > 255) return -1;
+        if (tcp_recv_all(c->tcp_sock, skip, room_len) < 0) return -1;
+
+        if (tcp_recv_all(c->tcp_sock, hdr2, 2) < 0) return -1;
+        uint16_t name_len = (uint16_t)(hdr2[0] | (hdr2[1] << 8));
+        if (name_len > 255) return -1;
+        if (tcp_recv_all(c->tcp_sock, skip, name_len) < 0) return -1;
+
+        if (tcp_recv_all(c->tcp_sock, hdr2, 2) < 0) return -1;
+        uint16_t nonce_len = (uint16_t)(hdr2[0] | (hdr2[1] << 8));
+        if (nonce_len > sizeof(skip)) return -1;
+        if (nonce_len > 0 && tcp_recv_all(c->tcp_sock, skip, nonce_len) < 0) return -1;
+
+        uint8_t type;
+        if (tcp_recv_all(c->tcp_sock, &type, 1) < 0) return -1;
+
+        uint8_t clenbuf[4];
+        if (tcp_recv_all(c->tcp_sock, clenbuf, 4) < 0) return -1;
+        uint32_t clen = (uint32_t)(clenbuf[0] | (clenbuf[1] << 8) |
+                                    (clenbuf[2] << 16) | (clenbuf[3] << 24));
+
+        if (type == MSG_TYPE_MEDIA_RELAY && (int)clen <= out_size && clen > 0) {
+            if (tcp_recv_all(c->tcp_sock, out, clen) < 0) return -1;
+            return (int)clen;
+        }
+
+        uint32_t remaining = clen;
+        while (remaining > 0) {
+            uint32_t chunk = remaining > sizeof(skip) ? sizeof(skip) : remaining;
+            if (tcp_recv_all(c->tcp_sock, skip, chunk) < 0) return -1;
+            remaining -= chunk;
+        }
+    }
+}
+
+static int ac_send_packet(AudioCall *c, const uint8_t *data, int len) {
+    if (c->relay_mode && c->tcp_sock) {
+        return tcp_relay_send_media(c, data, len);
+    }
+    if (c->peer_set) {
+        int r = sendto(c->sock, (const char *)data, len, 0,
+                       (struct sockaddr *)&c->peer, sizeof(c->peer));
+        return (r > 0) ? 0 : -1;
+    }
+    return -1;
+}
+
 /* --------------------------- AEAD-helpers -------------------------------- */
 
 /* Криптографические функции теперь в audio_crypto.h:
@@ -269,10 +468,14 @@ static THREAD_RET th_send_func(void *arg) {
     int waited = 0;
     while (atomic_load(&c->running)) {
         if (atomic_load(&c->remote_prefix_ready)) break;
-        if (waited == 0 && c->peer_set) send_hello(c);
+        if (waited == 0 && (c->peer_set || c->tcp_sock)) send_hello(c);
         waited++;
         msleep(50);
-        if (waited % 20 == 0 && c->peer_set) send_hello(c);
+        if (waited % 20 == 0 && (c->peer_set || c->tcp_sock)) {
+            /* Re-send UDP relay registration periodically (only for UDP relay) */
+            if (c->relay_mode && !c->tcp_sock) send_udp_registration(c);
+            send_hello(c);
+        }
     }
 
     int16_t pcm[AC_FRAME_SAMPLES];
@@ -280,7 +483,6 @@ static THREAD_RET th_send_func(void *arg) {
     uint8_t packet[1 + 8 + AC_MAX_OPUS_BYTES + AES_GCM_ABYTES];
 
     while (atomic_load(&c->running)) {
-        // Если входной поток недоступен, отправляем тишину
         if (c->in_stream == NULL) {
             memset(pcm, 0, sizeof(pcm));
         } else {
@@ -304,10 +506,7 @@ static THREAD_RET th_send_func(void *arg) {
             continue;
         }
 
-        if (c->peer_set) {
-            sendto(c->sock, (const char*)packet, (int)pkt_len, 0,
-                   (struct sockaddr*)&c->peer, sizeof(c->peer));
-        }
+        ac_send_packet(c, packet, (int)pkt_len);
     }
 
 #ifdef _WIN32
@@ -327,27 +526,39 @@ static THREAD_RET th_recv_func(void *arg) {
     int16_t pcm[AC_FRAME_SAMPLES];
 
     while (atomic_load(&c->running)) {
-        struct sockaddr_in src;
-#ifdef _WIN32
-        int slen = sizeof(src);
-#else
-        socklen_t slen = sizeof(src);
-#endif
-        int n = recvfrom(c->sock, (char*)rbuf, (int)sizeof(rbuf), 0,
-                         (struct sockaddr*)&src, &slen);
-        if (n <= 0) {
-            msleep(2);
-            continue;
-        }
+        int n;
 
-        if (!c->peer_set) {
-            c->peer = src;
-            c->peer_set = 1;
+        if (c->relay_mode && c->tcp_sock) {
+            /* TCP relay: read media frame from server */
+            n = tcp_relay_recv_media(c, rbuf, (int)sizeof(rbuf));
+            if (n < 0) {
+                fprintf(stderr, "[relay] TCP connection lost\n");
+                atomic_store(&c->running, 0);
+                break;
+            }
+            if (n == 0) continue;
+        } else {
+            struct sockaddr_in src;
+#ifdef _WIN32
+            int slen = sizeof(src);
+#else
+            socklen_t slen = sizeof(src);
+#endif
+            n = recvfrom(c->sock, (char*)rbuf, (int)sizeof(rbuf), 0,
+                         (struct sockaddr*)&src, &slen);
+            if (n <= 0) {
+                msleep(2);
+                continue;
+            }
+            if (!c->peer_set && !c->relay_mode) {
+                c->peer = src;
+                c->peer_set = 1;
+            }
         }
 
         if (rbuf[0] == PKT_VER_HELLO) {
             handle_hello(c, rbuf, (size_t)n);
-            if (c->peer_set) send_hello(c);
+            if (c->peer_set || c->tcp_sock) send_hello(c);
             continue;
         }
 
@@ -594,10 +805,20 @@ void audio_call_stop(AudioCall *c) {
         c->dec = NULL;
     }
 
+    if (c->tcp_sock) {
+        CLOSESOCK(c->tcp_sock);
+        c->tcp_sock = 0;
+    }
     if (c->sock) {
         CLOSESOCK(c->sock);
         c->sock = 0;
     }
+
+#ifdef _WIN32
+    if (c->relay_mode) DeleteCriticalSection(&c->tcp_send_lock);
+#else
+    if (c->relay_mode) pthread_mutex_destroy(&c->tcp_send_lock);
+#endif
 
     pcmring_free(&c->out_ring);
     free(c);
@@ -611,7 +832,10 @@ int audio_call_start(AudioCall **out_call,
                      int input_device_id,
                      int output_device_id,
                      const uint8_t *id_pk,
-                     const uint8_t *id_sk)
+                     const uint8_t *id_sk,
+                     int relay_mode,
+                     const char *relay_room,
+                     const char *relay_name)
 {
     if (!out_call || !key) return -1;
     if (net_init_once() != 0) return -1;
@@ -638,6 +862,19 @@ int audio_call_start(AudioCall **out_call,
     }
     c->peer_verified = 0;
     identity_default_known_keys_path(c->known_keys_path, sizeof(c->known_keys_path));
+
+    /* Relay mode setup */
+    c->relay_mode = relay_mode;
+    if (relay_mode && relay_room && relay_name) {
+        strncpy(c->relay_room, relay_room, sizeof(c->relay_room) - 1);
+        c->relay_room[sizeof(c->relay_room) - 1] = '\0';
+        strncpy(c->relay_name, relay_name, sizeof(c->relay_name) - 1);
+        c->relay_name[sizeof(c->relay_name) - 1] = '\0';
+    } else {
+        c->relay_mode = 0;
+        c->relay_room[0] = '\0';
+        c->relay_name[0] = '\0';
+    }
 
     if (pcmring_init(&c->out_ring, 128) != 0) {
         free(c);
@@ -694,7 +931,33 @@ int audio_call_start(AudioCall **out_call,
         return -1;
     }
 
-    if (is_caller && c->peer_set) {
+    /* TCP relay: connect to server and register */
+    if (c->relay_mode && remote_ip && remote_port != 0) {
+#ifdef _WIN32
+        InitializeCriticalSection(&c->tcp_send_lock);
+#else
+        pthread_mutex_init(&c->tcp_send_lock, NULL);
+#endif
+        if (tcp_relay_connect(c, remote_ip, remote_port) != 0) {
+            Pa_Terminate(); CLOSESOCK(c->sock);
+            pcmring_free(&c->out_ring); free(c);
+            return -1;
+        }
+        if (tcp_relay_register(c) != 0) {
+            fprintf(stderr, "TCP relay registration failed\n");
+            CLOSESOCK(c->tcp_sock); Pa_Terminate(); CLOSESOCK(c->sock);
+            pcmring_free(&c->out_ring); free(c);
+            return -1;
+        }
+        c->peer_set = 1; /* so send guards pass */
+    } else if (c->relay_mode && c->peer_set) {
+        /* Fallback: UDP relay registration */
+        send_udp_registration(c);
+        printf("UDP relay registration sent (room=%s, name=%s)\n",
+               c->relay_room, c->relay_name);
+    }
+
+    if (is_caller && (c->peer_set || c->tcp_sock)) {
         send_hello(c);
     }
 
@@ -1046,7 +1309,8 @@ int main(int argc, char **argv) {
         AudioCall *call = NULL;
         if (audio_call_start(&call, ip, rport, lport, 1, key, input_dev, output_dev,
                              has_identity ? id_pk : NULL,
-                             has_identity ? id_sk : NULL) != 0) {
+                             has_identity ? id_sk : NULL,
+                             0, NULL, NULL) != 0) {
             fprintf(stderr, "Failed to start call\n");
             if (has_identity) sodium_memzero(id_sk, sizeof(id_sk));
             return 1;
@@ -1166,7 +1430,8 @@ int main(int argc, char **argv) {
         AudioCall *call = NULL;
         if (audio_call_start(&call, NULL, 0, lport, 0, key, input_dev, output_dev,
                              has_identity ? id_pk : NULL,
-                             has_identity ? id_sk : NULL) != 0) {
+                             has_identity ? id_sk : NULL,
+                             0, NULL, NULL) != 0) {
             fprintf(stderr, "Failed to start listener\n");
             if (has_identity) sodium_memzero(id_sk, sizeof(id_sk));
             return 1;
@@ -1180,6 +1445,104 @@ int main(int argc, char **argv) {
         }
         audio_call_stop(call);
         printf("Listener stopped\n");
+        return 0;
+    }
+
+    if (strcmp(argv[1], "relay") == 0) {
+        if (argc < 4) {
+            fprintf(stderr, "Usage: %s relay <server_ip> <server_port> --room ROOM --name NAME [--key-file FILE] [--identity-file FILE] [--no-sign] [input_dev] [output_dev]\n", argv[0]);
+            return 1;
+        }
+        const char *ip = argv[2];
+        uint16_t rport = (uint16_t)atoi(argv[3]);
+
+        const char *keyfile = NULL;
+        const char *identity_file = NULL;
+        const char *relay_room = NULL;
+        const char *relay_name = NULL;
+        int no_sign = 0;
+        int input_dev = -1;
+        int output_dev = -1;
+
+        int arg_idx = 4;
+        while (arg_idx < argc) {
+            if (strcmp(argv[arg_idx], "--key-file") == 0 && arg_idx + 1 < argc) {
+                keyfile = argv[arg_idx + 1]; arg_idx += 2;
+            } else if (strcmp(argv[arg_idx], "--identity-file") == 0 && arg_idx + 1 < argc) {
+                identity_file = argv[arg_idx + 1]; arg_idx += 2;
+            } else if (strcmp(argv[arg_idx], "--no-sign") == 0) {
+                no_sign = 1; arg_idx++;
+            } else if (strcmp(argv[arg_idx], "--room") == 0 && arg_idx + 1 < argc) {
+                relay_room = argv[arg_idx + 1]; arg_idx += 2;
+            } else if (strcmp(argv[arg_idx], "--name") == 0 && arg_idx + 1 < argc) {
+                relay_name = argv[arg_idx + 1]; arg_idx += 2;
+            } else {
+                if (input_dev == -1) { input_dev = atoi(argv[arg_idx]); arg_idx++; }
+                else if (output_dev == -1) { output_dev = atoi(argv[arg_idx]); arg_idx++; }
+                else { arg_idx++; }
+            }
+        }
+
+        if (!relay_room || !relay_name) {
+            fprintf(stderr, "Error: --room and --name are required for relay mode\n");
+            return 1;
+        }
+
+        static char key_buffer[256];
+        memset(key_buffer, 0, sizeof(key_buffer));
+        const char *hexkey = NULL;
+        if (keyfile) {
+            if (read_key_from_file(keyfile, key_buffer, sizeof(key_buffer)) != 0) return 1;
+            hexkey = key_buffer;
+        } else {
+            int is_interactive = isatty(fileno(stdin));
+            if (read_key_from_stdin(key_buffer, sizeof(key_buffer), is_interactive) != 0) return 1;
+            hexkey = key_buffer;
+        }
+
+        uint8_t key[AES_GCM_KEY_LEN];
+        if (hex2bytes(hexkey, key, sizeof(key)) != 0) {
+            fprintf(stderr, "Invalid key (must be 64 hex chars)\n");
+            return 1;
+        }
+
+        uint8_t id_pk[IDENTITY_PK_BYTES], id_sk[IDENTITY_SK_BYTES];
+        int has_identity = 0;
+        if (!no_sign) {
+            char id_path[512];
+            if (identity_file) {
+                strncpy(id_path, identity_file, sizeof(id_path) - 1);
+                id_path[sizeof(id_path) - 1] = '\0';
+            } else {
+                identity_default_path(id_path, sizeof(id_path));
+            }
+            if (identity_load(id_path, id_pk, id_sk) == 0) {
+                has_identity = 1;
+                char fp[IDENTITY_FINGERPRINT_LEN];
+                identity_pk_fingerprint(id_pk, fp);
+                fprintf(stderr, "Identity loaded: %s\n", fp);
+            }
+        }
+
+        AudioCall *call = NULL;
+        if (audio_call_start(&call, ip, rport, 0, 1, key, input_dev, output_dev,
+                             has_identity ? id_pk : NULL,
+                             has_identity ? id_sk : NULL,
+                             1, relay_room, relay_name) != 0) {
+            fprintf(stderr, "Failed to start relay call\n");
+            if (has_identity) sodium_memzero(id_sk, sizeof(id_sk));
+            return 1;
+        }
+        if (has_identity) sodium_memzero(id_sk, sizeof(id_sk));
+
+        setup_signal();
+        printf("Relay call via %s:%u (room=%s, name=%s, press Ctrl+C to stop)\n",
+               ip, rport, relay_room, relay_name);
+        while (!atomic_load(&g_sigint)) {
+            msleep(100);
+        }
+        audio_call_stop(call);
+        printf("Relay call ended\n");
         return 0;
     }
 

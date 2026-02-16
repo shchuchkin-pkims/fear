@@ -4,6 +4,7 @@
  */
 
 #include "videocalldialog.h"
+#include "backend.h"
 #include <QVBoxLayout>
 #include <QHBoxLayout>
 #include <QGridLayout>
@@ -16,9 +17,9 @@
 #include <QProcess>
 #include <QSettings>
 
-VideoCallDialog::VideoCallDialog(VideoCallManager *videoManager, QWidget *parent,
-                                 const QString &roomKeyHex)
-    : QDialog(parent), videoManager(videoManager) {
+VideoCallDialog::VideoCallDialog(VideoCallManager *videoManager, Backend *backend,
+                                 QWidget *parent, const QString &roomKeyHex)
+    : QDialog(parent), videoManager(videoManager), backend(backend) {
     setWindowTitle("Video Call");
     setMinimumSize(550, 600);
 
@@ -89,12 +90,22 @@ void VideoCallDialog::onStartCall() {
     int audioInput = inputDeviceCombo->currentData().toInt();
     int audioOutput = outputDeviceCombo->currentData().toInt();
 
-    if (videoManager->startCall(remoteIp, remotePort, key,
-                                 localPortSpin->value(), quality, adaptive,
-                                 width, height, fps, bitrate,
-                                 camera, audioInput, audioOutput,
-                                 false, false)) {
-        statusLabel->setText("Call started");
+    if (relayCheck->isChecked() && backend) {
+        // Relay mode: route through server
+        if (videoManager->startRelay(remoteIp, remotePort,
+                                      backend->currentRoom, backend->currentName, key,
+                                      quality, adaptive, width, height, fps, bitrate,
+                                      camera, audioInput, audioOutput, false, false)) {
+            statusLabel->setText("Relay call started");
+        }
+    } else {
+        if (videoManager->startCall(remoteIp, remotePort, key,
+                                     localPortSpin->value(), quality, adaptive,
+                                     width, height, fps, bitrate,
+                                     camera, audioInput, audioOutput,
+                                     false, false)) {
+            statusLabel->setText("Call started");
+        }
     }
 }
 
@@ -248,22 +259,26 @@ void VideoCallDialog::setupUI() {
     QGroupBox *connGroup = new QGroupBox("Connection", this);
     QGridLayout *connLayout = new QGridLayout(connGroup);
 
-    connLayout->addWidget(new QLabel("Remote IP:"), 0, 0);
+    relayCheck = new QCheckBox("Relay through server", connGroup);
+    relayCheck->setToolTip("Route call through the chat server (for NAT traversal)");
+    connLayout->addWidget(relayCheck, 0, 0, 1, 4);
+
+    connLayout->addWidget(new QLabel("Remote IP:"), 1, 0);
     ipEdit = new QLineEdit(connGroup);
     ipEdit->setText("127.0.0.1");
-    connLayout->addWidget(ipEdit, 0, 1);
+    connLayout->addWidget(ipEdit, 1, 1);
 
-    connLayout->addWidget(new QLabel("Remote Port:"), 0, 2);
+    connLayout->addWidget(new QLabel("Remote Port:"), 1, 2);
     portSpin = new QSpinBox(connGroup);
     portSpin->setRange(1024, 65535);
     portSpin->setValue(50000);
-    connLayout->addWidget(portSpin, 0, 3);
+    connLayout->addWidget(portSpin, 1, 3);
 
-    connLayout->addWidget(new QLabel("Local Port:"), 1, 0);
+    connLayout->addWidget(new QLabel("Local Port:"), 2, 0);
     localPortSpin = new QSpinBox(connGroup);
     localPortSpin->setRange(1024, 65535);
     localPortSpin->setValue(50001);
-    connLayout->addWidget(localPortSpin, 1, 1);
+    connLayout->addWidget(localPortSpin, 2, 1);
 
     layout->addWidget(connGroup);
 
@@ -305,6 +320,31 @@ void VideoCallDialog::setupConnections() {
     connect(stopButton, &QPushButton::clicked, this, &VideoCallDialog::onStopCall);
     connect(qualityCombo, QOverload<int>::of(&QComboBox::currentIndexChanged),
             this, &VideoCallDialog::onQualityPresetChanged);
+
+    // Relay checkbox: auto-fill from backend connection
+    connect(relayCheck, &QCheckBox::toggled, this, [this](bool checked) {
+        if (checked && backend && backend->isConnected) {
+            ipEdit->setText(backend->serverHost);
+            portSpin->setValue(backend->serverPort);
+            ipEdit->setEnabled(false);
+            portSpin->setEnabled(false);
+            localPortSpin->setEnabled(false);
+            listenButton->setVisible(false);
+        } else {
+            ipEdit->setEnabled(true);
+            portSpin->setEnabled(true);
+            localPortSpin->setEnabled(true);
+            listenButton->setVisible(true);
+        }
+    });
+
+    // Enable relay checkbox only when connected to a remote server
+    if (backend && backend->isConnected && !backend->serverHost.isEmpty()) {
+        relayCheck->setEnabled(true);
+    } else {
+        relayCheck->setEnabled(false);
+        relayCheck->setToolTip("Connect to a server first to use relay mode");
+    }
 }
 
 void VideoCallDialog::refreshDevices() {

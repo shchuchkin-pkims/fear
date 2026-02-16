@@ -23,6 +23,7 @@ Backend::Backend(QObject *parent) : QObject(parent) {
     serverProc = nullptr;
     lastMessageId = 0;
     isConnected = false;
+    serverPort = 0;
 
     // Initialize audio call manager
     audioManager = new AudioCallManager(this);
@@ -157,6 +158,12 @@ bool Backend::connectToServer(const QString &host, int port, const QString &room
 
     // NOTE: Do NOT close write channel here - we need to keep it open for sending messages
 
+    // Store connection info for relay calls
+    serverHost = host;
+    serverPort = port;
+    currentRoom = room;
+    currentName = name;
+
     // Consider connection successful after process starts
     isConnected = true;
     emit connected();
@@ -266,6 +273,10 @@ bool Backend::disconnect() {
     }
     isConnected = false;
     roomKeyHex.clear();
+    serverHost.clear();
+    serverPort = 0;
+    currentRoom.clear();
+    currentName.clear();
     emit disconnected();
     return true;
 }

@@ -215,12 +215,12 @@ void MainWindow::handleFileOffer(const QString &sender, const QString &filename,
 }
 
 void MainWindow::onAudioCall() {
-    AudioCallDialog dialog(backend->audioManager, this, backend->roomKeyHex);
+    AudioCallDialog dialog(backend->audioManager, backend, this, backend->roomKeyHex);
     dialog.exec();
 }
 
 void MainWindow::onVideoCall() {
-    VideoCallDialog dialog(backend->videoManager, this, backend->roomKeyHex);
+    VideoCallDialog dialog(backend->videoManager, backend, this, backend->roomKeyHex);
     dialog.exec();
 }
 

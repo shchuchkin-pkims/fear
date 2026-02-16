@@ -4,6 +4,7 @@
  */
 
 #include "audiocalldialog.h"
+#include "backend.h"
 #include <QVBoxLayout>
 #include <QHBoxLayout>
 #include <QGridLayout>
@@ -15,9 +16,9 @@
 #include <QFileInfo>
 #include <QProcess>
 
-AudioCallDialog::AudioCallDialog(AudioCallManager *audioManager, QWidget *parent,
-                                 const QString &roomKeyHex)
-    : QDialog(parent), audioManager(audioManager) {
+AudioCallDialog::AudioCallDialog(AudioCallManager *audioManager, Backend *backend,
+                                 QWidget *parent, const QString &roomKeyHex)
+    : QDialog(parent), audioManager(audioManager), backend(backend) {
     setWindowTitle("Audio Call");
     setMinimumSize(500, 450);
 
@@ -66,8 +67,17 @@ void AudioCallDialog::onStartCall() {
     int inputDevice = inputDeviceCombo->currentData().toInt();
     int outputDevice = outputDeviceCombo->currentData().toInt();
 
-    if (audioManager->startCall(remoteIp, remotePort, key, localPortSpin->value(), inputDevice, outputDevice)) {
-        statusLabel->setText("Call started");
+    if (relayCheck->isChecked() && backend) {
+        // Relay mode: route through server
+        if (audioManager->startRelay(remoteIp, remotePort,
+                                      backend->currentRoom, backend->currentName, key,
+                                      inputDevice, outputDevice)) {
+            statusLabel->setText("Relay call started");
+        }
+    } else {
+        if (audioManager->startCall(remoteIp, remotePort, key, localPortSpin->value(), inputDevice, outputDevice)) {
+            statusLabel->setText("Call started");
+        }
     }
 }
 
@@ -147,22 +157,26 @@ void AudioCallDialog::setupUI() {
     QGroupBox *connGroup = new QGroupBox("Connection", this);
     QGridLayout *connLayout = new QGridLayout(connGroup);
 
-    connLayout->addWidget(new QLabel("Remote IP:"), 0, 0);
+    relayCheck = new QCheckBox("Relay through server", connGroup);
+    relayCheck->setToolTip("Route call through the chat server (for NAT traversal)");
+    connLayout->addWidget(relayCheck, 0, 0, 1, 2);
+
+    connLayout->addWidget(new QLabel("Remote IP:"), 1, 0);
     ipEdit = new QLineEdit(connGroup);
     ipEdit->setText("127.0.0.1");
-    connLayout->addWidget(ipEdit, 0, 1);
+    connLayout->addWidget(ipEdit, 1, 1);
 
-    connLayout->addWidget(new QLabel("Remote Port:"), 1, 0);
+    connLayout->addWidget(new QLabel("Remote Port:"), 2, 0);
     portSpin = new QSpinBox(connGroup);
     portSpin->setRange(1024, 65535);
     portSpin->setValue(50000);
-    connLayout->addWidget(portSpin, 1, 1);
+    connLayout->addWidget(portSpin, 2, 1);
 
-    connLayout->addWidget(new QLabel("Local Port:"), 2, 0);
+    connLayout->addWidget(new QLabel("Local Port:"), 3, 0);
     localPortSpin = new QSpinBox(connGroup);
     localPortSpin->setRange(1024, 65535);
     localPortSpin->setValue(50001);
-    connLayout->addWidget(localPortSpin, 2, 1);
+    connLayout->addWidget(localPortSpin, 3, 1);
 
     layout->addWidget(connGroup);
 
@@ -203,6 +217,31 @@ void AudioCallDialog::setupConnections() {
     connect(callButton, &QPushButton::clicked, this, &AudioCallDialog::onStartCall);
     connect(listenButton, &QPushButton::clicked, this, &AudioCallDialog::onStartListening);
     connect(stopButton, &QPushButton::clicked, this, &AudioCallDialog::onStopCall);
+
+    // Relay checkbox: auto-fill from backend connection
+    connect(relayCheck, &QCheckBox::toggled, this, [this](bool checked) {
+        if (checked && backend && backend->isConnected) {
+            ipEdit->setText(backend->serverHost);
+            portSpin->setValue(backend->serverPort);
+            ipEdit->setEnabled(false);
+            portSpin->setEnabled(false);
+            localPortSpin->setEnabled(false);
+            listenButton->setVisible(false);
+        } else {
+            ipEdit->setEnabled(true);
+            portSpin->setEnabled(true);
+            localPortSpin->setEnabled(true);
+            listenButton->setVisible(true);
+        }
+    });
+
+    // Enable relay checkbox only when connected to a remote server
+    if (backend && backend->isConnected && !backend->serverHost.isEmpty()) {
+        relayCheck->setEnabled(true);
+    } else {
+        relayCheck->setEnabled(false);
+        relayCheck->setToolTip("Connect to a server first to use relay mode");
+    }
 }
 
 void AudioCallDialog::refreshAudioDevices() {

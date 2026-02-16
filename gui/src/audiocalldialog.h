@@ -21,7 +21,10 @@
 #include <QLabel>
 #include <QTextEdit>
 #include <QGroupBox>
+#include <QCheckBox>
 #include "audiocallmanager.h"
+
+class Backend;
 
 /**
  * @class AudioCallDialog
@@ -46,7 +49,8 @@ public:
      * @param audioManager Manager for audio call processes
      * @param parent Parent widget (optional)
      */
-    explicit AudioCallDialog(AudioCallManager *audioManager, QWidget *parent = nullptr,
+    explicit AudioCallDialog(AudioCallManager *audioManager, Backend *backend = nullptr,
+                             QWidget *parent = nullptr,
                              const QString &roomKeyHex = QString());
 
 private slots:
@@ -145,6 +149,10 @@ private:
 
     // Manager
     AudioCallManager *audioManager;  ///< Audio call process manager
+    Backend *backend;                ///< Backend for relay connection info
+
+    // Relay
+    QCheckBox *relayCheck;           ///< Relay through server checkbox
 
     // Encryption key widgets
     QGroupBox *keyGroup;             ///< Key section group box

@@ -204,6 +204,66 @@ bool VideoCallManager::startListening(quint16 localPort, const QString &key,
     return true;
 }
 
+bool VideoCallManager::startRelay(const QString &serverIp, quint16 serverPort,
+                                   const QString &room, const QString &name, const QString &key,
+                                   const QString &quality, bool adaptive,
+                                   int width, int height, int fps, int bitrate,
+                                   const QString &camera, int audioInput, int audioOutput,
+                                   bool noVideo, bool noAudio) {
+    if (key.isEmpty()) {
+        emit error("Key is required to start a relay call");
+        return false;
+    }
+
+    stopCall();
+
+    QString appPath = findVideoCallApp();
+    if (appPath.isEmpty()) {
+        emit error("Video call application not found");
+        return false;
+    }
+
+    callProcess = new QProcess(this);
+    connect(callProcess, &QProcess::readyReadStandardOutput, this, &VideoCallManager::onProcessOutput);
+    connect(callProcess, &QProcess::readyReadStandardError, this, &VideoCallManager::onProcessError);
+    connect(callProcess, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
+            this, &VideoCallManager::onProcessFinished);
+
+    QStringList args;
+    args << "relay" << serverIp << QString::number(serverPort)
+         << "--room" << room << "--name" << name;
+    args << buildArgs(quality, adaptive, width, height, fps, bitrate,
+                      camera, audioInput, audioOutput, noVideo, noAudio);
+    if (!identityFilePath.isEmpty() && QFile::exists(identityFilePath)) {
+        args << "--identity-file" << identityFilePath;
+    }
+
+    callProcess->start(appPath, args);
+
+    if (!callProcess->waitForStarted(3000)) {
+        emit error("Failed to start video relay call");
+        delete callProcess;
+        callProcess = nullptr;
+        return false;
+    }
+
+    // SECURITY: Pass key via stdin
+    QByteArray keyData = key.toUtf8() + "\n";
+    qint64 written = callProcess->write(keyData);
+    if (written == -1) {
+        emit error("Failed to send key to video relay process");
+        callProcess->kill();
+        callProcess->waitForFinished(1000);
+        delete callProcess;
+        callProcess = nullptr;
+        return false;
+    }
+    callProcess->closeWriteChannel();
+
+    emit callStarted();
+    return true;
+}
+
 void VideoCallManager::stopCall() {
     if (callProcess && callProcess->state() == QProcess::Running) {
         callProcess->terminate();

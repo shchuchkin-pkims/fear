@@ -26,6 +26,8 @@
 #include <QGroupBox>
 #include "videocallmanager.h"
 
+class Backend;
+
 /**
  * @class VideoCallDialog
  * @brief User interface for encrypted video calling
@@ -34,7 +36,8 @@ class VideoCallDialog : public QDialog {
     Q_OBJECT
 
 public:
-    explicit VideoCallDialog(VideoCallManager *videoManager, QWidget *parent = nullptr,
+    explicit VideoCallDialog(VideoCallManager *videoManager, Backend *backend = nullptr,
+                             QWidget *parent = nullptr,
                              const QString &roomKeyHex = QString());
 
 private slots:
@@ -56,6 +59,10 @@ private:
     QString findVideoCallApp();
 
     VideoCallManager *videoManager;
+    Backend *backend;
+
+    // Relay
+    QCheckBox *relayCheck;
 
     // Key section
     QGroupBox *keyGroupBox;

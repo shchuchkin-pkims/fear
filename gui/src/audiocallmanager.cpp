@@ -205,6 +205,71 @@ bool AudioCallManager::startListening(quint16 localPort, const QString &key,
     return true;
 }
 
+bool AudioCallManager::startRelay(const QString &serverIp, quint16 serverPort,
+                                   const QString &room, const QString &name, const QString &key,
+                                   int inputDevice, int outputDevice) {
+    if (key.isEmpty()) {
+        emit error("Key is required to start a relay call");
+        return false;
+    }
+
+    stopCall();
+
+    QString audioAppPath = findAudioCallApp();
+    if (audioAppPath.isEmpty()) {
+        emit error("Audio call application not found");
+        return false;
+    }
+
+    callProcess = new QProcess(this);
+    connect(callProcess, &QProcess::readyReadStandardOutput, this, &AudioCallManager::onProcessOutput);
+    connect(callProcess, &QProcess::readyReadStandardError, this, &AudioCallManager::onProcessError);
+    connect(callProcess, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
+            this, &AudioCallManager::onProcessFinished);
+
+    QStringList args;
+    args << "relay" << serverIp << QString::number(serverPort)
+         << "--room" << room << "--name" << name;
+
+    if (!identityFilePath.isEmpty() && QFile::exists(identityFilePath)) {
+        args << "--identity-file" << identityFilePath;
+    }
+
+    if (inputDevice >= 0) {
+        args << QString::number(inputDevice);
+        if (outputDevice >= 0) {
+            args << QString::number(outputDevice);
+        }
+    } else if (outputDevice >= 0) {
+        args << "-1" << QString::number(outputDevice);
+    }
+
+    callProcess->start(audioAppPath, args);
+
+    if (!callProcess->waitForStarted(3000)) {
+        emit error("Failed to start audio relay call");
+        delete callProcess;
+        callProcess = nullptr;
+        return false;
+    }
+
+    // SECURITY: Pass key via stdin
+    QByteArray keyData = key.toUtf8() + "\n";
+    qint64 written = callProcess->write(keyData);
+    if (written == -1) {
+        emit error("Failed to send key to audio relay process");
+        callProcess->kill();
+        callProcess->waitForFinished(1000);
+        delete callProcess;
+        callProcess = nullptr;
+        return false;
+    }
+    callProcess->closeWriteChannel();
+
+    emit callStarted();
+    return true;
+}
+
 void AudioCallManager::stopCall() {
     if (callProcess && callProcess->state() == QProcess::Running) {
         callProcess->terminate();

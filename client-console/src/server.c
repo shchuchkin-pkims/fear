@@ -42,6 +42,9 @@ typedef struct {
     sock_t fd;              /**< Socket descriptor for this client */
     char room[MAX_ROOM];    /**< Room name (empty until first message) */
     char name[MAX_NAME];    /**< User name (empty until first message) */
+    struct sockaddr_in udp_addr; /**< UDP address for relay */
+    int udp_registered;     /**< Whether UDP relay address is set */
+    int is_media_relay;     /**< Whether this is a media relay connection (allows duplicate name) */
 } client_t;
 
 /**
@@ -203,7 +206,8 @@ static void send_user_list(client_t *clients, int nclients, const char *room) {
     int count = 0;
 
     for (int i = 0; i < nclients; i++) {
-        if (clients[i].room[0] != '\0' && strcmp(clients[i].room, room) == 0) {
+        if (clients[i].room[0] != '\0' && strcmp(clients[i].room, room) == 0
+            && !clients[i].is_media_relay) {
             size_t name_len = strlen(clients[i].name);
             if (offset + 2 + name_len < sizeof(user_list) - 100) {
                 wr_u16((uint8_t*)(user_list + offset), (uint16_t)name_len);
@@ -224,9 +228,10 @@ static void send_user_list(client_t *clients, int nclients, const char *room) {
     memcpy(payload + 2, user_list, offset);
     size_t payload_len = 2 + offset;
 
-    // Отправляем всем клиентам комнаты
+    // Отправляем всем клиентам комнаты (skip media relay connections)
     for (int i = 0; i < nclients; i++) {
-        if (clients[i].room[0] == '\0' || strcmp(clients[i].room, room) != 0) continue;
+        if (clients[i].room[0] == '\0' || strcmp(clients[i].room, room) != 0
+            || clients[i].is_media_relay) continue;
 
         // Формируем frame с MSG_TYPE_USER_LIST
         uint16_t room_len = (uint16_t)strlen(room);
@@ -286,7 +291,29 @@ void run_server(uint16_t port) {
     setlocale(LC_ALL, "");
 #endif
     sock_t listener = server_listen(port);
-    printf("[server] listening on 0.0.0.0:%u\n", port);
+    printf("[server] listening on 0.0.0.0:%u (TCP)\n", port);
+
+    /* Create UDP socket for relay, bound to same port */
+    sock_t udp_sock = (sock_t)socket(AF_INET, SOCK_DGRAM, 0);
+    if (udp_sock < 0) {
+        perror("UDP socket");
+        close_socket(listener);
+        return;
+    }
+    {
+        struct sockaddr_in udp_bind;
+        memset(&udp_bind, 0, sizeof(udp_bind));
+        udp_bind.sin_family = AF_INET;
+        udp_bind.sin_addr.s_addr = htonl(INADDR_ANY);
+        udp_bind.sin_port = htons(port);
+        if (bind(udp_sock, (struct sockaddr *)&udp_bind, sizeof(udp_bind)) < 0) {
+            perror("UDP bind");
+            close_socket(udp_sock);
+            close_socket(listener);
+            return;
+        }
+    }
+    printf("[server] UDP relay on port %u\n", port);
 
     client_t clients[MAX_CLIENTS];
     int nclients = 0;
@@ -294,13 +321,104 @@ void run_server(uint16_t port) {
         fd_set rfds;
         FD_ZERO(&rfds);
         FD_SET(listener, &rfds);
+        FD_SET(udp_sock, &rfds);
         sock_t maxfd = listener;
+        if (udp_sock > maxfd) maxfd = udp_sock;
         for (int i = 0; i < nclients; i++) {
             FD_SET(clients[i].fd, &rfds);
             if (clients[i].fd > maxfd) maxfd = clients[i].fd;
         }
         int r = select((int)(maxfd + 1), &rfds, NULL, NULL, NULL);
         if (r < 0) { perror("select"); break; }
+
+        /* Handle UDP relay */
+        if (FD_ISSET(udp_sock, &rfds)) {
+            uint8_t ubuf[65536];
+            struct sockaddr_in src;
+            socklen_t slen = sizeof(src);
+            int ulen = recvfrom(udp_sock, (char *)ubuf, sizeof(ubuf), 0,
+                                (struct sockaddr *)&src, &slen);
+            if (ulen > 0) {
+                if (ubuf[0] == UDP_REG_MAGIC && ulen >= 5) {
+                    /* Registration: [0xFE][2 room_len LE][room][2 name_len LE][name] */
+                    uint16_t reg_room_len = rd_u16(ubuf + 1);
+                    if (3 + reg_room_len + 2 <= (size_t)ulen) {
+                        uint16_t reg_name_len = rd_u16(ubuf + 3 + reg_room_len);
+                        if (3 + reg_room_len + 2 + reg_name_len <= (size_t)ulen) {
+                            char reg_room[MAX_ROOM], reg_name[MAX_NAME];
+                            size_t rl = reg_room_len < MAX_ROOM - 1 ? reg_room_len : MAX_ROOM - 1;
+                            size_t nl = reg_name_len < MAX_NAME - 1 ? reg_name_len : MAX_NAME - 1;
+                            memcpy(reg_room, ubuf + 3, rl);
+                            reg_room[rl] = '\0';
+                            memcpy(reg_name, ubuf + 3 + reg_room_len + 2, nl);
+                            reg_name[nl] = '\0';
+
+                            /* Find matching TCP client by room+name */
+                            for (int i = 0; i < nclients; i++) {
+                                if (clients[i].room[0] != '\0' && clients[i].name[0] != '\0' &&
+                                    strcmp(clients[i].room, reg_room) == 0 &&
+                                    strcmp(clients[i].name, reg_name) == 0) {
+                                    clients[i].udp_addr = src;
+                                    clients[i].udp_registered = 1;
+                                    printf("[server] UDP registered: %s@%s from %s:%u\n",
+                                           reg_name, reg_room,
+                                           inet_ntoa(src.sin_addr), ntohs(src.sin_port));
+                                    /* Send ACK back: [0xFD] — test UDP reachability */
+                                    {
+                                        uint8_t ack = 0xFD;
+                                        sendto(udp_sock, (const char *)&ack, 1, 0,
+                                               (struct sockaddr *)&src, sizeof(src));
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    /* Media relay: find sender by address, forward to other room members */
+                    int sender_idx = -1;
+                    for (int i = 0; i < nclients; i++) {
+                        if (clients[i].udp_registered &&
+                            clients[i].udp_addr.sin_addr.s_addr == src.sin_addr.s_addr &&
+                            clients[i].udp_addr.sin_port == src.sin_port) {
+                            sender_idx = i;
+                            break;
+                        }
+                    }
+                    if (sender_idx >= 0) {
+                        const char *sender_room = clients[sender_idx].room;
+                        int forwarded = 0;
+                        for (int i = 0; i < nclients; i++) {
+                            if (i == sender_idx) continue;
+                            if (!clients[i].udp_registered) continue;
+                            if (strcmp(clients[i].room, sender_room) != 0) continue;
+                            int sr = sendto(udp_sock, (const char *)ubuf, ulen, 0,
+                                   (struct sockaddr *)&clients[i].udp_addr,
+                                   sizeof(clients[i].udp_addr));
+                            if (sr > 0) forwarded++;
+                        }
+                        /* Log relay activity */
+                        static long relay_count = 0;
+                        relay_count++;
+                        if (relay_count <= 20 || relay_count % 500 == 0) {
+                            printf("[server] UDP relay #%ld: %s (type=0x%02x, %d bytes) -> %d peer(s)\n",
+                                   relay_count, clients[sender_idx].name,
+                                   ubuf[0], ulen, forwarded);
+                        }
+                    } else {
+                        /* Packet from unregistered UDP source */
+                        static int unreg_warn_count = 0;
+                        if (unreg_warn_count < 10) {
+                            printf("[server] UDP drop: unregistered %s:%u (type=0x%02x, %d bytes)\n",
+                                   inet_ntoa(src.sin_addr), ntohs(src.sin_port),
+                                   ubuf[0], ulen);
+                            unreg_warn_count++;
+                        }
+                    }
+                }
+            }
+        }
+
         if (FD_ISSET(listener, &rfds)) {
             struct sockaddr_in cli;
             socklen_t cl = sizeof(cli);
@@ -310,6 +428,8 @@ void run_server(uint16_t port) {
                     clients[nclients].fd = c;
                     clients[nclients].room[0] = '\0';
                     clients[nclients].name[0] = '\0';
+                    clients[nclients].udp_registered = 0;
+                    clients[nclients].is_media_relay = 0;
                     nclients++;
                     printf("[server] new connection (%d total)\n", nclients);
                 } else {
@@ -355,18 +475,25 @@ void run_server(uint16_t port) {
                 clients[i].room[rl] = '\0';
             }
             if (clients[i].name[0] == '\0') {
-                // Проверяем уникальность имени в той же комнате
+                // Check message type to detect media relay connections
+                uint16_t nonce_len_val = rd_u16(frame + 2 + room_len + 2 + name_len);
+                uint8_t msg_type = frame[2 + room_len + 2 + name_len + 2 + nonce_len_val];
+                int is_media = (msg_type == MSG_TYPE_MEDIA_RELAY);
+
+                // Проверяем уникальность имени в той же комнате (skip for media relay)
                 int name_exists = 0;
-                for (int j = 0; j < nclients; j++) {
-                    if (i == j) continue; // Пропускаем себя
-                    if (clients[j].name[0] != '\0' && clients[j].room[0] != '\0') {
-                        // Сравниваем имена и комнаты
-                        if (strncmp(clients[j].room, room, room_len) == 0 &&
-                            clients[j].room[room_len] == '\0' &&
-                            strncmp(clients[j].name, name, name_len) == 0 &&
-                            clients[j].name[name_len] == '\0') {
-                            name_exists = 1;
-                            break;
+                if (!is_media) {
+                    for (int j = 0; j < nclients; j++) {
+                        if (i == j) continue;
+                        if (clients[j].name[0] != '\0' && clients[j].room[0] != '\0' &&
+                            !clients[j].is_media_relay) {
+                            if (strncmp(clients[j].room, room, room_len) == 0 &&
+                                clients[j].room[room_len] == '\0' &&
+                                strncmp(clients[j].name, name, name_len) == 0 &&
+                                clients[j].name[name_len] == '\0') {
+                                name_exists = 1;
+                                break;
+                            }
                         }
                     }
                 }
@@ -386,16 +513,23 @@ void run_server(uint16_t port) {
                 size_t nl = name_len < MAX_NAME - 1 ? name_len : MAX_NAME - 1;
                 memcpy(clients[i].name, name, nl);
                 clients[i].name[nl] = '\0';
-                printf("[server] client registered: name='%s', room='%s'\n",
-                       clients[i].name, clients[i].room);
+                clients[i].is_media_relay = is_media;
 
-                // Отправляем обновленный список участников всем в комнате
-                send_user_list(clients, nclients, clients[i].room);
+                if (is_media) {
+                    printf("[server] media relay registered: name='%s', room='%s'\n",
+                           clients[i].name, clients[i].room);
+                } else {
+                    printf("[server] client registered: name='%s', room='%s'\n",
+                           clients[i].name, clients[i].room);
+                    // Отправляем обновленный список участников всем в комнате
+                    send_user_list(clients, nclients, clients[i].room);
+                }
             }
             broadcast(clients, &nclients, clients[i].room, frame, flen, clients[i].fd);
             free(frame);
         }
     }
+    close_socket(udp_sock);
     close_socket(listener);
 #ifdef _WIN32
     WSACleanup();

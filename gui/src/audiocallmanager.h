@@ -87,6 +87,21 @@ public:
                         int inputDevice = -1, int outputDevice = -1);
 
     /**
+     * @brief Starts a relay audio call through the server
+     * @param serverIp Server IP for UDP relay
+     * @param serverPort Server port for UDP relay
+     * @param room Room name for relay registration
+     * @param name User name for relay registration
+     * @param key Encryption key (64 hex chars)
+     * @param inputDevice Audio input device ID (-1 = default)
+     * @param outputDevice Audio output device ID (-1 = default)
+     * @return true if relay call started
+     */
+    bool startRelay(const QString &serverIp, quint16 serverPort,
+                    const QString &room, const QString &name, const QString &key,
+                    int inputDevice = -1, int outputDevice = -1);
+
+    /**
      * @brief Stops the active call or listening process
      *
      * Terminates the audio_call subprocess gracefully, or kills it

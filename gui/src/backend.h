@@ -58,6 +58,10 @@ public:
     QString identityFilePath;     ///< Path to Ed25519 identity key file
     bool identityAvailable;       ///< Whether identity key exists
     QString roomKeyHex;           ///< Room key as 64-char hex (for audio/video calls)
+    QString serverHost;           ///< Server host from last connection
+    int serverPort;               ///< Server port from last connection
+    QString currentRoom;          ///< Current room name
+    QString currentName;          ///< Current user name
 
     /**
      * @brief Sets the path to the CLI executable

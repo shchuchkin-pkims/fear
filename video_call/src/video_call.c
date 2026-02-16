@@ -35,6 +35,7 @@
 #  include <arpa/inet.h>
 #  include <sys/socket.h>
 #  include <sys/types.h>
+#  include <sys/time.h>
 #  include <pthread.h>
 #  define THREAD_RET void*
 #endif
@@ -139,6 +140,17 @@ typedef struct VideoCall {
     int peer_verified;           /* 0=unknown, 1=verified, -1=conflict */
     char known_keys_path[512];
 
+    /* Relay mode */
+    int relay_mode;
+    char relay_room[256];
+    char relay_name[256];
+    socket_t tcp_sock;      /* TCP socket for relay (0 = unused) */
+#ifdef _WIN32
+    CRITICAL_SECTION tcp_send_lock;
+#else
+    pthread_mutex_t tcp_send_lock;
+#endif
+
     /* Threads */
 #ifdef _WIN32
     HANDLE th_vsend;
@@ -170,6 +182,205 @@ typedef struct VideoCall {
     pthread_mutex_t disp_lock;
 #endif
 } VideoCall;
+
+/* ===== UDP relay registration ===== */
+
+static int send_udp_registration(VideoCall *vc) {
+    /* Packet: [0xFE][2 room_len LE][room][2 name_len LE][name] */
+    uint16_t room_len = (uint16_t)strlen(vc->relay_room);
+    uint16_t name_len = (uint16_t)strlen(vc->relay_name);
+    size_t pkt_len = 1 + 2 + room_len + 2 + name_len;
+    uint8_t pkt[1 + 2 + 256 + 2 + 256];
+
+    pkt[0] = 0xFE;
+    pkt[1] = (uint8_t)(room_len & 0xFF);
+    pkt[2] = (uint8_t)((room_len >> 8) & 0xFF);
+    memcpy(pkt + 3, vc->relay_room, room_len);
+    pkt[3 + room_len] = (uint8_t)(name_len & 0xFF);
+    pkt[3 + room_len + 1] = (uint8_t)((name_len >> 8) & 0xFF);
+    memcpy(pkt + 3 + room_len + 2, vc->relay_name, name_len);
+
+    int r = sendto(vc->sock, (const char *)pkt, (int)pkt_len, 0,
+                   (struct sockaddr *)&vc->peer, sizeof(vc->peer));
+    return (r == (int)pkt_len) ? 0 : -1;
+}
+
+/* ===== TCP relay helpers ===== */
+
+#define MSG_TYPE_MEDIA_RELAY 17
+#define TCP_NONCE_LEN 12
+
+static int tcp_send_all(socket_t fd, const void *buf, size_t len) {
+    const uint8_t *p = (const uint8_t *)buf;
+    size_t sent = 0;
+    while (sent < len) {
+        int n = send(fd, (const char *)(p + sent), (int)(len - sent), 0);
+        if (n <= 0) return -1;
+        sent += (size_t)n;
+    }
+    return 0;
+}
+
+static int tcp_recv_all(socket_t fd, void *buf, size_t len) {
+    uint8_t *p = (uint8_t *)buf;
+    size_t got = 0;
+    while (got < len) {
+        int n = recv(fd, (char *)(p + got), (int)(len - got), 0);
+        if (n <= 0) return -1;
+        got += (size_t)n;
+    }
+    return 0;
+}
+
+static int tcp_relay_connect(VideoCall *vc, const char *ip, uint16_t port) {
+    vc->tcp_sock = (socket_t)socket(AF_INET, SOCK_STREAM, 0);
+    if (vc->tcp_sock == (socket_t)SOCK_ERR) {
+        fprintf(stderr, "TCP socket() failed\n");
+        return -1;
+    }
+    struct sockaddr_in srv;
+    memset(&srv, 0, sizeof(srv));
+    srv.sin_family = AF_INET;
+    srv.sin_port = htons(port);
+    if (inet_pton(AF_INET, ip, &srv.sin_addr) != 1) {
+        fprintf(stderr, "TCP inet_pton failed for %s\n", ip);
+        CLOSESOCK(vc->tcp_sock); vc->tcp_sock = 0;
+        return -1;
+    }
+    if (connect(vc->tcp_sock, (struct sockaddr *)&srv, sizeof(srv)) < 0) {
+        fprintf(stderr, "TCP connect failed to %s:%u\n", ip, port);
+        CLOSESOCK(vc->tcp_sock); vc->tcp_sock = 0;
+        return -1;
+    }
+    printf("TCP relay connected to %s:%u\n", ip, port);
+    return 0;
+}
+
+static int tcp_relay_register(VideoCall *vc) {
+    /* Send first message to register room+name with server */
+    uint16_t room_len = (uint16_t)strlen(vc->relay_room);
+    uint16_t name_len = (uint16_t)strlen(vc->relay_name);
+    size_t frame_len = 2 + room_len + 2 + name_len + 2 + TCP_NONCE_LEN + 1 + 4 + 1;
+    uint8_t *frame = (uint8_t *)calloc(1, frame_len);
+    if (!frame) return -1;
+
+    uint8_t *w = frame;
+    w[0] = room_len & 0xFF; w[1] = (room_len >> 8) & 0xFF; w += 2;
+    memcpy(w, vc->relay_room, room_len); w += room_len;
+    w[0] = name_len & 0xFF; w[1] = (name_len >> 8) & 0xFF; w += 2;
+    memcpy(w, vc->relay_name, name_len); w += name_len;
+    w[0] = TCP_NONCE_LEN; w[1] = 0; w += 2;
+    memset(w, 0, TCP_NONCE_LEN); w += TCP_NONCE_LEN;
+    *w++ = MSG_TYPE_MEDIA_RELAY; /* media relay registration */
+    w[0] = 1; w[1] = 0; w[2] = 0; w[3] = 0; w += 4; /* clen=1 */
+    *w++ = 0; /* dummy byte */
+
+    int ret = tcp_send_all(vc->tcp_sock, frame, frame_len);
+    free(frame);
+    if (ret == 0) printf("TCP relay registered: room=%s name=%s\n",
+                         vc->relay_room, vc->relay_name);
+    return ret;
+}
+
+static int tcp_relay_send_media(VideoCall *vc, const uint8_t *media, int media_len) {
+    uint16_t room_len = (uint16_t)strlen(vc->relay_room);
+    uint16_t name_len = (uint16_t)strlen(vc->relay_name);
+    size_t frame_len = 2 + room_len + 2 + name_len + 2 + TCP_NONCE_LEN + 1 + 4 + (size_t)media_len;
+    uint8_t *frame = (uint8_t *)malloc(frame_len);
+    if (!frame) return -1;
+
+    uint8_t *w = frame;
+    w[0] = room_len & 0xFF; w[1] = (room_len >> 8) & 0xFF; w += 2;
+    memcpy(w, vc->relay_room, room_len); w += room_len;
+    w[0] = name_len & 0xFF; w[1] = (name_len >> 8) & 0xFF; w += 2;
+    memcpy(w, vc->relay_name, name_len); w += name_len;
+    w[0] = TCP_NONCE_LEN; w[1] = 0; w += 2;
+    memset(w, 0, TCP_NONCE_LEN); w += TCP_NONCE_LEN;
+    *w++ = MSG_TYPE_MEDIA_RELAY;
+    w[0] = (uint8_t)(media_len & 0xFF);
+    w[1] = (uint8_t)((media_len >> 8) & 0xFF);
+    w[2] = (uint8_t)((media_len >> 16) & 0xFF);
+    w[3] = (uint8_t)((media_len >> 24) & 0xFF);
+    w += 4;
+    memcpy(w, media, media_len);
+
+#ifdef _WIN32
+    EnterCriticalSection(&vc->tcp_send_lock);
+#else
+    pthread_mutex_lock(&vc->tcp_send_lock);
+#endif
+    int ret = tcp_send_all(vc->tcp_sock, frame, frame_len);
+#ifdef _WIN32
+    LeaveCriticalSection(&vc->tcp_send_lock);
+#else
+    pthread_mutex_unlock(&vc->tcp_send_lock);
+#endif
+    free(frame);
+    return ret;
+}
+
+/* Read one TCP frame, return media payload size (0 = non-media skipped, -1 = error) */
+static int tcp_relay_recv_media(VideoCall *vc, uint8_t *out, int out_size) {
+    for (;;) {
+        uint8_t hdr2[2];
+        uint8_t skip[512];
+
+        /* room_len */
+        if (tcp_recv_all(vc->tcp_sock, hdr2, 2) < 0) return -1;
+        uint16_t room_len = (uint16_t)(hdr2[0] | (hdr2[1] << 8));
+        if (room_len > 255) return -1;
+        if (tcp_recv_all(vc->tcp_sock, skip, room_len) < 0) return -1;
+
+        /* name_len + name */
+        if (tcp_recv_all(vc->tcp_sock, hdr2, 2) < 0) return -1;
+        uint16_t name_len = (uint16_t)(hdr2[0] | (hdr2[1] << 8));
+        if (name_len > 255) return -1;
+        if (tcp_recv_all(vc->tcp_sock, skip, name_len) < 0) return -1;
+
+        /* nonce_len + nonce */
+        if (tcp_recv_all(vc->tcp_sock, hdr2, 2) < 0) return -1;
+        uint16_t nonce_len = (uint16_t)(hdr2[0] | (hdr2[1] << 8));
+        if (nonce_len > sizeof(skip)) return -1;
+        if (nonce_len > 0 && tcp_recv_all(vc->tcp_sock, skip, nonce_len) < 0) return -1;
+
+        /* type */
+        uint8_t type;
+        if (tcp_recv_all(vc->tcp_sock, &type, 1) < 0) return -1;
+
+        /* clen */
+        uint8_t clenbuf[4];
+        if (tcp_recv_all(vc->tcp_sock, clenbuf, 4) < 0) return -1;
+        uint32_t clen = (uint32_t)(clenbuf[0] | (clenbuf[1] << 8) |
+                                    (clenbuf[2] << 16) | (clenbuf[3] << 24));
+
+        if (type == MSG_TYPE_MEDIA_RELAY && (int)clen <= out_size && clen > 0) {
+            if (tcp_recv_all(vc->tcp_sock, out, clen) < 0) return -1;
+            return (int)clen;
+        }
+
+        /* Skip non-media or oversized payload */
+        uint32_t remaining = clen;
+        while (remaining > 0) {
+            uint32_t chunk = remaining > sizeof(skip) ? sizeof(skip) : remaining;
+            if (tcp_recv_all(vc->tcp_sock, skip, chunk) < 0) return -1;
+            remaining -= chunk;
+        }
+        /* Loop to read next frame */
+    }
+}
+
+/* Unified send: TCP relay or UDP */
+static int vc_send_packet(VideoCall *vc, const uint8_t *data, int len) {
+    if (vc->relay_mode && vc->tcp_sock) {
+        return tcp_relay_send_media(vc, data, len);
+    }
+    if (vc->peer_set) {
+        int r = sendto(vc->sock, (const char *)data, len, 0,
+                       (struct sockaddr *)&vc->peer, sizeof(vc->peer));
+        return (r > 0) ? 0 : -1;
+    }
+    return -1;
+}
 
 /* ===== Key derivation ===== */
 
@@ -234,13 +445,16 @@ static int send_hello(VideoCall *vc) {
         }
     }
 
-    int r = sendto(vc->sock, (const char *)pkt, pkt_len, 0,
-                   (struct sockaddr *)&vc->peer, sizeof(vc->peer));
-    return (r == pkt_len) ? 0 : -1;
+    return vc_send_packet(vc, pkt, pkt_len);
 }
 
 static int handle_hello(VideoCall *vc, const uint8_t *buf, size_t len) {
-    if (len < HELLO_SIZE_AUDIO) return -1;
+    if (len < HELLO_SIZE_AUDIO) {
+        fprintf(stderr, "[handle_hello] REJECTED: len=%zu < HELLO_SIZE_AUDIO=%d\n",
+                len, HELLO_SIZE_AUDIO);
+        return -1;
+    }
+    fprintf(stderr, "[handle_hello] OK: len=%zu, setting remote_prefix_ready=1\n", len);
 
     /* Detect if peer reconnected (different nonce prefix = new session) */
     int prefix_changed = (atomic_load(&vc->remote_prefix_ready) &&
@@ -584,9 +798,7 @@ static THREAD_RET th_vsend_func(void *arg) {
                 continue;
             }
 
-            if (vc->peer_set) {
-                sendto(vc->sock, (const char *)enc_buf, (int)enc_len, 0,
-                       (struct sockaddr *)&vc->peer, sizeof(vc->peer));
+            if (vc_send_packet(vc, enc_buf, (int)enc_len) == 0) {
                 quality_record_sent(&vc->quality);
             }
         }
@@ -600,9 +812,8 @@ static THREAD_RET th_vsend_func(void *arg) {
             quality_build_stats(&vc->quality, &sp);
             uint64_t seq = atomic_fetch_add(&vc->video_seq_tx, 1);
             size_t enc_len = 0;
-            if (encrypt_stats(vc, &sp, enc_buf, &enc_len, seq) == 0 && vc->peer_set) {
-                sendto(vc->sock, (const char *)enc_buf, (int)enc_len, 0,
-                       (struct sockaddr *)&vc->peer, sizeof(vc->peer));
+            if (encrypt_stats(vc, &sp, enc_buf, &enc_len, seq) == 0) {
+                vc_send_packet(vc, enc_buf, (int)enc_len);
             }
         }
 
@@ -633,10 +844,14 @@ static THREAD_RET th_asend_func(void *arg) {
     int waited = 0;
     while (atomic_load(&vc->running)) {
         if (atomic_load(&vc->remote_prefix_ready)) break;
-        if (waited == 0 && vc->peer_set) send_hello(vc);
+        if (waited == 0 && (vc->peer_set || vc->tcp_sock)) send_hello(vc);
         waited++;
         msleep(50);
-        if (waited % 20 == 0 && vc->peer_set) send_hello(vc);
+        if (waited % 20 == 0 && (vc->peer_set || vc->tcp_sock)) {
+            /* Re-send UDP relay registration periodically (only for UDP relay) */
+            if (vc->relay_mode && !vc->tcp_sock) send_udp_registration(vc);
+            send_hello(vc);
+        }
     }
 
     if (!vc->audio_enabled) {
@@ -671,10 +886,7 @@ static THREAD_RET th_asend_func(void *arg) {
             continue;
         }
 
-        if (vc->peer_set) {
-            sendto(vc->sock, (const char *)packet, (int)pkt_len, 0,
-                   (struct sockaddr *)&vc->peer, sizeof(vc->peer));
-        }
+        vc_send_packet(vc, packet, (int)pkt_len);
     }
 
 #ifdef _WIN32
@@ -708,19 +920,43 @@ static THREAD_RET th_recv_func(void *arg) {
     }
 
     while (atomic_load(&vc->running)) {
-        struct sockaddr_in src;
-#ifdef _WIN32
-        int slen = sizeof(src);
-#else
-        socklen_t slen = sizeof(src);
-#endif
-        int n = recvfrom(vc->sock, (char *)rbuf, MAX_PACKET_SIZE, 0,
-                         (struct sockaddr *)&src, &slen);
-        if (n <= 0) { msleep(2); continue; }
+        int n;
 
-        if (!vc->peer_set) {
-            vc->peer = src;
-            vc->peer_set = 1;
+        if (vc->relay_mode && vc->tcp_sock) {
+            /* TCP relay: read media frame from server */
+            n = tcp_relay_recv_media(vc, rbuf, MAX_PACKET_SIZE);
+            if (n < 0) {
+                fprintf(stderr, "[relay] TCP connection lost\n");
+                atomic_store(&vc->running, 0);
+                break;
+            }
+            if (n == 0) continue; /* non-media message, skip */
+        } else {
+            /* UDP: direct or UDP relay */
+            struct sockaddr_in src;
+#ifdef _WIN32
+            int slen = sizeof(src);
+#else
+            socklen_t slen = sizeof(src);
+#endif
+            n = recvfrom(vc->sock, (char *)rbuf, MAX_PACKET_SIZE, 0,
+                         (struct sockaddr *)&src, &slen);
+            if (n <= 0) {
+                if (vc->relay_mode) {
+                    static long timeout_count = 0;
+                    timeout_count++;
+                    if (timeout_count <= 5 || timeout_count % 10 == 0) {
+                        fprintf(stderr, "[relay-recv] timeout #%ld\n", timeout_count);
+                    }
+                } else {
+                    msleep(2);
+                }
+                continue;
+            }
+            if (!vc->peer_set && !vc->relay_mode) {
+                vc->peer = src;
+                vc->peer_set = 1;
+            }
         }
 
         uint8_t pkt_type = rbuf[0];
@@ -728,7 +964,7 @@ static THREAD_RET th_recv_func(void *arg) {
         /* HELLO handshake */
         if (pkt_type == PKT_TYPE_HELLO) {
             handle_hello(vc, rbuf, (size_t)n);
-            if (vc->peer_set) send_hello(vc);
+            if (vc->peer_set || vc->tcp_sock) send_hello(vc);
             continue;
         }
 
@@ -1050,14 +1286,17 @@ static void video_call_stop(VideoCall *vc) {
     video_frag_receiver_free(&vc->frag_recv);
     pcmring_free(&vc->out_ring);
 
+    if (vc->tcp_sock) CLOSESOCK(vc->tcp_sock);
     if (vc->sock) CLOSESOCK(vc->sock);
     free(vc->disp_yuv);
     free(vc->local_yuv);
 
 #ifdef _WIN32
     DeleteCriticalSection(&vc->disp_lock);
+    if (vc->tcp_sock) DeleteCriticalSection(&vc->tcp_send_lock);
 #else
     pthread_mutex_destroy(&vc->disp_lock);
+    if (vc->relay_mode) pthread_mutex_destroy(&vc->tcp_send_lock);
 #endif
 
     /* Secure wipe keys */
@@ -1142,6 +1381,7 @@ static void print_usage(const char *argv0) {
         "  %s listdevices\n"
         "  %s call <ip> <port> [options] [local_port]\n"
         "  %s listen <port> [options]\n"
+        "  %s relay <ip> <port> --room ROOM --name NAME [options]\n"
         "  %s hub <port>\n"
         "\n"
         "Options:\n"
@@ -1158,9 +1398,11 @@ static void print_usage(const char *argv0) {
         "  --no-video            Disable video (audio only)\n"
         "  --no-audio            Disable audio (video only)\n"
         "  --no-camera           No local camera (receive-only video)\n"
+        "  --room ROOM           Room name (relay mode)\n"
+        "  --name NAME           User name (relay mode)\n"
         "\n"
         "Key input: --key-file > stdin > deprecated CLI arg\n",
-        argv0, argv0, argv0, argv0, argv0);
+        argv0, argv0, argv0, argv0, argv0, argv0);
 }
 
 typedef struct {
@@ -1174,6 +1416,8 @@ typedef struct {
     uint16_t local_port;
     const char *identity_file;
     int no_sign;
+    const char *relay_room;
+    const char *relay_name;
 } CallOptions;
 
 static void options_init(CallOptions *opts) {
@@ -1223,6 +1467,10 @@ static int parse_options(int argc, char **argv, int start_idx, CallOptions *opts
             opts->identity_file = argv[++i];
         } else if (strcmp(argv[i], "--no-sign") == 0) {
             opts->no_sign = 1;
+        } else if (strcmp(argv[i], "--room") == 0 && i + 1 < argc) {
+            opts->relay_room = argv[++i];
+        } else if (strcmp(argv[i], "--name") == 0 && i + 1 < argc) {
+            opts->relay_name = argv[++i];
         } else {
             /* Treat as local port if numeric */
             char *endptr;
@@ -1367,6 +1615,7 @@ static int start_video_call(const char *remote_ip, uint16_t remote_port,
     }
 
     vc->peer_set = 0;
+    vc->relay_mode = 0;
     if (remote_ip && remote_port != 0) {
         memset(&vc->peer, 0, sizeof(vc->peer));
         vc->peer.sin_family = AF_INET;
@@ -1376,6 +1625,34 @@ static int start_video_call(const char *remote_ip, uint16_t remote_port,
             CLOSESOCK(vc->sock); pcmring_free(&vc->out_ring); free(vc); SDL_Quit(); return -1;
         }
         vc->peer_set = 1;
+    }
+
+    /* Relay mode: if room+name provided, connect via TCP to server */
+    if (opts->relay_room && opts->relay_name) {
+        vc->relay_mode = 1;
+        strncpy(vc->relay_room, opts->relay_room, sizeof(vc->relay_room) - 1);
+        vc->relay_room[sizeof(vc->relay_room) - 1] = '\0';
+        strncpy(vc->relay_name, opts->relay_name, sizeof(vc->relay_name) - 1);
+        vc->relay_name[sizeof(vc->relay_name) - 1] = '\0';
+
+        /* TCP relay: connect to server and register */
+        if (remote_ip && remote_port != 0) {
+#ifdef _WIN32
+            InitializeCriticalSection(&vc->tcp_send_lock);
+#else
+            pthread_mutex_init(&vc->tcp_send_lock, NULL);
+#endif
+            if (tcp_relay_connect(vc, remote_ip, remote_port) != 0) {
+                CLOSESOCK(vc->sock); pcmring_free(&vc->out_ring); free(vc); SDL_Quit(); return -1;
+            }
+            if (tcp_relay_register(vc) != 0) {
+                fprintf(stderr, "TCP relay registration failed\n");
+                CLOSESOCK(vc->tcp_sock); CLOSESOCK(vc->sock);
+                pcmring_free(&vc->out_ring); free(vc); SDL_Quit(); return -1;
+            }
+            /* Set peer_set=1 so send guards pass (actual routing goes through TCP) */
+            vc->peer_set = 1;
+        }
     }
 
     /* Initialize audio */
@@ -1607,6 +1884,26 @@ int main(int argc, char **argv) {
         parse_options(argc, argv, 3, &opts);
 
         return start_video_call(NULL, 0, &opts);
+    }
+
+    if (strcmp(argv[1], "relay") == 0) {
+        if (argc < 4) {
+            fprintf(stderr, "Usage: %s relay <ip> <port> --room ROOM --name NAME [options]\n", argv[0]);
+            return 1;
+        }
+        const char *ip = argv[2];
+        uint16_t rport = (uint16_t)atoi(argv[3]);
+
+        CallOptions opts;
+        options_init(&opts);
+        parse_options(argc, argv, 4, &opts);
+
+        if (!opts.relay_room || !opts.relay_name) {
+            fprintf(stderr, "Error: --room and --name are required for relay mode\n");
+            return 1;
+        }
+
+        return start_video_call(ip, rport, &opts);
     }
 
     fprintf(stderr, "Unknown command: %s\n", argv[1]);

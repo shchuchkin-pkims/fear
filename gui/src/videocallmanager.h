@@ -79,6 +79,33 @@ public:
                         bool noVideo = false, bool noAudio = false);
 
     /**
+     * @brief Starts a relay video call through the server
+     * @param serverIp Server IP for UDP relay
+     * @param serverPort Server port for UDP relay
+     * @param room Room name for relay registration
+     * @param name User name for relay registration
+     * @param key Encryption key (64 hex chars)
+     * @param quality Quality preset
+     * @param adaptive Enable adaptive quality
+     * @param width Custom width
+     * @param height Custom height
+     * @param fps Custom FPS
+     * @param bitrate Custom bitrate in kbps
+     * @param camera Camera device path
+     * @param audioInput Audio input device ID
+     * @param audioOutput Audio output device ID
+     * @param noVideo Disable video
+     * @param noAudio Disable audio
+     * @return true if relay call started
+     */
+    bool startRelay(const QString &serverIp, quint16 serverPort,
+                    const QString &room, const QString &name, const QString &key,
+                    const QString &quality = "medium", bool adaptive = true,
+                    int width = 0, int height = 0, int fps = 0, int bitrate = 0,
+                    const QString &camera = QString(), int audioInput = -1, int audioOutput = -1,
+                    bool noVideo = false, bool noAudio = false);
+
+    /**
      * @brief Stops the active call or listening process
      */
     void stopCall();
