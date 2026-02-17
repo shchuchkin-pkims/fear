@@ -15,6 +15,7 @@
 #include <QFile>
 #include <QFileInfo>
 #include <QProcess>
+#include <QSettings>
 
 AudioCallDialog::AudioCallDialog(AudioCallManager *audioManager, Backend *backend,
                                  QWidget *parent, const QString &roomKeyHex)
@@ -33,6 +34,29 @@ AudioCallDialog::AudioCallDialog(AudioCallManager *audioManager, Backend *backen
 
     // Load audio devices list when dialog opens
     refreshAudioDevices();
+
+    // Pre-select defaults from settings
+    QSettings settings("fear-messenger", "fear-gui");
+
+    QString audioIn = settings.value("audio/inputDevice", "").toString();
+    if (!audioIn.isEmpty() && audioIn != "System default") {
+        for (int i = 0; i < inputDeviceCombo->count(); i++) {
+            if (inputDeviceCombo->itemText(i) == audioIn) {
+                inputDeviceCombo->setCurrentIndex(i);
+                break;
+            }
+        }
+    }
+
+    QString audioOut = settings.value("audio/outputDevice", "").toString();
+    if (!audioOut.isEmpty() && audioOut != "System default") {
+        for (int i = 0; i < outputDeviceCombo->count(); i++) {
+            if (outputDeviceCombo->itemText(i) == audioOut) {
+                outputDeviceCombo->setCurrentIndex(i);
+                break;
+            }
+        }
+    }
 }
 
 void AudioCallDialog::onGenerateKey() {

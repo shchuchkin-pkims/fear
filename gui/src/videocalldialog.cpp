@@ -34,13 +34,41 @@ VideoCallDialog::VideoCallDialog(VideoCallManager *videoManager, Backend *backen
 
     refreshDevices();
 
-    // Pre-select default camera from settings
+    // Pre-select defaults from settings
     QSettings settings("fear-messenger", "fear-gui");
+
     QString defaultCamera = settings.value("video/defaultCamera", "").toString();
     if (!defaultCamera.isEmpty()) {
         for (int i = 0; i < cameraCombo->count(); i++) {
             if (cameraCombo->itemData(i).toString() == defaultCamera) {
                 cameraCombo->setCurrentIndex(i);
+                break;
+            }
+        }
+    }
+
+    QString quality = settings.value("video/quality", "medium").toString();
+    int qIdx = 1; // default medium
+    if (quality == "low") qIdx = 0;
+    else if (quality == "medium") qIdx = 1;
+    else if (quality == "high") qIdx = 2;
+    qualityCombo->setCurrentIndex(qIdx);
+
+    QString audioIn = settings.value("audio/inputDevice", "").toString();
+    if (!audioIn.isEmpty() && audioIn != "System default") {
+        for (int i = 0; i < inputDeviceCombo->count(); i++) {
+            if (inputDeviceCombo->itemText(i) == audioIn) {
+                inputDeviceCombo->setCurrentIndex(i);
+                break;
+            }
+        }
+    }
+
+    QString audioOut = settings.value("audio/outputDevice", "").toString();
+    if (!audioOut.isEmpty() && audioOut != "System default") {
+        for (int i = 0; i < outputDeviceCombo->count(); i++) {
+            if (outputDeviceCombo->itemText(i) == audioOut) {
+                outputDeviceCombo->setCurrentIndex(i);
                 break;
             }
         }

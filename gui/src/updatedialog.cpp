@@ -14,6 +14,7 @@
 #include <QTextCursor>
 #include <QRegularExpression>
 #include <QDebug>
+#include <QTimer>
 
 UpdateDialog::UpdateDialog(QWidget *parent, const QString &cliPath)
     : QDialog(parent), m_cliPath(cliPath) {
@@ -30,34 +31,33 @@ UpdateDialog::UpdateDialog(QWidget *parent, const QString &cliPath)
     // Text field for version information
     m_versionText = new QTextEdit(this);
     m_versionText->setReadOnly(true);
-    m_versionText->setPlaceholderText("Click 'Check Version' to get version information...");
     layout->addWidget(m_versionText);
 
     // Status
-    m_statusLabel = new QLabel("Ready to check version", this);
+    m_statusLabel = new QLabel("Checking version...", this);
     layout->addWidget(m_statusLabel);
 
     // Buttons
     QHBoxLayout *buttonLayout = new QHBoxLayout();
 
-    m_checkButton = new QPushButton("Check Version", this);
     m_updateButton = new QPushButton("Update", this);
     QPushButton *closeButton = new QPushButton("Close", this);
 
     m_updateButton->setEnabled(false);
 
-    buttonLayout->addWidget(m_checkButton);
     buttonLayout->addWidget(m_updateButton);
     buttonLayout->addWidget(closeButton);
     layout->addLayout(buttonLayout);
 
     // Connect signals
-    connect(m_checkButton, &QPushButton::clicked, this, &UpdateDialog::checkVersion);
     connect(m_updateButton, &QPushButton::clicked, this, &UpdateDialog::runUpdater);
     connect(closeButton, &QPushButton::clicked, this, &UpdateDialog::accept);
 
     // Initialize process
     m_updaterProcess = nullptr;
+
+    // Auto-check version when dialog opens
+    QTimer::singleShot(0, this, &UpdateDialog::checkVersion);
 }
 
 UpdateDialog::~UpdateDialog() {
@@ -78,7 +78,6 @@ void UpdateDialog::checkVersion() {
     m_statusLabel->setText("Checking version...");
     m_versionText->setPlainText("Please wait while checking version...");
     m_updateButton->setEnabled(false);
-    m_checkButton->setEnabled(false);
 
     // Let GUI update
     QApplication::processEvents();
@@ -116,7 +115,7 @@ void UpdateDialog::checkVersion() {
                                     "Please set the correct CLI path in File -> Set CLI path...");
         m_statusLabel->setText("Error: fear not found");
 #endif
-        m_checkButton->setEnabled(true);
+
         return;
     }
 
@@ -128,7 +127,7 @@ void UpdateDialog::checkVersion() {
                                     "Path: " + fearPath);
         m_statusLabel->setText("Error: Process failed to start");
         process->deleteLater();
-        m_checkButton->setEnabled(true);
+
         return;
     }
 
@@ -138,7 +137,7 @@ void UpdateDialog::checkVersion() {
         process->kill();
         process->waitForFinished(1000);
         process->deleteLater();
-        m_checkButton->setEnabled(true);
+
         return;
     }
 
@@ -150,7 +149,7 @@ void UpdateDialog::checkVersion() {
                                         .arg(process->exitCode()).arg(error).arg(output));
         m_statusLabel->setText("Error: Process failed");
         process->deleteLater();
-        m_checkButton->setEnabled(true);
+
         return;
     }
 
@@ -166,7 +165,6 @@ void UpdateDialog::checkVersion() {
 
     // Enable update button
     m_updateButton->setEnabled(true);
-    m_checkButton->setEnabled(true);
     m_statusLabel->setText(currentVersion.isEmpty() ? "Version unknown" : "Version: " + currentVersion);
 
     process->deleteLater();
@@ -198,7 +196,6 @@ void UpdateDialog::runUpdater() {
 
     // Disable buttons during update
     m_updateButton->setEnabled(false);
-    m_checkButton->setEnabled(false);
     m_statusLabel->setText("Running updater...");
 
     // Clear text field and show updater output
@@ -317,7 +314,6 @@ void UpdateDialog::cleanupUpdaterProcess() {
         m_updaterProcess = nullptr;
     }
     m_updateButton->setEnabled(true);
-    m_checkButton->setEnabled(true);
 }
 
 QString UpdateDialog::parseVersion(const QString &output) {

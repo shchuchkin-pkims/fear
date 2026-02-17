@@ -114,7 +114,6 @@ private:
     QString m_currentVersion;    ///< Currently detected version
     QTextEdit *m_versionText;    ///< Display for version info and update output
     QLabel *m_statusLabel;       ///< Status message display
-    QPushButton *m_checkButton;  ///< Check version button
     QPushButton *m_updateButton; ///< Run updater button
     QProcess *m_updaterProcess;  ///< Updater process handle
 };
