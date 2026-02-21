@@ -4,7 +4,7 @@
 
 ---
 
-**Version:** 1.2 (v0.4.1)
+**Version:** 1.3 (v0.4.2)
 **Author:** Shchuchkin E. Yu.
 
 ---
@@ -47,6 +47,22 @@
 - **Encrypted video calls:** VP8 codec with AES-256-GCM, SDL3 display, adaptive bitrate
 - **File transfer:** Encrypted file sharing with CRC32 integrity verification
 - **Open source:** Full transparency for audit and verification
+
+### What's New in v0.4.2
+
+**TCP Media Relay:**
+- Audio and video calls can now be relayed through the TCP server when direct UDP is unavailable (NAT/VPN)
+- Each call manager opens a dedicated TCP connection for media transport
+- Transparent fallback — no user configuration needed
+
+**Server Improvements:**
+- TCP keepalive detects dead connections within ~90 seconds (idle=60s, interval=10s, 3 probes)
+- Duplicate name rejection now sends an error message to the client before disconnecting
+
+**Android:**
+- In-app update: check for new versions and install APK directly from the app (Menu > Check for Updates)
+- Menu button on the connection screen (theme, trusted keys, updates)
+- Online users list persists across theme changes
 
 ### What's New in v0.4.1
 
@@ -152,6 +168,7 @@ Every TCP message follows this wire format:
 | 4 | USER_LIST | Room participants (service, zero nonce) |
 | 15 | KEY_REQUEST | ECDH key request (service, zero nonce) |
 | 16 | KEY_RESPONSE | ECDH key response (service, zero nonce) |
+| 17 | MEDIA_RELAY | TCP media relay (raw encrypted media packet) |
 
 ---
 
@@ -493,8 +510,12 @@ In the GUI, trusted keys can be managed via Menu > Keys > Trusted keys.
 ### Requirements
 
 - Microphone and speakers/headphones
-- Direct network connection between peers (or port forwarding)
+- Direct network connection between peers, or TCP media relay via server
 - Low network latency (< 100ms recommended)
+
+### TCP Media Relay
+
+When direct UDP connections are blocked (NAT, VPN, firewall), calls can be relayed through the TCP server. In the GUI and Android app, a **Relay** button appears when connected to a remote server. The relay uses MSG_TYPE_MEDIA_RELAY frames over a dedicated TCP connection.
 
 ### Setup via GUI
 

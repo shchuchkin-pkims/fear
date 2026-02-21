@@ -29,6 +29,7 @@
 #include <windows.h>
 #else
 #include <sys/select.h>
+#include <netinet/tcp.h>
 #include <errno.h>
 #endif
 
@@ -260,6 +261,46 @@ static void send_user_list(client_t *clients, int nclients, const char *room) {
 }
 
 
+static void set_tcp_keepalive(sock_t fd) {
+#ifdef _WIN32
+    DWORD yes = 1;
+    setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, (const char *)&yes, sizeof(yes));
+#else
+    int yes = 1;
+    setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &yes, sizeof(yes));
+    int idle = 60;   /* start probing after 60s of silence */
+    int intvl = 10;  /* 10s between probes */
+    int cnt = 3;     /* 3 failed probes = dead */
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt));
+#endif
+}
+
+static void send_error_and_close(sock_t fd, const char *room, uint16_t room_len,
+                                 const char *error_msg) {
+    uint16_t name_len = (uint16_t)strlen("server");
+    uint8_t nonce[CRYPTO_NPUBBYTES];
+    memset(nonce, 0, sizeof(nonce));
+    size_t msg_len = strlen(error_msg);
+    size_t frame_len = 2 + room_len + 2 + name_len + 2 + CRYPTO_NPUBBYTES + 1 + 4 + msg_len;
+    uint8_t *frame = (uint8_t *)malloc(frame_len);
+    if (!frame) { close_socket(fd); return; }
+    uint8_t *w = frame;
+    wr_u16(w, room_len); w += 2;
+    memcpy(w, room, room_len); w += room_len;
+    wr_u16(w, name_len); w += 2;
+    memcpy(w, "server", name_len); w += name_len;
+    wr_u16(w, CRYPTO_NPUBBYTES); w += 2;
+    memcpy(w, nonce, CRYPTO_NPUBBYTES); w += CRYPTO_NPUBBYTES;
+    *w++ = (uint8_t)MSG_TYPE_TEXT;
+    wr_u32(w, (uint32_t)msg_len); w += 4;
+    memcpy(w, error_msg, msg_len);
+    send_all(fd, frame, frame_len);
+    free(frame);
+    close_socket(fd);
+}
+
 /**
  * @brief Main server loop - accept connections and relay messages
  *
@@ -425,6 +466,7 @@ void run_server(uint16_t port) {
             sock_t c = accept(listener, (struct sockaddr*)&cli, &cl);
             if (c >= 0) {
                 if (nclients < MAX_CLIENTS) {
+                    set_tcp_keepalive(c);
                     clients[nclients].fd = c;
                     clients[nclients].room[0] = '\0';
                     clients[nclients].name[0] = '\0';
@@ -499,10 +541,10 @@ void run_server(uint16_t port) {
                 }
 
                 if (name_exists) {
-                    // Имя уже занято - отключаем клиента
                     printf("[server] client rejected: name '%.*s' already exists in room '%.*s'\n",
                            (int)name_len, name, (int)room_len, room);
-                    close_socket(clients[i].fd);
+                    send_error_and_close(clients[i].fd, room, room_len,
+                                         "Name already taken in this room");
                     clients[i] = clients[nclients - 1];
                     nclients--;
                     i--;

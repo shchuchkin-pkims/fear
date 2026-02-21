@@ -1,6 +1,6 @@
 # Code Structure Guide
 
-**Version:** 0.4.1
+**Version:** 0.4.2
 
 ---
 
@@ -30,7 +30,7 @@ client-console/
 - **common.c** — Little-endian I/O (`rd_u16`/`wr_u16`/`rd_u32`/`wr_u32`), `send_all`/`recv_all`, Base64 (URL-safe, RFC 4648), AES-256-GCM encrypt/decrypt, CRC32
 - **network.c** — `dial_tcp(host, port)`, `server_listen(port)`, cross-platform socket init
 - **client.c** — Room connection (3 modes: `--create`, `--join`, manual key), ECDH key exchange (MSG_TYPE_KEY_REQUEST/KEY_RESPONSE), Ed25519 identity (TOFU), file transfer, user list
-- **server.c** — Accept connections, broadcast to room, enforce unique names, relay service messages (USER_LIST, KEY_REQUEST/KEY_RESPONSE)
+- **server.c** — Accept connections, broadcast to room, enforce unique names, relay service messages (USER_LIST, KEY_REQUEST/KEY_RESPONSE), TCP media relay, TCP keepalive for dead connection detection
 
 ### 2. Video Call (`video_call/`)
 
@@ -131,9 +131,19 @@ MSG_TYPE_FILE_END     = 3   // File transfer completion
 MSG_TYPE_USER_LIST    = 4   // Room participant list (service, zero nonce)
 MSG_TYPE_KEY_REQUEST  = 15  // ECDH key request (service, zero nonce)
 MSG_TYPE_KEY_RESPONSE = 16  // ECDH key response (service, zero nonce)
+MSG_TYPE_MEDIA_RELAY  = 17  // TCP media relay (raw encrypted media packet)
 ```
 
 Service messages (types 4, 15, 16) use a zero nonce and are not encrypted with the room key.
+
+### TCP Media Relay
+
+When direct UDP is unavailable (NAT/VPN), audio and video calls can be relayed through the TCP server using MSG_TYPE_MEDIA_RELAY. Each call manager opens a dedicated TCP connection, registers with room+name, and media packets are wrapped in standard TCP frames. The server broadcasts media frames to other room participants.
+
+### Server Features
+
+- **TCP keepalive:** `SO_KEEPALIVE` with idle=60s, interval=10s, 3 probes — detects dead connections within ~90s
+- **Duplicate name rejection:** Server sends "Name already taken" error message before disconnecting
 
 ### UDP Media Packets
 

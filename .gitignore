@@ -41,3 +41,6 @@ key-exchange/CMakeFiles/
 key-exchange/cmake_install.cmake
 updater/CMakeFiles/
 updater/cmake_install.cmake
+
+# Web bridge
+web/node_modules/

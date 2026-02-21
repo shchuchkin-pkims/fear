@@ -9,11 +9,21 @@
 | **v0.3** | Secure key handling, file transfer, auto-updater, mobile app | Done |
 | **v0.4** | Encrypted video calls (VP8 + SDL3 + AES-GCM) | Done |
 | **v0.4.1** | ECDH key exchange, Ed25519 identity (TOFU), Android v0.4.1 | Done |
+| **v0.4.2** | TCP media relay, server keepalive, Android in-app updates | Done |
 | **v1.0** | CI/CD, security hardening, full testing | Planned |
 
 ---
 
 ## Completed
+
+### v0.4.2 — TCP Media Relay & Server Hardening
+- [x] TCP media relay for audio/video calls through server (MSG_TYPE_MEDIA_RELAY = 17)
+- [x] TCP keepalive on server (idle=60s, interval=10s, 3 probes — dead connection detection in ~90s)
+- [x] Duplicate name rejection with error message to client
+- [x] Android: in-app update (check GitHub releases, download and install APK)
+- [x] Android: menu button on connection screen (theme, trusted keys, updates)
+- [x] Android: online users list persists across theme changes
+- [x] Android: close previous connection before starting new one (fixes ghost session bug)
 
 ### v0.4.1 — ECDH & Identity
 - [x] ECDH key exchange (X25519 + crypto_box) — `--create` / `--join` modes
@@ -81,6 +91,23 @@
 ---
 
 ## Changelog
+
+### v0.4.2
+
+**TCP Media Relay:**
+- MSG_TYPE_MEDIA_RELAY (17) — audio/video calls relayed through TCP server when UDP is blocked
+- Each call manager opens dedicated TCP connection, registers with room+name
+- Server broadcasts media frames to room participants
+
+**Server Hardening:**
+- TCP keepalive (SO_KEEPALIVE, idle=60s, interval=10s, 3 probes) — detects dead connections in ~90s
+- Duplicate name rejection sends error message before disconnecting
+
+**Android v0.4.2:**
+- In-app update: check GitHub releases, download and install APK directly
+- Menu button on connection screen
+- Online users list preserved on theme change
+- Previous connection closed before starting new one (fixes ghost session)
 
 ### v0.4.1
 
