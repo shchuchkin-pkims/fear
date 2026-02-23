@@ -36,6 +36,7 @@
 #  include <sys/socket.h>
 #  include <sys/types.h>
 #  include <sys/time.h>
+#  include <sys/ioctl.h>
 #  include <netinet/tcp.h>
 #  include <pthread.h>
 #  define THREAD_RET void*
@@ -137,6 +138,13 @@ typedef struct VideoCall {
     uint32_t last_peer_ping_ts;            /* peer's timestamp to echo back */
     uint64_t peer_ping_recv_time;          /* when we received the peer's ping */
     uint32_t measured_rtt_ms;              /* our measured round-trip time */
+
+    /* TCP relay frame skipping */
+    uint8_t *latest_yuv;                   /* deferred decode: latest decoded YUV */
+    int latest_yuv_size;
+    int latest_yuv_w, latest_yuv_h;
+    uint32_t latest_fid;                   /* frame ID of latest complete frame */
+    int skip_to_keyframe;                  /* 1 = skip P-frames until next keyframe */
 
     /* Identity signing (optional) */
     int has_identity;
@@ -327,6 +335,23 @@ static int tcp_relay_send_media(VideoCall *vc, const uint8_t *media, int media_l
     free(frame);
     return ret;
 }
+
+/* Return number of bytes pending in TCP receive buffer */
+static int tcp_pending_bytes(socket_t sock) {
+#ifdef _WIN32
+    u_long avail = 0;
+    if (ioctlsocket(sock, FIONREAD, &avail) == 0) return (int)avail;
+    return 0;
+#else
+    int avail = 0;
+    if (ioctl(sock, FIONREAD, &avail) == 0) return avail;
+    return 0;
+#endif
+}
+
+/* Threshold for entering skip-to-keyframe mode (bytes).
+   ~30KB ≈ 200-300ms of video at 800kbps + overhead */
+#define TCP_LAG_THRESHOLD 30000
 
 /* Read one TCP frame, return media payload size (0 = non-media skipped, -1 = error) */
 static int tcp_relay_recv_media(VideoCall *vc, uint8_t *out, int out_size) {
@@ -703,6 +728,23 @@ static int decrypt_stats(VideoCall *vc, const uint8_t *pkt, size_t pkt_len,
     return 0;
 }
 
+/* ===== PortAudio output callback (non-blocking audio playback) ===== */
+
+static int pa_output_callback(const void *input, void *output,
+                              unsigned long frameCount,
+                              const PaStreamCallbackTimeInfo *timeInfo,
+                              PaStreamCallbackFlags statusFlags,
+                              void *userData) {
+    (void)input; (void)timeInfo; (void)statusFlags;
+    VideoCall *vc = (VideoCall *)userData;
+    int16_t *out = (int16_t *)output;
+
+    if (pcmring_pop(&vc->out_ring, out) != 0) {
+        memset(out, 0, frameCount * VC_CHANNELS * sizeof(int16_t));
+    }
+    return paContinue;
+}
+
 /* ===== Thread: Video Send ===== */
 
 typedef struct { VideoCall *vc; } ThreadArgs;
@@ -866,16 +908,19 @@ static THREAD_RET th_asend_func(void *arg) {
     VideoCall *vc = ta->vc;
     free(ta);
 
+    /* Always send at least one HELLO so the peer gets our nonce prefix,
+       even if we already received the peer's HELLO via TCP buffer */
+    if (vc->peer_set || vc->tcp_sock) send_hello(vc);
+
     /* Wait for handshake */
     int waited = 0;
     while (atomic_load(&vc->running)) {
         if (atomic_load(&vc->remote_prefix_ready)) break;
-        if (waited == 0 && (vc->peer_set || vc->tcp_sock)) send_hello(vc);
         waited++;
         msleep(50);
-        if (waited % 20 == 0 && (vc->peer_set || vc->tcp_sock)) {
+        if ((vc->peer_set || vc->tcp_sock)) {
             /* Re-send UDP relay registration periodically (only for UDP relay) */
-            if (vc->relay_mode && !vc->tcp_sock) send_udp_registration(vc);
+            if (waited % 20 == 0 && vc->relay_mode && !vc->tcp_sock) send_udp_registration(vc);
             send_hello(vc);
         }
     }
@@ -1025,14 +1070,6 @@ static THREAD_RET th_recv_func(void *arg) {
                 int16_t discard[VC_FRAME_SAMPLES];
                 pcmring_pop(&vc->out_ring, discard);
             }
-
-            if (vc->out_stream &&
-                atomic_load(&vc->out_ring.count) >= PLAYOUT_BUFFER_FRAMES) {
-                int16_t play[VC_FRAME_SAMPLES];
-                if (pcmring_pop(&vc->out_ring, play) == 0) {
-                    Pa_WriteStream(vc->out_stream, play, VC_FRAME_SAMPLES);
-                }
-            }
             continue;
         }
 
@@ -1052,6 +1089,18 @@ static THREAD_RET th_recv_func(void *arg) {
                                                        yuv_buf, VC_MAX_VP8_FRAME,
                                                        &completed_fid);
             if (frame_size > 0) {
+                /* VP8 keyframe: bit 0 of first byte is 0 */
+                int is_keyframe = (yuv_buf[0] & 0x01) == 0;
+
+                /* TCP relay latency control: when falling behind, skip
+                   P-frames until the next keyframe. This catches up without
+                   corrupting the picture — keyframes re-establish the
+                   decoder reference so subsequent P-frames decode cleanly. */
+                if (vc->relay_mode && vc->tcp_sock && vc->skip_to_keyframe) {
+                    if (!is_keyframe) continue; /* skip P-frame */
+                    vc->skip_to_keyframe = 0;   /* resume normal decode */
+                }
+
                 /* Decode VP8 frame */
                 int dec_w = 0, dec_h = 0;
                 uint8_t *yuv_dec = (uint8_t *)malloc(VC_MAX_YUV_FRAME);
@@ -1083,6 +1132,14 @@ static THREAD_RET th_recv_func(void *arg) {
 #endif
                     }
                     free(yuv_dec);
+                }
+
+                /* After decoding, check if TCP buffer has more pending
+                   data — if so, we're falling behind. Skip P-frames until
+                   the next keyframe to catch up. */
+                if (vc->relay_mode && vc->tcp_sock &&
+                    tcp_pending_bytes(vc->tcp_sock) > TCP_LAG_THRESHOLD) {
+                    vc->skip_to_keyframe = 1;
                 }
             }
             continue;
@@ -1253,15 +1310,16 @@ static int audio_init_ports(VideoCall *vc, int input_device_id, int output_devic
         }
     }
 
-    /* Open output stream */
+    /* Open output stream (callback mode — non-blocking) */
     if (outParams.device != paNoDevice) {
         pe = Pa_OpenStream(&vc->out_stream, NULL, &outParams, VC_SAMPLE_RATE,
-                           VC_FRAME_SAMPLES, paClipOff, NULL, NULL);
+                           VC_FRAME_SAMPLES, paClipOff, pa_output_callback, vc);
         if (pe != paNoError) vc->out_stream = NULL;
     }
     if (vc->out_stream == NULL) {
         pe = Pa_OpenDefaultStream(&vc->out_stream, 0, VC_CHANNELS, paInt16,
-                                  VC_SAMPLE_RATE, VC_FRAME_SAMPLES, NULL, NULL);
+                                  VC_SAMPLE_RATE, VC_FRAME_SAMPLES,
+                                  pa_output_callback, vc);
         if (pe != paNoError) {
             fprintf(stderr, "Warning: Audio output disabled\n");
             vc->out_stream = NULL;

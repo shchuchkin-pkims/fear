@@ -265,6 +265,9 @@ static void set_tcp_keepalive(sock_t fd) {
 #ifdef _WIN32
     DWORD yes = 1;
     setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, (const char *)&yes, sizeof(yes));
+    /* Send timeout: 5 seconds */
+    DWORD snd_timeout = 5000;
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, (const char *)&snd_timeout, sizeof(snd_timeout));
 #else
     int yes = 1;
     setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &yes, sizeof(yes));
@@ -274,6 +277,9 @@ static void set_tcp_keepalive(sock_t fd) {
     setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
     setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
     setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt));
+    /* Send timeout: 5 seconds — prevents broadcast() from blocking forever on dead clients */
+    struct timeval snd_timeout = { .tv_sec = 5, .tv_usec = 0 };
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &snd_timeout, sizeof(snd_timeout));
 #endif
 }
 
