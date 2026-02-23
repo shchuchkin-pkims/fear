@@ -60,6 +60,13 @@ int video_display_render_pip(VideoDisplay *disp,
                              const uint8_t *local_yuv, int local_w, int local_h);
 
 /**
+ * @brief Set RTT value to display as overlay on video
+ * @param disp Display context
+ * @param rtt_ms Round-trip time in milliseconds
+ */
+void video_display_set_rtt(VideoDisplay *disp, uint32_t rtt_ms);
+
+/**
  * @brief Close display and free resources
  * @param disp Display context (safe to pass NULL)
  */

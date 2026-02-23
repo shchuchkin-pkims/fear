@@ -16,6 +16,7 @@
 #include <QFileInfo>
 #include <QProcess>
 #include <QSettings>
+#include <QRegularExpression>
 
 AudioCallDialog::AudioCallDialog(AudioCallManager *audioManager, Backend *backend,
                                  QWidget *parent, const QString &roomKeyHex)
@@ -144,7 +145,20 @@ void AudioCallDialog::onError(const QString &error) {
 }
 
 void AudioCallDialog::onOutput(const QString &output) {
-    outputText->append(output);
+    // Parse [STATS] lines and update status label
+    QStringList lines = output.split('\n');
+    for (const QString &line : lines) {
+        QString t = line.trimmed();
+        if (t.startsWith("[STATS]")) {
+            QRegularExpression rx("RTT=(\\d+)");
+            QRegularExpressionMatch m = rx.match(t);
+            if (m.hasMatch()) {
+                statusLabel->setText(QString("RTT: %1 ms").arg(m.captured(1)));
+            }
+        } else if (!t.isEmpty()) {
+            outputText->append(t);
+        }
+    }
 }
 
 void AudioCallDialog::setupUI() {

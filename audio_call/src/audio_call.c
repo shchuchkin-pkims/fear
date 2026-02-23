@@ -42,6 +42,7 @@ typedef SOCKET socket_t;
 #  include <arpa/inet.h>
 #  include <sys/socket.h>
 #  include <sys/types.h>
+#  include <netinet/tcp.h>
 #  include <pthread.h>
 #  include <sys/select.h>
 typedef int socket_t;
@@ -81,7 +82,11 @@ typedef int socket_t;
 
 /* Пакеты протокола */
 #define PKT_VER_AUDIO  0x01
+#define PKT_VER_STATS  0x04
 #define PKT_VER_HELLO  0x7F
+
+/* Stats exchange interval (ms) */
+#define AC_STATS_INTERVAL_MS 2000
 
 /* AES-GCM конфигурация */
 #define AES_GCM_NONCE_LEN crypto_aead_aes256gcm_NPUBBYTES  /* 12 байт */
@@ -154,6 +159,12 @@ typedef struct AudioCall {
     OpusDecoder *dec;
 
     PcmRing out_ring;
+
+    /* RTT measurement (ping/pong via stats packets) */
+    uint32_t last_peer_ping_ts;            /* peer's timestamp to echo back */
+    uint64_t peer_ping_recv_time;          /* when we received the peer's ping */
+    uint32_t measured_rtt_ms;              /* our measured round-trip time */
+    uint64_t last_stats_time_ms;           /* last time we sent stats */
 
     /* Identity signing (optional) */
     int has_identity;
@@ -312,6 +323,9 @@ static int tcp_relay_connect(AudioCall *c, const char *ip, uint16_t port) {
         CLOSESOCK(c->tcp_sock); c->tcp_sock = 0;
         return -1;
     }
+    /* Disable Nagle's algorithm for low-latency media relay */
+    int flag = 1;
+    setsockopt(c->tcp_sock, IPPROTO_TCP, TCP_NODELAY, (const char *)&flag, sizeof(flag));
     printf("TCP relay connected to %s:%u\n", ip, port);
     return 0;
 }
@@ -454,6 +468,71 @@ static int decrypt_opus(AudioCall *c, const uint8_t *pkt, size_t pkt_len,
                                 c->remote_nonce_prefix, opus_out, opus_len);
 }
 
+/* ===== Stats packet: [0x04][seq(8 BE)][AES-GCM(16 bytes payload + 16 tag)] ===== */
+
+typedef struct {
+    uint32_t ping_ts;    /* sender's timestamp (lower 32 bits of ms) */
+    uint32_t pong_ts;    /* echo of peer's last ping_ts */
+    uint32_t reserved1;
+    uint32_t reserved2;
+} AudioStatsPayload;
+
+static int encrypt_stats(AudioCall *c, const AudioStatsPayload *sp,
+                          uint8_t *out, size_t *out_len, uint64_t seq) {
+    out[0] = PKT_VER_STATS;
+    uint64_t be_seq = htonll_u64(seq);
+    memcpy(out + 1, &be_seq, 8);
+
+    uint8_t nonce[AES_GCM_NONCE_LEN];
+    memcpy(nonce, c->local_nonce_prefix, NONCE_PREFIX_LEN);
+    memcpy(nonce + NONCE_PREFIX_LEN, &be_seq, 8);
+
+    unsigned long long clen = 0;
+    if (crypto_aead_aes256gcm_encrypt(
+            out + 1 + 8, &clen,
+            (const uint8_t *)sp, sizeof(AudioStatsPayload),
+            NULL, 0, NULL, nonce, c->key) != 0) {
+        return -1;
+    }
+    *out_len = 1 + 8 + (size_t)clen;
+    return 0;
+}
+
+static int decrypt_stats(AudioCall *c, const uint8_t *pkt, size_t pkt_len,
+                          AudioStatsPayload *sp_out) {
+    if (pkt_len < 1 + 8 + AES_GCM_ABYTES) return -1;
+    if (!atomic_load(&c->remote_prefix_ready)) return -2;
+
+    uint64_t be_seq;
+    memcpy(&be_seq, pkt + 1, 8);
+
+    uint8_t nonce[AES_GCM_NONCE_LEN];
+    memcpy(nonce, c->remote_nonce_prefix, NONCE_PREFIX_LEN);
+    memcpy(nonce + NONCE_PREFIX_LEN, &be_seq, 8);
+
+    unsigned long long mlen = 0;
+    uint8_t plain[64];
+    if (crypto_aead_aes256gcm_decrypt(
+            plain, &mlen, NULL,
+            pkt + 1 + 8, pkt_len - (1 + 8),
+            NULL, 0, nonce, c->key) != 0) {
+        return -1;
+    }
+    if (mlen < sizeof(AudioStatsPayload)) return -1;
+    memcpy(sp_out, plain, sizeof(AudioStatsPayload));
+    return 0;
+}
+
+static uint64_t audio_time_ms(void) {
+#ifdef _WIN32
+    return (uint64_t)GetTickCount64();
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)ts.tv_nsec / 1000000ULL;
+#endif
+}
+
 /* ----------------------------- Потоки ----------------------------------- */
 
 typedef struct {
@@ -482,6 +561,8 @@ static THREAD_RET th_send_func(void *arg) {
     uint8_t opus[AC_MAX_OPUS_BYTES];
     uint8_t packet[1 + 8 + AC_MAX_OPUS_BYTES + AES_GCM_ABYTES];
 
+    c->last_stats_time_ms = audio_time_ms();
+
     while (atomic_load(&c->running)) {
         if (c->in_stream == NULL) {
             memset(pcm, 0, sizeof(pcm));
@@ -507,6 +588,31 @@ static THREAD_RET th_send_func(void *arg) {
         }
 
         ac_send_packet(c, packet, (int)pkt_len);
+
+        /* Send stats every 2 seconds */
+        uint64_t now = audio_time_ms();
+        if ((now - c->last_stats_time_ms) >= AC_STATS_INTERVAL_MS) {
+            c->last_stats_time_ms = now;
+
+            AudioStatsPayload sp;
+            memset(&sp, 0, sizeof(sp));
+            sp.ping_ts = (uint32_t)(now & 0xFFFFFFFF);
+            {
+                uint32_t hold_time = (c->peer_ping_recv_time > 0)
+                    ? (uint32_t)(now - c->peer_ping_recv_time) : 0;
+                sp.pong_ts = c->last_peer_ping_ts + hold_time;
+            }
+
+            uint8_t stats_pkt[1 + 8 + sizeof(AudioStatsPayload) + AES_GCM_ABYTES];
+            size_t stats_len = 0;
+            uint64_t stats_seq = atomic_fetch_add(&c->seq_tx, 1);
+            if (encrypt_stats(c, &sp, stats_pkt, &stats_len, stats_seq) == 0) {
+                ac_send_packet(c, stats_pkt, (int)stats_len);
+            }
+
+            printf("[STATS] RTT=%u\n", c->measured_rtt_ms);
+            fflush(stdout);
+        }
     }
 
 #ifdef _WIN32
@@ -562,6 +668,20 @@ static THREAD_RET th_recv_func(void *arg) {
             continue;
         }
 
+        /* Stats packet: RTT ping/pong */
+        if (rbuf[0] == PKT_VER_STATS) {
+            AudioStatsPayload sp;
+            if (decrypt_stats(c, rbuf, (size_t)n, &sp) == 0) {
+                if (sp.pong_ts != 0) {
+                    uint32_t now32 = (uint32_t)(audio_time_ms() & 0xFFFFFFFF);
+                    c->measured_rtt_ms = now32 - sp.pong_ts;
+                }
+                c->last_peer_ping_ts = sp.ping_ts;
+                c->peer_ping_recv_time = audio_time_ms();
+            }
+            continue;
+        }
+
         size_t opus_len = 0;
         if (decrypt_opus(c, rbuf, (size_t)n, opus, &opus_len) != 0) {
             continue;
@@ -576,6 +696,15 @@ static THREAD_RET th_recv_func(void *arg) {
         }
 
         pcmring_push(&c->out_ring, pcm);
+
+        /* Latency control: if buffer grows too large, drain old frames.
+           Max ~20 frames (400ms) prevents unbounded latency accumulation
+           that occurs with TCP relay bursts. */
+        #define MAX_PLAYOUT_FRAMES 20
+        while (atomic_load(&c->out_ring.count) > MAX_PLAYOUT_FRAMES) {
+            int16_t discard[AC_FRAME_SAMPLES];
+            pcmring_pop(&c->out_ring, discard);
+        }
 
         // Воспроизводим только если выходной поток доступен и буфер достаточно наполнен
         if (c->out_stream && atomic_load(&c->out_ring.count) >= PLAYOUT_BUFFER_FRAMES) {

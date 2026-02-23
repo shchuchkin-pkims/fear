@@ -4,7 +4,7 @@
 
 ---
 
-**Version:** 1.3 (v0.4.2)
+**Version:** 1.4 (v0.4.3)
 **Author:** Shchuchkin E. Yu.
 
 ---
@@ -48,16 +48,18 @@
 - **File transfer:** Encrypted file sharing with CRC32 integrity verification
 - **Open source:** Full transparency for audit and verification
 
-### What's New in v0.4.2
+### What's New in v0.4.3
 
-**TCP Media Relay:**
-- Audio and video calls can now be relayed through the TCP server when direct UDP is unavailable (NAT/VPN)
-- Each call manager opens a dedicated TCP connection for media transport
-- Transparent fallback — no user configuration needed
+**RTT Latency Measurement:**
+- Real-time RTT (Round-Trip Time) display during audio and video calls
+- Video calls: color-coded overlay on SDL video window (green < 100ms, yellow 100-300ms, red > 300ms)
+- Audio calls: RTT stats exchange via encrypted stats packets every 2 seconds
+- Hold-time compensation for accurate RTT calculation
 
-**Server Improvements:**
-- TCP keepalive detects dead connections within ~90 seconds (idle=60s, interval=10s, 3 probes)
-- Duplicate name rejection now sends an error message to the client before disconnecting
+**Video Call Improvements:**
+- Ring buffer for video capture — eliminates frame accumulation delay
+- TCP_NODELAY on media relay sockets for reduced latency
+- Latest-frame-only read strategy prevents stale frame buildup
 
 **Android:**
 - In-app update: check for new versions and install APK directly from the app (Menu > Check for Updates)

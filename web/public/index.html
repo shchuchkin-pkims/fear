@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>F.E.A.R. Messenger</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <!-- Login Screen -->
+    <div id="login-screen" class="screen">
+        <div class="login-box">
+            <h1 class="logo">F.E.A.R.</h1>
+            <p class="subtitle">Fully Encrypted Anonymous Relay</p>
+
+            <div class="form-group">
+                <label>Server</label>
+                <div class="input-row">
+                    <input type="text" id="host-input" placeholder="Host (default: this server)">
+                    <input type="text" id="port-input" placeholder="8888" value="8888" class="port-input">
+                </div>
+            </div>
+
+            <div class="form-group">
+                <label>Room</label>
+                <input type="text" id="room-input" placeholder="Room name">
+            </div>
+
+            <div class="form-group">
+                <label>Name</label>
+                <input type="text" id="name-input" placeholder="Your name">
+            </div>
+
+            <div class="form-group">
+                <label>Key</label>
+                <div class="input-row">
+                    <input type="password" id="key-input" placeholder="Room key (auto for Create/Join)">
+                    <button id="key-toggle" class="btn-small">Show</button>
+                </div>
+            </div>
+
+            <div class="btn-group">
+                <button id="btn-create" class="btn btn-primary">Create Room</button>
+                <button id="btn-join" class="btn btn-secondary">Join Room</button>
+                <button id="btn-connect" class="btn btn-tertiary">Connect</button>
+            </div>
+
+            <div class="login-help">
+                <strong>Create:</strong> Generate a new room key<br>
+                <strong>Join:</strong> Get key via ECDH exchange<br>
+                <strong>Connect:</strong> Use an existing key
+            </div>
+        </div>
+    </div>
+
+    <!-- Chat Screen -->
+    <div id="chat-screen" class="screen" style="display:none">
+        <div class="chat-header">
+            <div class="header-left">
+                <span id="room-label" class="room-label"></span>
+                <button id="user-list-toggle" class="btn-small">Users (0)</button>
+            </div>
+            <div class="header-right">
+                <button id="identity-btn" class="btn-small">ID</button>
+                <button id="disconnect-btn" class="btn-small btn-danger">Disconnect</button>
+            </div>
+        </div>
+
+        <div id="identity-panel" class="identity-panel hidden">
+            <div class="id-row">
+                <span class="id-label">Fingerprint:</span>
+                <span id="fingerprint-display" class="fingerprint">No identity</span>
+            </div>
+            <div class="id-buttons">
+                <button id="generate-id-btn" class="btn-small">Generate</button>
+                <button id="clear-id-btn" class="btn-small btn-danger">Clear</button>
+            </div>
+        </div>
+
+        <div class="chat-body">
+            <div id="sidebar" class="sidebar">
+                <div class="sidebar-title">Users</div>
+                <div id="user-list"></div>
+            </div>
+
+            <div class="chat-main">
+                <div id="messages" class="messages"></div>
+                <div id="drop-zone" class="drop-zone">Drop file here</div>
+                <div class="input-bar">
+                    <input type="text" id="message-input" placeholder="Type a message..." autocomplete="off">
+                    <button id="file-btn" class="btn-small" title="Send file">File</button>
+                    <button id="send-btn" class="btn btn-primary">Send</button>
+                    <input type="file" id="file-input" style="display:none">
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div id="status-bar" class="status-bar">Loading...</div>
+
+    <script src="sodium.js"></script>
+    <script src="crypto.js"></script>
+    <script src="identity.js"></script>
+    <script src="filetransfer.js"></script>
+    <script src="app.js"></script>
+</body>
+</html>

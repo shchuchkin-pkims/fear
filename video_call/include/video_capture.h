@@ -46,6 +46,19 @@ int video_capture_open(VideoCapture **cap, const char *device,
 int video_capture_read(VideoCapture *cap, uint8_t *yuv_out, int max_size);
 
 /**
+ * @brief Read the latest available frame, discarding older buffered frames
+ * @param cap Capture context
+ * @param yuv_out Output buffer for YUV420P data
+ * @param max_size Maximum output buffer size
+ * @return Number of bytes written to yuv_out, or -1 on error
+ *
+ * Reads one frame first (blocking), then drains any additional buffered
+ * frames non-blockingly and returns the most recent one. Prevents capture
+ * buffer overflow (e.g. dshow rtbufsize on Windows).
+ */
+int video_capture_read_latest(VideoCapture *cap, uint8_t *yuv_out, int max_size);
+
+/**
  * @brief Get current capture dimensions
  * @param cap Capture context
  * @param width Receives width (may differ from requested)

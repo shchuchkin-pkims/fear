@@ -36,6 +36,7 @@
 #  include <sys/socket.h>
 #  include <sys/types.h>
 #  include <sys/time.h>
+#  include <netinet/tcp.h>
 #  include <pthread.h>
 #  define THREAD_RET void*
 #endif
@@ -131,6 +132,11 @@ typedef struct VideoCall {
     /* Peer connection tracking */
     atomic_uint_fast64_t last_recv_time;   /* ms timestamp of last data packet */
     atomic_int peer_connected;             /* 1 = receiving data, 0 = timed out */
+
+    /* RTT measurement (ping/pong via stats packets) */
+    uint32_t last_peer_ping_ts;            /* peer's timestamp to echo back */
+    uint64_t peer_ping_recv_time;          /* when we received the peer's ping */
+    uint32_t measured_rtt_ms;              /* our measured round-trip time */
 
     /* Identity signing (optional) */
     int has_identity;
@@ -252,6 +258,9 @@ static int tcp_relay_connect(VideoCall *vc, const char *ip, uint16_t port) {
         CLOSESOCK(vc->tcp_sock); vc->tcp_sock = 0;
         return -1;
     }
+    /* Disable Nagle's algorithm for low-latency media relay */
+    int flag = 1;
+    setsockopt(vc->tcp_sock, IPPROTO_TCP, TCP_NODELAY, (const char *)&flag, sizeof(flag));
     printf("TCP relay connected to %s:%u\n", ip, port);
     return 0;
 }
@@ -753,8 +762,8 @@ static THREAD_RET th_vsend_func(void *arg) {
             frame_interval_ms = 1000 / preset->fps;
         }
 
-        /* Capture frame */
-        int cap_ret = video_capture_read(vc->capture, yuv_buf, yuv_size);
+        /* Capture latest frame (drains buffered frames to prevent dshow overflow) */
+        int cap_ret = video_capture_read_latest(vc->capture, yuv_buf, yuv_size);
         if (cap_ret <= 0) {
             msleep(5);
             continue;
@@ -810,11 +819,28 @@ static THREAD_RET th_vsend_func(void *arg) {
         if (quality_should_send_stats(&vc->quality, now)) {
             StatsPayload sp;
             quality_build_stats(&vc->quality, &sp);
+
+            /* Ping/pong for RTT measurement:
+               reserved = our timestamp (ping)
+               rtt_ms   = echo of peer's timestamp + hold time (pong)
+               Hold time compensation: we add the time we held the ping
+               so the peer can subtract it to get accurate RTT */
+            sp.reserved = (uint32_t)(now & 0xFFFFFFFF);
+            {
+                uint32_t hold_time = (vc->peer_ping_recv_time > 0)
+                    ? (uint32_t)(now - vc->peer_ping_recv_time) : 0;
+                sp.rtt_ms = vc->last_peer_ping_ts + hold_time;
+            }
+
             uint64_t seq = atomic_fetch_add(&vc->video_seq_tx, 1);
             size_t enc_len = 0;
             if (encrypt_stats(vc, &sp, enc_buf, &enc_len, seq) == 0) {
                 vc_send_packet(vc, enc_buf, (int)enc_len);
             }
+
+            /* Print stats to stdout for GUI */
+            printf("[STATS] RTT=%u\n", vc->measured_rtt_ms);
+            fflush(stdout);
         }
 
         /* Pace to target FPS */
@@ -993,6 +1019,13 @@ static THREAD_RET th_recv_func(void *arg) {
 
             pcmring_push(&vc->out_ring, pcm);
 
+            /* Latency control: drain old frames if buffer grows too large */
+            #define MAX_PLAYOUT_FRAMES 20
+            while (atomic_load(&vc->out_ring.count) > MAX_PLAYOUT_FRAMES) {
+                int16_t discard[VC_FRAME_SAMPLES];
+                pcmring_pop(&vc->out_ring, discard);
+            }
+
             if (vc->out_stream &&
                 atomic_load(&vc->out_ring.count) >= PLAYOUT_BUFFER_FRAMES) {
                 int16_t play[VC_FRAME_SAMPLES];
@@ -1060,7 +1093,23 @@ static THREAD_RET th_recv_func(void *arg) {
             StatsPayload sp;
             if (decrypt_stats(vc, rbuf, (size_t)n, &sp) == 0) {
                 quality_record_peer_stats(&vc->quality, sp.packets_received, sp.packets_lost);
+
+                /* RTT: sp.rtt_ms = echo of our ping + hold time
+                   sp.reserved = peer's current ping timestamp */
+                if (sp.rtt_ms != 0) {
+                    uint32_t now32 = (uint32_t)(video_time_ms() & 0xFFFFFFFF);
+                    vc->measured_rtt_ms = now32 - sp.rtt_ms;
+                }
+                vc->last_peer_ping_ts = sp.reserved;
+                vc->peer_ping_recv_time = video_time_ms();
+
+                /* Feed actual measured RTT to quality controller */
+                sp.rtt_ms = vc->measured_rtt_ms;
                 quality_update(&vc->quality, &sp, video_time_ms());
+
+                /* Update overlay */
+                if (vc->display)
+                    video_display_set_rtt(vc->display, vc->measured_rtt_ms);
             }
             continue;
         }

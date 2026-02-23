@@ -1,0 +1,13 @@
+{
+  "name": "fear-web-bridge",
+  "version": "0.4.3",
+  "description": "F.E.A.R. Messenger WebSocket-TCP Bridge",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.21.0",
+    "ws": "^8.18.0"
+  }
+}

@@ -23,7 +23,47 @@ struct VideoDisplay {
     SDL_Texture *local_texture;
     int local_tex_width;
     int local_tex_height;
+    /* RTT overlay */
+    uint32_t rtt_ms;
 };
+
+void video_display_set_rtt(VideoDisplay *disp, uint32_t rtt_ms) {
+    if (disp) disp->rtt_ms = rtt_ms;
+}
+
+static void render_rtt_overlay(VideoDisplay *disp) {
+    if (!disp || !disp->renderer) return;
+
+    uint32_t rtt = disp->rtt_ms;
+    char buf[32];
+    snprintf(buf, sizeof(buf), "RTT: %u ms", rtt);
+
+    /* Color: green < 100ms, yellow 100-300ms, red > 300ms */
+    uint8_t r, g, b;
+    if (rtt < 100) {
+        r = 0; g = 220; b = 0;       /* green */
+    } else if (rtt < 300) {
+        r = 255; g = 200; b = 0;     /* yellow */
+    } else {
+        r = 255; g = 40; b = 40;     /* red */
+    }
+
+    /* Background for readability */
+    float scale = 2.0f;
+    float text_w = (float)strlen(buf) * 8.0f * scale;
+    float text_h = 8.0f * scale;
+    float pad = 4.0f;
+    SDL_FRect bg = { 8 - pad, 8 - pad, text_w + pad * 2, text_h + pad * 2 };
+    SDL_SetRenderDrawColor(disp->renderer, 0, 0, 0, 180);
+    SDL_SetRenderDrawBlendMode(disp->renderer, SDL_BLENDMODE_BLEND);
+    SDL_RenderFillRect(disp->renderer, &bg);
+
+    /* Render text scaled 2x for readability */
+    SDL_SetRenderScale(disp->renderer, scale, scale);
+    SDL_SetRenderDrawColor(disp->renderer, r, g, b, 255);
+    SDL_RenderDebugText(disp->renderer, 8.0f / scale, 8.0f / scale, buf);
+    SDL_SetRenderScale(disp->renderer, 1.0f, 1.0f);
+}
 
 int video_display_open(VideoDisplay **disp, const char *title,
                        int width, int height) {
@@ -98,6 +138,7 @@ int video_display_render(VideoDisplay *disp, const uint8_t *yuv,
 
     SDL_RenderClear(disp->renderer);
     SDL_RenderTexture(disp->renderer, disp->texture, NULL, NULL);
+    render_rtt_overlay(disp);
     SDL_RenderPresent(disp->renderer);
 
     return 0;
@@ -194,6 +235,7 @@ int video_display_render_pip(VideoDisplay *disp,
     };
     SDL_RenderTexture(disp->renderer, disp->local_texture, NULL, &pip_rect);
 
+    render_rtt_overlay(disp);
     SDL_RenderPresent(disp->renderer);
     return 0;
 }

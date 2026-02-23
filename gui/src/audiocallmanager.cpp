@@ -300,8 +300,10 @@ void AudioCallManager::onProcessOutput() {
 
 void AudioCallManager::onProcessError() {
     if (callProcess) {
-        QString error = QString::fromUtf8(callProcess->readAllStandardError());
-        emit this->error(error);
+        QString err = QString::fromUtf8(callProcess->readAllStandardError());
+        // PortAudio/ALSA/JACK print informational messages to stderr;
+        // forward as output, not as error, to avoid confusing the user
+        emit this->output(err);
     }
 }
 

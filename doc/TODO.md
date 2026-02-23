@@ -10,11 +10,21 @@
 | **v0.4** | Encrypted video calls (VP8 + SDL3 + AES-GCM) | Done |
 | **v0.4.1** | ECDH key exchange, Ed25519 identity (TOFU), Android v0.4.1 | Done |
 | **v0.4.2** | TCP media relay, server keepalive, Android in-app updates | Done |
+| **v0.4.3** | RTT latency measurement, video call latency fixes | Done |
 | **v1.0** | CI/CD, security hardening, full testing | Planned |
 
 ---
 
 ## Completed
+
+### v0.4.3 — RTT Latency & Video Call Improvements
+- [x] RTT ping/pong measurement in video calls (StatsPayload with hold-time compensation)
+- [x] RTT ping/pong measurement in audio calls (new AudioStatsPayload + PKT_VER_STATS)
+- [x] Color-coded RTT overlay on SDL video window (green/yellow/red)
+- [x] RTT display in desktop GUI via [STATS] stdout parsing
+- [x] Ring buffer for video capture (eliminates frame accumulation delay)
+- [x] TCP_NODELAY on media relay sockets
+- [x] Android: RTT stats for video and audio calls with color-coded display
 
 ### v0.4.2 — TCP Media Relay & Server Hardening
 - [x] TCP media relay for audio/video calls through server (MSG_TYPE_MEDIA_RELAY = 17)
@@ -91,6 +101,23 @@
 ---
 
 ## Changelog
+
+### v0.4.3
+
+**RTT Latency Measurement:**
+- Ping/pong via StatsPayload in video calls, new AudioStatsPayload in audio calls
+- Hold-time compensation: echo includes delay since ping reception for accurate RTT
+- Color-coded SDL overlay on desktop video (green < 100ms, yellow 100-300ms, red > 300ms)
+- Desktop GUI parses [STATS] lines from stdout for audio/video call RTT display
+
+**Video Call Latency Fixes:**
+- Ring buffer in video_capture replaces unbounded queue — prevents frame accumulation
+- TCP_NODELAY on TCP media relay sockets
+- video_capture_read_latest() returns only the most recent frame
+
+**Android v0.4.3:**
+- RTT stats exchange for both video and audio calls
+- Color-coded RTT display (VideoCallActivity + MainActivity)
 
 ### v0.4.2
 
