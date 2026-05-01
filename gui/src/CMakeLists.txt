@@ -113,6 +113,14 @@ set(SOURCES
     settingsdialog.cpp
     knownkeysdialog.cpp
     mainwindow.cpp
+    # New Telegram-style UI (Phase 1)
+    chatwindow.cpp
+    connectiondialog.cpp
+    theme/theme.cpp
+    widgets/avatar.cpp
+    widgets/chatlistitem.cpp
+    widgets/sidebar.cpp
+    widgets/chatarea.cpp
 )
 
 set(HEADERS
@@ -126,6 +134,13 @@ set(HEADERS
     settingsdialog.h
     knownkeysdialog.h
     mainwindow.h
+    chatwindow.h
+    connectiondialog.h
+    theme/theme.h
+    widgets/avatar.h
+    widgets/chatlistitem.h
+    widgets/sidebar.h
+    widgets/chatarea.h
 )
 
 add_executable(${PROJECT_NAME}

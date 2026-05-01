@@ -33,6 +33,12 @@ VideoCallDialog::VideoCallDialog(VideoCallManager *videoManager, Backend *backen
         keyGroupBox->setVisible(false);
     }
 
+    // If a chat session is active — default to relay-through-server mode and
+    // auto-fill the server endpoint from backend.
+    if (backend && backend->isConnected) {
+        relayCheck->setChecked(true);
+    }
+
     refreshDevices();
 
     // Pre-select defaults from settings

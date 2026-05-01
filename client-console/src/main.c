@@ -32,7 +32,7 @@
 #include <unistd.h>
 #endif
 
-#define PROGRAM_VERSION "0.4.3"
+#define PROGRAM_VERSION "0.5.0"
 
 /**
  * @brief Print command-line usage information

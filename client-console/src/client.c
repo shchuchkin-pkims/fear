@@ -40,6 +40,50 @@
 #include <libgen.h>
 #endif
 
+/* Create directory (no error if it already exists). Cross-platform. */
+static int mkdir_p_one(const char *dir) {
+#ifdef _WIN32
+    int rc = _mkdir(dir);
+#else
+    int rc = mkdir(dir, 0755);
+#endif
+    if (rc != 0 && errno != EEXIST) return -1;
+    return 0;
+}
+
+/* Ensure the parent directory of `path` exists, creating intermediate dirs as
+ * needed. Safe to call repeatedly. */
+static void ensure_parent_dir(const char *path) {
+    if (!path || !*path) return;
+    char buf[512];
+    strncpy(buf, path, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = '\0';
+
+    /* Find rightmost separator — that's the boundary between dir and filename. */
+    char *last = strrchr(buf, '/');
+#ifdef _WIN32
+    char *last_bs = strrchr(buf, '\\');
+    if (last_bs > last) last = last_bs;
+#endif
+    if (!last) return;       /* no directory component */
+    *last = '\0';
+    if (buf[0] == '\0') return;
+
+    /* Walk through path components, mkdir each one. */
+    for (char *p = buf + 1; *p; p++) {
+        if (*p == '/'
+#ifdef _WIN32
+            || *p == '\\'
+#endif
+            ) {
+            *p = '\0';
+            mkdir_p_one(buf);
+            *p = '/';
+        }
+    }
+    mkdir_p_one(buf);
+}
+
 /* Identity signing state (module-level) */
 static int g_has_identity = 0;
 static uint8_t g_identity_pk[IDENTITY_PK_BYTES];
@@ -542,6 +586,7 @@ void handle_file_transfer(const char *filename, const uint8_t key[32],
 void receive_file(const char *temp_path, size_t total_size,
                  const uint8_t *data, size_t data_len) {
     if (current_transfer.fp == NULL) {
+        ensure_parent_dir(temp_path);   /* mkdir -p Downloads */
         current_transfer.fp = fopen(temp_path, "wb");
         if (!current_transfer.fp) {
             printf("Cannot create temp file: %s\n", temp_path);
@@ -622,6 +667,7 @@ static void handle_accept_command(const char *arg) {
 
     if (current_transfer.completed) {
         /* File already fully received - move from temp */
+        ensure_parent_dir(final_path);   /* user-picked path may target a fresh dir */
         if (rename(current_transfer.temp_filename, final_path) == 0) {
             printf("File saved: %s\n", final_path);
         } else {

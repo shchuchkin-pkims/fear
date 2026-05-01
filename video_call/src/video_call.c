@@ -37,9 +37,24 @@
 #  include <sys/types.h>
 #  include <sys/time.h>
 #  include <netinet/tcp.h>
+#  include <netdb.h>
 #  include <pthread.h>
 #  define THREAD_RET void*
 #endif
+
+/* Resolve a host (literal IPv4 or DNS name) into an IPv4 in_addr.
+ * Returns 0 on success, -1 on failure. */
+static int resolve_host_v4(const char *host, struct in_addr *out) {
+    if (inet_pton(AF_INET, host, out) == 1) return 0;
+    struct addrinfo hints, *res = NULL;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    if (getaddrinfo(host, NULL, &hints, &res) != 0 || !res) return -1;
+    *out = ((struct sockaddr_in *)res->ai_addr)->sin_addr;
+    freeaddrinfo(res);
+    return 0;
+}
 
 #include <opus.h>
 #include <sodium.h>
@@ -248,8 +263,8 @@ static int tcp_relay_connect(VideoCall *vc, const char *ip, uint16_t port) {
     memset(&srv, 0, sizeof(srv));
     srv.sin_family = AF_INET;
     srv.sin_port = htons(port);
-    if (inet_pton(AF_INET, ip, &srv.sin_addr) != 1) {
-        fprintf(stderr, "TCP inet_pton failed for %s\n", ip);
+    if (resolve_host_v4(ip, &srv.sin_addr) != 0) {
+        fprintf(stderr, "TCP relay: cannot resolve host %s\n", ip);
         CLOSESOCK(vc->tcp_sock); vc->tcp_sock = 0;
         return -1;
     }
@@ -1669,8 +1684,8 @@ static int start_video_call(const char *remote_ip, uint16_t remote_port,
         memset(&vc->peer, 0, sizeof(vc->peer));
         vc->peer.sin_family = AF_INET;
         vc->peer.sin_port = htons(remote_port);
-        if (inet_pton(AF_INET, remote_ip, &vc->peer.sin_addr) != 1) {
-            fprintf(stderr, "inet_pton failed for %s\n", remote_ip);
+        if (resolve_host_v4(remote_ip, &vc->peer.sin_addr) != 0) {
+            fprintf(stderr, "cannot resolve host %s\n", remote_ip);
             CLOSESOCK(vc->sock); pcmring_free(&vc->out_ring); free(vc); SDL_Quit(); return -1;
         }
         vc->peer_set = 1;

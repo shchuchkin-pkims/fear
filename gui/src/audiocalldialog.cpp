@@ -33,6 +33,12 @@ AudioCallDialog::AudioCallDialog(AudioCallManager *audioManager, Backend *backen
         keyGroup->setVisible(false);
     }
 
+    // If we already have a chat session — default to relay mode through that
+    // server and auto-fill the IP/port. The toggled handler does the fill.
+    if (backend && backend->isConnected) {
+        relayCheck->setChecked(true);
+    }
+
     // Load audio devices list when dialog opens
     refreshAudioDevices();
 

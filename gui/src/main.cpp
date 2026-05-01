@@ -7,7 +7,9 @@
  */
 
 #include "mainwindow.h"
+#include "chatwindow.h"
 #include <QApplication>
+#include <QCommandLineParser>
 #include <QIcon>
 #include <QFile>
 #include <QDir>
@@ -57,6 +59,11 @@ static void cleanupOldFiles() {
  * @return Application exit code
  */
 int main(int argc, char **argv) {
+    // Opt out of X11 session management to avoid libICE killing us via its
+    // default IO error handler when the SM socket goes away mid-session.
+    // We don't participate in OS save/restore flows.
+    qunsetenv("SESSION_MANAGER");
+
     QApplication app(argc, argv);
 
     // Set application metadata for proper desktop integration
@@ -75,8 +82,21 @@ int main(int argc, char **argv) {
     // Clean up old backup files from previous updates
     cleanupOldFiles();
 
-    MainWindow w;
-    w.show();
+    // Parse CLI: --classic-ui falls back to legacy MainWindow during transition
+    QCommandLineParser parser;
+    QCommandLineOption classicUi(QStringList() << "classic-ui",
+        QStringLiteral("Use legacy GUI instead of the new Telegram-style window."));
+    parser.addOption(classicUi);
+    parser.addHelpOption();
+    parser.process(app);
 
+    if (parser.isSet(classicUi)) {
+        MainWindow w;
+        w.show();
+        return app.exec();
+    }
+
+    fear::ChatWindow w;
+    w.show();
     return app.exec();
 }

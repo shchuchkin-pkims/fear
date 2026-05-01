@@ -43,6 +43,7 @@ typedef SOCKET socket_t;
 #  include <sys/socket.h>
 #  include <sys/types.h>
 #  include <netinet/tcp.h>
+#  include <netdb.h>
 #  include <pthread.h>
 #  include <sys/select.h>
 typedef int socket_t;
@@ -292,6 +293,20 @@ static int tcp_send_all(socket_t fd, const void *buf, size_t len) {
     return 0;
 }
 
+/* Resolve a host (literal IPv4 or DNS name) into an IPv4 in_addr.
+ * Returns 0 on success, -1 on failure. */
+static int resolve_host_v4(const char *host, struct in_addr *out) {
+    if (inet_pton(AF_INET, host, out) == 1) return 0;
+    struct addrinfo hints, *res = NULL;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    if (getaddrinfo(host, NULL, &hints, &res) != 0 || !res) return -1;
+    *out = ((struct sockaddr_in *)res->ai_addr)->sin_addr;
+    freeaddrinfo(res);
+    return 0;
+}
+
 static int tcp_recv_all(socket_t fd, void *buf, size_t len) {
     uint8_t *p = (uint8_t *)buf;
     size_t got = 0;
@@ -313,8 +328,8 @@ static int tcp_relay_connect(AudioCall *c, const char *ip, uint16_t port) {
     memset(&srv, 0, sizeof(srv));
     srv.sin_family = AF_INET;
     srv.sin_port = htons(port);
-    if (inet_pton(AF_INET, ip, &srv.sin_addr) != 1) {
-        fprintf(stderr, "TCP inet_pton failed for %s\n", ip);
+    if (resolve_host_v4(ip, &srv.sin_addr) != 0) {
+        fprintf(stderr, "TCP relay: cannot resolve host %s\n", ip);
         CLOSESOCK(c->tcp_sock); c->tcp_sock = 0;
         return -1;
     }
@@ -1036,8 +1051,8 @@ int audio_call_start(AudioCall **out_call,
         memset(&c->peer, 0, sizeof(c->peer));
         c->peer.sin_family = AF_INET;
         c->peer.sin_port = htons(remote_port);
-        if (inet_pton(AF_INET, remote_ip, &c->peer.sin_addr) != 1) {
-            fprintf(stderr, "inet_pton failed for %s\n", remote_ip);
+        if (resolve_host_v4(remote_ip, &c->peer.sin_addr) != 0) {
+            fprintf(stderr, "cannot resolve host %s\n", remote_ip);
             CLOSESOCK(c->sock);
             pcmring_free(&c->out_ring);
             free(c);
