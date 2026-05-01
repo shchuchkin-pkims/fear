@@ -9,6 +9,7 @@
 #include "videocalldialog.h"
 #include "settingsdialog.h"
 #include "knownkeysdialog.h"
+#include "updatedialog.h"
 
 #include <QSplitter>
 #include <QApplication>
@@ -24,6 +25,11 @@
 #include <QFileInfo>
 #include <QDir>
 #include <QSettings>
+#include <QNetworkAccessManager>
+#include <QNetworkRequest>
+#include <QNetworkReply>
+#include <QJsonDocument>
+#include <QJsonObject>
 
 namespace fear {
 
@@ -98,6 +104,9 @@ void ChatWindow::showEvent(QShowEvent *e) {
     if (!m_connectShown) {
         m_connectShown = true;
         QTimer::singleShot(0, this, &ChatWindow::requestConnect);
+        // Silent auto-update check ~3s after launch (let the connect dialog
+        // appear first, then probe GitHub in the background).
+        QTimer::singleShot(3000, this, [this]{ checkForUpdates(/*silent=*/true); });
     }
 }
 
@@ -287,6 +296,8 @@ void ChatWindow::onSidebarMenu(const QPoint &globalPos) {
                                                  : tr("Switch to dark theme"));
     QAction *settingsAct   = menu.addAction(tr("Settings"));
     QAction *trustedAct    = menu.addAction(tr("Trusted keys"));
+    QAction *updateAct     = menu.addAction(tr("Check for updates"));
+    QAction *aboutAct      = menu.addAction(tr("About F.E.A.R."));
     menu.addSeparator();
     QAction *quitAct       = menu.addAction(tr("Quit"));
 
@@ -299,7 +310,106 @@ void ChatWindow::onSidebarMenu(const QPoint &globalPos) {
     else if (picked == themeAct)      toggleTheme();
     else if (picked == settingsAct)   openSettings();
     else if (picked == trustedAct)    openTrustedKeys();
+    else if (picked == updateAct)     checkForUpdates(/*silent=*/false);
+    else if (picked == aboutAct)      showAbout();
     else if (picked == quitAct)       close();
+}
+
+void ChatWindow::showAbout() {
+    const QString html = tr(
+        "<div style='font-family:sans-serif'>"
+        "<h2 style='margin-bottom:4px'>F.E.A.R. Messenger</h2>"
+        "<p style='color:#888;margin-top:0'>"
+        "Fully Encrypted Anonymous Routing<br>"
+        "Version %1"
+        "</p>"
+        "<p>End-to-end encrypted text, voice and video over a self-hostable "
+        "TCP relay. Open source, decentralised, no phone numbers.</p>"
+        "<h4>Author</h4>"
+        "<p>Evgeny Shchuchkin<br>"
+        "<a href='mailto:shchuchkin-pkims@yandex.ru'>shchuchkin-pkims@yandex.ru</a></p>"
+        "<h4>Links</h4>"
+        "<ul style='margin-top:0'>"
+        "<li>Site: <a href='https://fear-project.ru/'>fear-project.ru</a></li>"
+        "<li>Desktop: <a href='https://github.com/shchuchkin-pkims/fear'>"
+        "github.com/shchuchkin-pkims/fear</a></li>"
+        "<li>Mobile: <a href='https://github.com/shchuchkin-pkims/fear-mobile'>"
+        "github.com/shchuchkin-pkims/fear-mobile</a></li>"
+        "</ul>"
+        "</div>"
+    ).arg(QStringLiteral(FEAR_VERSION));
+
+    QMessageBox box(this);
+    box.setWindowTitle(tr("About F.E.A.R."));
+    box.setTextFormat(Qt::RichText);
+    box.setTextInteractionFlags(Qt::TextBrowserInteraction);
+    box.setText(html);
+    box.setStandardButtons(QMessageBox::Ok);
+    box.exec();
+}
+
+// Compare semantic versions like "1.2.3". Returns -1/0/+1 for a<b/a==b/a>b.
+static int compareSemver(const QString &a, const QString &b) {
+    auto parts = [](const QString &s) {
+        QStringList p = s.split('.');
+        while (p.size() < 3) p << "0";
+        return p;
+    };
+    QStringList pa = parts(a), pb = parts(b);
+    for (int i = 0; i < 3; ++i) {
+        int xa = pa[i].toInt();
+        int xb = pb[i].toInt();
+        if (xa != xb) return xa < xb ? -1 : 1;
+    }
+    return 0;
+}
+
+void ChatWindow::checkForUpdates(bool silent) {
+    static QNetworkAccessManager *net = nullptr;
+    if (!net) net = new QNetworkAccessManager(this);
+
+    QUrl url("https://api.github.com/repos/shchuchkin-pkims/fear/releases/latest");
+    QNetworkRequest req(url);
+    req.setRawHeader("Accept", "application/vnd.github+json");
+    QNetworkReply *reply = net->get(req);
+    connect(reply, &QNetworkReply::finished, this, [this, reply, silent]() {
+        reply->deleteLater();
+        if (reply->error() != QNetworkReply::NoError) {
+            if (!silent) QMessageBox::warning(this, tr("Update check"),
+                tr("Failed to query GitHub: %1").arg(reply->errorString()));
+            return;
+        }
+        QJsonDocument doc = QJsonDocument::fromJson(reply->readAll());
+        const QString tag = doc.object().value("tag_name").toString();
+        const QString latest = tag.startsWith('v') ? tag.mid(1) : tag;
+        const QString current = QStringLiteral(FEAR_VERSION);
+
+        if (latest.isEmpty()) {
+            if (!silent) QMessageBox::information(this, tr("Update check"),
+                tr("Couldn't read latest version from GitHub."));
+            return;
+        }
+
+        if (compareSemver(latest, current) <= 0) {
+            // No update needed. Silent → say nothing; manual → toast-style info.
+            if (!silent) QMessageBox::information(this, tr("Up to date"),
+                tr("You're on the latest version (v%1).").arg(current));
+            return;
+        }
+
+        // Update available — ask user.
+        const auto answer = QMessageBox::question(this, tr("Update available"),
+            tr("Version %1 is available (you have %2). Update now?\n\n"
+               "The app will download, install and restart automatically.")
+                .arg(latest, current),
+            QMessageBox::Yes | QMessageBox::No);
+        if (answer != QMessageBox::Yes) return;
+
+        // Open the existing UpdateDialog — it spawns the updater binary, shows
+        // live output, and offers to restart on completion.
+        UpdateDialog dlg(this, m_backend->cliPath);
+        dlg.exec();
+    });
 }
 
 void ChatWindow::toggleTheme() {

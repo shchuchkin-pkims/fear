@@ -39,6 +39,8 @@ private:
     void openSettings();
     void openTrustedKeys();
     void toggleTheme();
+    void checkForUpdates(bool silent);
+    void showAbout();
     void handleFileOffer(const QString &sender, const QString &filename, const QString &sizeStr);
     void updateOnlineStatus();
 

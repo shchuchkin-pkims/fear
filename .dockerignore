@@ -1,0 +1,24 @@
+# Anything not needed by the server binary build
+.git
+.github
+.vscode
+build
+build-linux
+.build-temp
+gui
+audio_call
+video_call
+key-exchange
+updater
+web
+screenshots
+doc
+lib
+*.zip
+*.apk
+*.exe
+*.dll
+fear-linux-x86_64.zip
+fear-windows-x86_64.zip
+README*.md
+LICENSE

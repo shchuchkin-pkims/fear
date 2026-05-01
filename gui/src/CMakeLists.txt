@@ -19,7 +19,11 @@ set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib")
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")  # Статическая линковка для MSVC
 set(CMAKE_POSITION_INDEPENDENT_CODE OFF)  # Отключаем PIC для статической линковки
 
-find_package(Qt6 REQUIRED COMPONENTS Widgets)
+find_package(Qt6 REQUIRED COMPONENTS Widgets Network)
+
+# Bake version into GUI for the auto-update check (must match PROGRAM_VERSION in
+# client-console/src/main.c).
+add_compile_definitions(FEAR_VERSION="0.5.0")
 
 # Получаем путь к windeployqt (только для Windows)
 if(WIN32)
@@ -160,6 +164,7 @@ endif()
 
 target_link_libraries(fear_gui PRIVATE
     Qt6::Widgets
+    Qt6::Network
     ${LIBSODIUM_LIBRARIES}
 )
 
