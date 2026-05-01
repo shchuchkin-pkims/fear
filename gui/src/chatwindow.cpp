@@ -326,7 +326,7 @@ void ChatWindow::showAbout() {
         "<p>End-to-end encrypted text, voice and video over a self-hostable "
         "TCP relay. Open source, decentralised, no phone numbers.</p>"
         "<h4>Author</h4>"
-        "<p>Evgeny Shchuchkin<br>"
+        "<p>Evgenii Shchuchkin<br>"
         "<a href='mailto:shchuchkin-pkims@yandex.ru'>shchuchkin-pkims@yandex.ru</a></p>"
         "<h4>Links</h4>"
         "<ul style='margin-top:0'>"
