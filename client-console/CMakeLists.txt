@@ -27,6 +27,7 @@ set(SOURCES
     ${SRC_DIR}/network.c
     ${SRC_DIR}/client.c
     ${SRC_DIR}/server.c
+    ${SRC_DIR}/server_db.c
     ${CMAKE_SOURCE_DIR}/identity/identity.c
 )
 
@@ -80,6 +81,9 @@ else()
     # Поиск libsodium на Linux
     find_package(PkgConfig)
     pkg_check_modules(LIBSODIUM libsodium)
+    pkg_check_modules(SQLITE3   REQUIRED sqlite3)
+    target_include_directories(${TARGET_NAME} PRIVATE ${SQLITE3_INCLUDE_DIRS})
+    target_link_libraries(${TARGET_NAME} ${SQLITE3_LIBRARIES})
     if(LIBSODIUM_FOUND)
         target_include_directories(${TARGET_NAME} PRIVATE ${LIBSODIUM_INCLUDE_DIRS})
         target_link_libraries(${TARGET_NAME} ${LIBSODIUM_LIBRARIES})

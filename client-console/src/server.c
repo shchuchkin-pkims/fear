@@ -19,6 +19,7 @@
 
 #include "server.h"
 #include "network.h"
+#include "server_db.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -261,6 +262,153 @@ static void send_user_list(client_t *clients, int nclients, const char *room) {
 }
 
 
+/**
+ * Build and send a HANDLE_RESULT frame back to the requesting client.
+ *
+ * Frame mirrors the wire format used everywhere else (room/name/zero-nonce/
+ * type/clen/cipher); the cipher field carries the response payload directly
+ * since handle commands are public service messages.
+ *
+ * Payload layout: [status(1)][reason_len(1)][reason][optional pk(0 or 32)]
+ */
+static void send_handle_result(sock_t fd, const char *room, uint16_t room_len,
+                               uint8_t status, const char *reason,
+                               const uint8_t *pk_or_null) {
+    uint8_t  payload[256];
+    size_t   payload_len = 0;
+    payload[payload_len++] = status;
+
+    uint8_t reason_len = reason ? (uint8_t)strlen(reason) : 0;
+    if (reason_len > 200) reason_len = 200;
+    payload[payload_len++] = reason_len;
+    if (reason_len) {
+        memcpy(payload + payload_len, reason, reason_len);
+        payload_len += reason_len;
+    }
+    if (pk_or_null) {
+        memcpy(payload + payload_len, pk_or_null, 32);
+        payload_len += 32;
+    }
+
+    static const char *kSrvName = "server";
+    uint16_t name_len = (uint16_t)strlen(kSrvName);
+    uint8_t  nonce[CRYPTO_NPUBBYTES];
+    memset(nonce, 0, sizeof(nonce));
+
+    size_t frame_len = 2 + room_len + 2 + name_len + 2 + CRYPTO_NPUBBYTES + 1 + 4 + payload_len;
+    uint8_t *frame = (uint8_t *)malloc(frame_len);
+    if (!frame) return;
+
+    uint8_t *w = frame;
+    wr_u16(w, room_len);            w += 2;
+    memcpy(w, room, room_len);      w += room_len;
+    wr_u16(w, name_len);            w += 2;
+    memcpy(w, kSrvName, name_len);  w += name_len;
+    wr_u16(w, CRYPTO_NPUBBYTES);    w += 2;
+    memcpy(w, nonce, CRYPTO_NPUBBYTES); w += CRYPTO_NPUBBYTES;
+    *w++ = (uint8_t)MSG_TYPE_HANDLE_RESULT;
+    wr_u32(w, (uint32_t)payload_len); w += 4;
+    memcpy(w, payload, payload_len);
+
+    send_all(fd, frame, frame_len);
+    free(frame);
+}
+
+/**
+ * Inspect a freshly-read frame for handle-registry commands.
+ * If the frame's type is REGISTER_HANDLE / LOOKUP_HANDLE, process it
+ * locally (talks to server_db) and send a HANDLE_RESULT back.
+ *
+ * Returns 1 if the frame was a handle command (caller should NOT broadcast),
+ *         0 if it's a regular text/file/etc frame to be broadcast as usual.
+ */
+static int try_handle_command(sock_t fd, const uint8_t *frame, size_t flen) {
+    if (flen < 2) return 0;
+    uint16_t room_len = rd_u16(frame);
+    if (flen < (size_t)2 + room_len + 2) return 0;
+    uint16_t name_len = rd_u16(frame + 2 + room_len);
+    size_t off = 2 + room_len + 2 + name_len;
+    if (flen < off + 2) return 0;
+    uint16_t nonce_len = rd_u16(frame + off);
+    off += 2 + nonce_len;
+    if (flen < off + 1 + 4) return 0;
+    uint8_t  type = frame[off];
+    uint32_t clen = rd_u32(frame + off + 1);
+    if (flen < off + 5 + clen) return 0;
+    const uint8_t *cipher = frame + off + 5;
+    const char    *room   = (const char *)(frame + 2);
+
+    if (type == MSG_TYPE_REGISTER_HANDLE) {
+        /* payload: [pk(32)][sig(64)][handle_len(1)][handle UTF-8] */
+        if (clen < 32 + 64 + 1) {
+            send_handle_result(fd, room, room_len, 2, "payload too short", NULL);
+            return 1;
+        }
+        const uint8_t *pk        = cipher;
+        const uint8_t *sig       = cipher + 32;
+        uint8_t        handle_len = cipher[32 + 64];
+        if (clen < (uint32_t)32 + 64 + 1 + handle_len) {
+            send_handle_result(fd, room, room_len, 2, "truncated handle", NULL);
+            return 1;
+        }
+        char handle[64];
+        if (handle_len >= sizeof(handle)) handle_len = sizeof(handle) - 1;
+        memcpy(handle, cipher + 32 + 64 + 1, handle_len);
+        handle[handle_len] = '\0';
+
+        /* Verify the Ed25519 sig over the handle bytes — proves the requester
+         * actually owns identity_pk. */
+        if (crypto_sign_verify_detached(sig, (const uint8_t *)handle,
+                                        handle_len, pk) != 0) {
+            send_handle_result(fd, room, room_len, 2, "bad signature", NULL);
+            return 1;
+        }
+
+        handle_register_result_t rc = server_db_register_handle(handle, pk);
+        switch (rc) {
+            case HANDLE_REGISTER_OK:
+                send_handle_result(fd, room, room_len, 0, "ok", pk);
+                printf("[server] handle '%s' registered\n", handle);
+                break;
+            case HANDLE_REGISTER_CONFLICT:
+                send_handle_result(fd, room, room_len, 1, "handle taken", NULL);
+                break;
+            case HANDLE_REGISTER_INVALID:
+                send_handle_result(fd, room, room_len, 2, "invalid handle", NULL);
+                break;
+            default:
+                send_handle_result(fd, room, room_len, 3, "server error", NULL);
+                break;
+        }
+        return 1;
+    }
+
+    if (type == MSG_TYPE_LOOKUP_HANDLE) {
+        if (clen < 1) {
+            send_handle_result(fd, room, room_len, 2, "missing handle", NULL);
+            return 1;
+        }
+        uint8_t handle_len = cipher[0];
+        if (clen < (uint32_t)1 + handle_len) {
+            send_handle_result(fd, room, room_len, 2, "truncated handle", NULL);
+            return 1;
+        }
+        char handle[64];
+        if (handle_len >= sizeof(handle)) handle_len = sizeof(handle) - 1;
+        memcpy(handle, cipher + 1, handle_len);
+        handle[handle_len] = '\0';
+
+        uint8_t pk[32];
+        int rc = server_db_lookup_handle(handle, pk);
+        if (rc == 0)      send_handle_result(fd, room, room_len, 0, "ok", pk);
+        else if (rc == 1) send_handle_result(fd, room, room_len, 1, "not found", NULL);
+        else              send_handle_result(fd, room, room_len, 3, "server error", NULL);
+        return 1;
+    }
+
+    return 0;  /* not a handle command */
+}
+
 static void set_tcp_keepalive(sock_t fd) {
 #ifdef _WIN32
     DWORD yes = 1;
@@ -333,6 +481,13 @@ void run_server(uint16_t port) {
 #endif
     sock_t listener = server_listen(port);
     printf("[server] listening on 0.0.0.0:%u (TCP)\n", port);
+
+    /* Phase B-2: open the handles + user_blobs DB. Failure here is non-fatal —
+     * the relay still works without persistent state, just no handle
+     * registration is possible. */
+    if (server_db_open(NULL) < 0) {
+        printf("[server] WARN: server-db unavailable, handle commands will be rejected\n");
+    }
 
     /* Create UDP socket for relay, bound to same port */
     sock_t udp_sock = (sock_t)socket(AF_INET, SOCK_DGRAM, 0);
@@ -507,6 +662,14 @@ void run_server(uint16_t port) {
 
                 continue;
             }
+            /* Phase B-2: handle-registry commands are out-of-band — they
+             * don't belong to any chat room. Process and reply right away
+             * without registering this client into a room or broadcasting. */
+            if (try_handle_command(clients[i].fd, frame, flen)) {
+                free(frame);
+                continue;
+            }
+
             uint16_t room_len = rd_u16(frame);
             const char *room = (const char*)(frame + 2);
             uint16_t name_len = rd_u16(frame + 2 + room_len);
@@ -573,6 +736,7 @@ void run_server(uint16_t port) {
     }
     close_socket(udp_sock);
     close_socket(listener);
+    server_db_close();
 #ifdef _WIN32
     WSACleanup();
 #endif

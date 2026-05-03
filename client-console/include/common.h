@@ -72,7 +72,18 @@ typedef enum {
     MSG_TYPE_IDENTITY_ANNOUNCE = 9, /**< Identity announcement: [pk(32)][sig(64)] */
     MSG_TYPE_KEY_REQUEST  = 15,     /**< ECDH key request: [x25519_pk(32)] (zero nonce service msg) */
     MSG_TYPE_KEY_RESPONSE = 16,     /**< ECDH key response: [target_name_len(2)][target_name][responder_pk(32)][box_nonce(24)][crypto_box(room_key)(48)] */
-    MSG_TYPE_MEDIA_RELAY  = 17      /**< Media relay: payload is raw encrypted media packet (audio/video/hello) */
+    MSG_TYPE_MEDIA_RELAY  = 17,     /**< Media relay: payload is raw encrypted media packet (audio/video/hello) */
+    /* ===== Phase B-2: handle registry ===== */
+    MSG_TYPE_REGISTER_HANDLE  = 20, /**< Client → Server: claim a handle.
+                                          Payload: [pk(32)][sig(64)][handle_len(1)][handle UTF-8].
+                                          Server replies with REGISTER_HANDLE_RESULT. */
+    MSG_TYPE_LOOKUP_HANDLE    = 21, /**< Client → Server: ask which pk owns a handle.
+                                          Payload: [handle_len(1)][handle UTF-8].
+                                          Server replies with LOOKUP_HANDLE_RESULT. */
+    MSG_TYPE_HANDLE_RESULT    = 22  /**< Server → Client.
+                                          Payload: [status(1)][reason_len(1)][reason][pk(0 or 32)].
+                                          status: 0=ok, 1=conflict, 2=invalid, 3=server_error.
+                                          For lookup, pk is the owner (status=0) or absent (status=1). */
 } message_type_t;
 
 /* ===== Cryptographic Constants ===== */
