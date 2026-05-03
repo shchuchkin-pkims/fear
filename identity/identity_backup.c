@@ -11,6 +11,7 @@
 #include <string.h>
 #include <time.h>
 
+
 /* ===== Endian helpers (host → big-endian uint64) ===== */
 
 static void u64_to_be(uint8_t out[8], uint64_t v) {
