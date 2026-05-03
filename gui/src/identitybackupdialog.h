@@ -43,9 +43,11 @@ private:
     QLineEdit  *m_passwordConfirm;
     QLabel     *m_status;
     QPushButton *m_okBtn;
+    class QCheckBox *m_alsoQr = nullptr;   // export-only, shows QR after save
 
     bool runExport(QString *err);
     bool runImport(QString *err);
+    void showQrAfterExport();
 };
 
 #endif

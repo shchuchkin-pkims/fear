@@ -121,6 +121,7 @@ set(SOURCES
     chatwindow.cpp
     connectiondialog.cpp
     identitybackupdialog.cpp
+    qrshowdialog.cpp
     theme/theme.cpp
     widgets/avatar.cpp
     widgets/chatlistitem.cpp
@@ -145,6 +146,7 @@ set(HEADERS
     chatwindow.h
     connectiondialog.h
     identitybackupdialog.h
+    qrshowdialog.h
     theme/theme.h
     widgets/avatar.h
     widgets/chatlistitem.h
@@ -171,6 +173,7 @@ target_link_libraries(fear_gui PRIVATE
     Qt6::Widgets
     Qt6::Network
     ${LIBSODIUM_LIBRARIES}
+    qrencode
 )
 
 if(WIN32)

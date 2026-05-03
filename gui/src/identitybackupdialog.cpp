@@ -1,4 +1,5 @@
 #include "identitybackupdialog.h"
+#include "qrshowdialog.h"
 
 #include <QVBoxLayout>
 #include <QHBoxLayout>
@@ -8,6 +9,7 @@
 #include <QMessageBox>
 #include <QStandardPaths>
 #include <QApplication>
+#include <QCheckBox>
 #include <QFile>
 #include <QDir>
 
@@ -64,6 +66,11 @@ IdentityBackupDialog::IdentityBackupDialog(Mode mode, const QString &identityPat
         form->addRow(tr("Confirm:"), m_passwordConfirm);
     }
     layout->addLayout(form);
+
+    if (mode == Export) {
+        m_alsoQr = new QCheckBox(tr("Also show backup as QR code (for scanning on phone)"), this);
+        layout->addWidget(m_alsoQr);
+    }
 
     m_status = new QLabel(this);
     m_status->setWordWrap(true);
@@ -143,6 +150,9 @@ void IdentityBackupDialog::onAccept()
                                  m_mode == Export
                                     ? tr("Identity saved to %1.\nKeep the file (and your password) safe.").arg(QFileInfo(m_filePath).fileName())
                                     : tr("Identity restored. Reconnect to apply the change."));
+        if (m_mode == Export && m_alsoQr && m_alsoQr->isChecked()) {
+            showQrAfterExport();
+        }
         accept();
     } else {
         m_status->setStyleSheet("color: #c0392b;");
@@ -169,6 +179,43 @@ bool IdentityBackupDialog::runExport(QString *err)
         return false;
     }
     return true;
+}
+
+/**
+ * After a successful file export, re-encrypt the same identity in memory and
+ * pop a QR code window. We re-encrypt rather than reading the just-saved file
+ * back so the user only types the password once and we never need to re-prompt.
+ */
+void IdentityBackupDialog::showQrAfterExport()
+{
+    uint8_t pk[IDENTITY_PK_BYTES];
+    uint8_t sk[IDENTITY_SK_BYTES];
+    if (identity_load(m_identityPath.toUtf8().constData(), pk, sk) != 0) {
+        return;
+    }
+    QByteArray pwBytes = m_password->text().toUtf8();
+    uint8_t *buf = nullptr; size_t buf_len = 0;
+    int rc = identity_backup_export_buf(&buf, &buf_len, sk, pk, pwBytes.constData());
+    sodium_memzero(sk, sizeof(sk));
+    sodium_memzero(pwBytes.data(), pwBytes.size());
+
+    if (rc != 0 || !buf) return;
+
+    QByteArray bytes(reinterpret_cast<const char *>(buf), int(buf_len));
+    sodium_memzero(buf, buf_len);
+    free(buf);
+
+    QrShowDialog *qr = QrShowDialog::fromBinary(
+        bytes,
+        tr("Identity backup QR"),
+        tr("Scan this on another device → Import identity. Password required to decrypt."),
+        nullptr  // top-level so it survives this dialog closing
+    );
+    sodium_memzero(bytes.data(), bytes.size());
+    if (qr) {
+        qr->setAttribute(Qt::WA_DeleteOnClose);
+        qr->show();
+    }
 }
 
 bool IdentityBackupDialog::runImport(QString *err)
