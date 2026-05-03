@@ -11,6 +11,7 @@
 #include "knownkeysdialog.h"
 #include "identitybackupdialog.h"
 #include "updatedialog.h"
+#include "history.h"
 
 extern "C" {
 #include "identity.h"
@@ -79,6 +80,7 @@ ChatWindow::ChatWindow(QWidget *parent) : QMainWindow(parent) {
     setCentralWidget(m_split);
 
     m_backend = new Backend(this);
+    m_history = new History(this);
 
     // Backend → UI
     connect(m_backend, &Backend::connected,         this, &ChatWindow::handleConnected);
@@ -165,6 +167,14 @@ void ChatWindow::handleConnected() {
     m_sidebar->selectChat(e.id);
 
     m_chatArea->clearMessages();
+
+    // Replay locally-persisted history for this room (Phase A §9a) before
+    // any new live messages arrive.
+    if (m_history) {
+        const auto recent = m_history->loadRecent(m_backend->currentRoom);
+        for (const auto &m : recent) m_chatArea->appendMessage(m);
+    }
+
     m_seenPeers.clear();
     m_reportedCount = 0;
     updateOnlineStatus();
@@ -282,6 +292,14 @@ void ChatWindow::appendParsedLine(const QString &line) {
     msg.delivered = true;
     m_chatArea->appendMessage(msg);
 
+    // Persist to local history (Phase A §9a). Skip when no room is set
+    // (defensive — should never happen once connected).
+    if (m_history && !m_backend->currentRoom.isEmpty()) {
+        m_history->insert(m_backend->currentRoom, msg.sender, msg.text,
+                          msg.timestamp.toMSecsSinceEpoch(),
+                          msg.fromSelf, /*isSystem=*/false);
+    }
+
     // Heard from a real peer — count them as online even if [USERS] never came.
     if (!msg.fromSelf) {
         const int before = m_seenPeers.size();
@@ -306,6 +324,8 @@ void ChatWindow::onSidebarMenu(const QPoint &globalPos) {
     QAction *exportIdAct   = menu.addAction(tr("Export identity…"));
     QAction *importIdAct   = menu.addAction(tr("Import identity…"));
     menu.addSeparator();
+    QAction *clearHistAct  = menu.addAction(tr("Clear chat history…"));
+    menu.addSeparator();
     QAction *updateAct     = menu.addAction(tr("Check for updates"));
     QAction *aboutAct      = menu.addAction(tr("About F.E.A.R."));
     menu.addSeparator();
@@ -322,9 +342,30 @@ void ChatWindow::onSidebarMenu(const QPoint &globalPos) {
     else if (picked == trustedAct)    openTrustedKeys();
     else if (picked == exportIdAct)   openIdentityBackup(/*export=*/true);
     else if (picked == importIdAct)   openIdentityBackup(/*export=*/false);
+    else if (picked == clearHistAct)  clearActiveHistory();
     else if (picked == updateAct)     checkForUpdates(/*silent=*/false);
     else if (picked == aboutAct)      showAbout();
     else if (picked == quitAct)       close();
+}
+
+void ChatWindow::clearActiveHistory() {
+    if (!m_history || m_backend->currentRoom.isEmpty()) {
+        QMessageBox::information(this, tr("Clear history"),
+            tr("No active chat to clear."));
+        return;
+    }
+    auto answer = QMessageBox::question(this, tr("Clear chat history"),
+        tr("Delete all locally-stored messages for room '%1'?\n\n"
+           "Messages on the server and on other participants' devices stay.")
+            .arg(m_backend->currentRoom));
+    if (answer != QMessageBox::Yes) return;
+
+    if (m_history->clearRoom(m_backend->currentRoom)) {
+        m_chatArea->clearMessages();
+    } else {
+        QMessageBox::warning(this, tr("Clear history"),
+            tr("Could not clear local history."));
+    }
 }
 
 void ChatWindow::showAbout() {

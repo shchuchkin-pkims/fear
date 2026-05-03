@@ -14,6 +14,7 @@ namespace fear {
 
 class Sidebar;
 class ChatArea;
+class History;
 
 class ChatWindow : public QMainWindow {
     Q_OBJECT
@@ -42,6 +43,7 @@ private:
     void toggleTheme();
     void checkForUpdates(bool silent);
     void showAbout();
+    void clearActiveHistory();
     void handleFileOffer(const QString &sender, const QString &filename, const QString &sizeStr);
     void updateOnlineStatus();
 
@@ -49,6 +51,7 @@ private:
     Sidebar   *m_sidebar;
     ChatArea  *m_chatArea;
     Backend   *m_backend = nullptr;
+    History   *m_history = nullptr;
     bool       m_connectShown = false;
     Backend::ConnectMode m_lastMode = Backend::CREATE_ROOM;
     QDateTime  m_connectStarted;

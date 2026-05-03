@@ -19,7 +19,7 @@ set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib")
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")  # Статическая линковка для MSVC
 set(CMAKE_POSITION_INDEPENDENT_CODE OFF)  # Отключаем PIC для статической линковки
 
-find_package(Qt6 REQUIRED COMPONENTS Widgets Network)
+find_package(Qt6 REQUIRED COMPONENTS Widgets Network Sql)
 
 # Bake version into GUI for the auto-update check (must match PROGRAM_VERSION in
 # client-console/src/main.c).
@@ -122,6 +122,7 @@ set(SOURCES
     connectiondialog.cpp
     identitybackupdialog.cpp
     qrshowdialog.cpp
+    history.cpp
     theme/theme.cpp
     widgets/avatar.cpp
     widgets/chatlistitem.cpp
@@ -147,6 +148,7 @@ set(HEADERS
     connectiondialog.h
     identitybackupdialog.h
     qrshowdialog.h
+    history.h
     theme/theme.h
     widgets/avatar.h
     widgets/chatlistitem.h
@@ -172,6 +174,7 @@ endif()
 target_link_libraries(fear_gui PRIVATE
     Qt6::Widgets
     Qt6::Network
+    Qt6::Sql
     ${LIBSODIUM_LIBRARIES}
     qrencode
     zbar
