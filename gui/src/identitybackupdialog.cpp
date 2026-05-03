@@ -6,6 +6,7 @@
 #include <QFormLayout>
 #include <QFileDialog>
 #include <QFileInfo>
+#include <QImage>
 #include <QMessageBox>
 #include <QStandardPaths>
 #include <QApplication>
@@ -18,6 +19,44 @@ extern "C" {
 #include "identity_backup.h"
 #include <sodium.h>
 }
+
+#include <zbar.h>
+
+namespace {
+
+/**
+ * Decode the first QR code found in `image` via libzbar.
+ * Returns an empty QByteArray on failure.
+ *
+ * Pipeline: QImage → 8-bit grayscale → zbar_image_t (Y800 format)
+ *   → zbar_image_scanner_scan → first symbol's text payload.
+ */
+QByteArray decodeQrFromImage(const QImage &image) {
+    if (image.isNull()) return {};
+
+    QImage gray = image.convertToFormat(QImage::Format_Grayscale8);
+    if (gray.isNull()) return {};
+
+    zbar::ImageScanner scanner;
+    scanner.set_config(zbar::ZBAR_QRCODE, zbar::ZBAR_CFG_ENABLE, 1);
+
+    zbar::Image zimg(gray.width(), gray.height(), "Y800",
+                     gray.constBits(), gray.sizeInBytes());
+
+    int n = scanner.scan(zimg);
+    QByteArray out;
+    if (n > 0) {
+        for (auto sym = zimg.symbol_begin(); sym != zimg.symbol_end(); ++sym) {
+            const std::string s = sym->get_data();
+            out = QByteArray(s.data(), int(s.size()));
+            break;  // take the first QR
+        }
+    }
+    zimg.set_data(nullptr, 0);  // detach pixel buffer before QImage frees it
+    return out;
+}
+
+}  // namespace
 
 IdentityBackupDialog::IdentityBackupDialog(Mode mode, const QString &identityPath, QWidget *parent)
     : QDialog(parent), m_mode(mode), m_identityPath(identityPath)
@@ -106,8 +145,10 @@ void IdentityBackupDialog::browseFile()
             m_pathLabel->setStyleSheet("");
         }
     } else {
-        QString path = QFileDialog::getOpenFileName(this, tr("Open backup file…"),
-                                                    defaultDir, tr("FEAR backup (*.fbk);;All files (*)"));
+        QString path = QFileDialog::getOpenFileName(
+            this, tr("Open backup file or QR image…"),
+            defaultDir,
+            tr("FEAR backup or QR (*.fbk *.png *.jpg *.jpeg);;All files (*)"));
         if (!path.isEmpty()) {
             m_filePath = path;
             m_pathLabel->setText(QFileInfo(path).fileName());
@@ -223,13 +264,48 @@ bool IdentityBackupDialog::runImport(QString *err)
     uint8_t pk[IDENTITY_PK_BYTES];
     uint8_t sk[IDENTITY_SK_BYTES];
 
+    // Detect input format. .fbk files start with magic 'FBK1'. Otherwise
+    // try loading as an image (PNG/JPG) and decoding the first QR code,
+    // whose payload is the base64 of the same .fbk blob.
+    QFile inputFile(m_filePath);
+    if (!inputFile.open(QIODevice::ReadOnly)) {
+        if (err) *err = tr("Could not read %1").arg(m_filePath);
+        return false;
+    }
+    QByteArray fileBytes = inputFile.readAll();
+    inputFile.close();
+
+    QByteArray blob;
+    bool looksLikeFbk = fileBytes.size() >= 4 && memcmp(fileBytes.constData(), "FBK1", 4) == 0;
+    if (looksLikeFbk) {
+        blob = fileBytes;
+    } else {
+        QImage img;
+        if (!img.loadFromData(fileBytes)) {
+            if (err) *err = tr("Not a FEAR backup file and not an image with a QR.");
+            return false;
+        }
+        QByteArray qrText = decodeQrFromImage(img);
+        if (qrText.isEmpty()) {
+            if (err) *err = tr("No QR code found in the image.");
+            return false;
+        }
+        blob = QByteArray::fromBase64(qrText);
+        if (blob.size() < 4 || memcmp(blob.constData(), "FBK1", 4) != 0) {
+            if (err) *err = tr("Scanned QR is not a FEAR identity backup.");
+            return false;
+        }
+    }
+
     QByteArray pwBytes = m_password->text().toUtf8();
-    int rc = identity_backup_import(m_filePath.toUtf8().constData(),
-                                    pwBytes.constData(), sk, pk);
+    int rc = identity_backup_import_buf(reinterpret_cast<const uint8_t *>(blob.constData()),
+                                        size_t(blob.size()),
+                                        pwBytes.constData(), sk, pk);
     sodium_memzero(pwBytes.data(), pwBytes.size());
+    sodium_memzero(blob.data(), blob.size());
 
     if (rc != 0) {
-        if (err) *err = tr("Could not decrypt file. Wrong password or corrupt backup.");
+        if (err) *err = tr("Could not decrypt. Wrong password or corrupt backup.");
         return false;
     }
 

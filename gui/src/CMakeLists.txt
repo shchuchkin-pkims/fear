@@ -174,6 +174,7 @@ target_link_libraries(fear_gui PRIVATE
     Qt6::Network
     ${LIBSODIUM_LIBRARIES}
     qrencode
+    zbar
 )
 
 if(WIN32)
