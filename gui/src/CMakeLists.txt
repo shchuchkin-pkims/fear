@@ -126,6 +126,10 @@ set(SOURCES
     searchdialog.cpp
     profilesettings.cpp
     profiledialog.cpp
+    contactsdialog.cpp
+    # Phase B-2/B-3 wire helpers — handle registry + per-user blob store
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../identity/server_proto.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../identity/contacts_cipher.c
     theme/theme.cpp
     widgets/avatar.cpp
     widgets/chatlistitem.cpp
@@ -155,6 +159,7 @@ set(HEADERS
     searchdialog.h
     profilesettings.h
     profiledialog.h
+    contactsdialog.h
     theme/theme.h
     widgets/avatar.h
     widgets/chatlistitem.h

@@ -15,6 +15,7 @@
 #include "searchdialog.h"
 #include "profilesettings.h"
 #include "profiledialog.h"
+#include "contactsdialog.h"
 
 extern "C" {
 #include "identity.h"
@@ -330,6 +331,7 @@ void ChatWindow::onSidebarMenu(const QPoint &globalPos) {
         Theme::instance().mode() == Theme::Dark ? tr("Switch to light theme")
                                                  : tr("Switch to dark theme"));
     QAction *profileAct    = menu.addAction(tr("My profile…"));
+    QAction *contactsAct   = menu.addAction(tr("Contacts…"));
     QAction *settingsAct   = menu.addAction(tr("Settings"));
     QAction *trustedAct    = menu.addAction(tr("Trusted keys"));
     menu.addSeparator();
@@ -352,6 +354,7 @@ void ChatWindow::onSidebarMenu(const QPoint &globalPos) {
     else if (picked == disconnectAct) m_backend->disconnect();
     else if (picked == themeAct)      toggleTheme();
     else if (picked == profileAct)    openProfile();
+    else if (picked == contactsAct)   openContacts();
     else if (picked == settingsAct)   openSettings();
     else if (picked == trustedAct)    openTrustedKeys();
     else if (picked == exportIdAct)   openIdentityBackup(/*export=*/true);
@@ -364,6 +367,20 @@ void ChatWindow::onSidebarMenu(const QPoint &globalPos) {
     else if (picked == updateAct)     checkForUpdates(/*silent=*/false);
     else if (picked == aboutAct)      showAbout();
     else if (picked == quitAct)       close();
+}
+
+void ChatWindow::openContacts() {
+    if (m_backend->serverHost.isEmpty()) {
+        QMessageBox::information(this, tr("Contacts"),
+            tr("Connect to a server first — contacts are stored as an "
+               "encrypted blob on the server."));
+        return;
+    }
+    ContactsDialog dlg(m_backend->identityFilePath,
+                       m_backend->serverHost,
+                       (uint16_t)m_backend->serverPort,
+                       this);
+    dlg.exec();
 }
 
 void ChatWindow::openProfile() {
