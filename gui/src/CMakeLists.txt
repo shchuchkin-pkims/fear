@@ -124,6 +124,8 @@ set(SOURCES
     qrshowdialog.cpp
     history.cpp
     searchdialog.cpp
+    profilesettings.cpp
+    profiledialog.cpp
     theme/theme.cpp
     widgets/avatar.cpp
     widgets/chatlistitem.cpp
@@ -151,6 +153,8 @@ set(HEADERS
     qrshowdialog.h
     history.h
     searchdialog.h
+    profilesettings.h
+    profiledialog.h
     theme/theme.h
     widgets/avatar.h
     widgets/chatlistitem.h

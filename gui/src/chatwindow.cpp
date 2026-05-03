@@ -13,6 +13,8 @@
 #include "updatedialog.h"
 #include "history.h"
 #include "searchdialog.h"
+#include "profilesettings.h"
+#include "profiledialog.h"
 
 extern "C" {
 #include "identity.h"
@@ -82,6 +84,7 @@ ChatWindow::ChatWindow(QWidget *parent) : QMainWindow(parent) {
 
     m_backend = new Backend(this);
     m_history = new History(this);
+    m_profile = new ProfileSettings(this);
 
     // Backend → UI
     connect(m_backend, &Backend::connected,         this, &ChatWindow::handleConnected);
@@ -157,6 +160,13 @@ void ChatWindow::requestConnect() {
 }
 
 void ChatWindow::handleConnected() {
+    // Mirror of Android ProfileStore.markRegistered: first successful connect
+    // to a host = this user has effectively claimed @displayName@host on it.
+    // Phase B-2 will replace this with the server's REGISTER_HANDLE confirmation.
+    if (m_profile && !m_backend->serverHost.isEmpty()) {
+        m_profile->markRegistered(m_backend->serverHost);
+    }
+
     ChatListEntry e;
     e.id           = m_backend->currentRoom;
     e.title        = m_backend->currentRoom;
@@ -319,6 +329,7 @@ void ChatWindow::onSidebarMenu(const QPoint &globalPos) {
     QAction *themeAct      = menu.addAction(
         Theme::instance().mode() == Theme::Dark ? tr("Switch to light theme")
                                                  : tr("Switch to dark theme"));
+    QAction *profileAct    = menu.addAction(tr("My profile…"));
     QAction *settingsAct   = menu.addAction(tr("Settings"));
     QAction *trustedAct    = menu.addAction(tr("Trusted keys"));
     menu.addSeparator();
@@ -340,6 +351,7 @@ void ChatWindow::onSidebarMenu(const QPoint &globalPos) {
     if      (picked == connectAct)    requestConnect();
     else if (picked == disconnectAct) m_backend->disconnect();
     else if (picked == themeAct)      toggleTheme();
+    else if (picked == profileAct)    openProfile();
     else if (picked == settingsAct)   openSettings();
     else if (picked == trustedAct)    openTrustedKeys();
     else if (picked == exportIdAct)   openIdentityBackup(/*export=*/true);
@@ -352,6 +364,20 @@ void ChatWindow::onSidebarMenu(const QPoint &globalPos) {
     else if (picked == updateAct)     checkForUpdates(/*silent=*/false);
     else if (picked == aboutAct)      showAbout();
     else if (picked == quitAct)       close();
+}
+
+void ChatWindow::openProfile() {
+    ProfileDialog dlg(
+        m_profile,
+        m_backend->identityFilePath,
+        /*onExport=*/ [this]{ openIdentityBackup(/*export=*/true); },
+        /*onShowQr=*/ [this]{
+            // Reuse the export+QR path; the user will get a 'show as QR'
+            // checkbox prefilled.
+            openIdentityBackup(/*export=*/true);
+        },
+        this);
+    dlg.exec();
 }
 
 void ChatWindow::clearActiveHistory() {
