@@ -118,4 +118,36 @@ bool History::clearAll() {
     return q.exec("DELETE FROM messages");
 }
 
+QVector<History::SearchHit> History::search(const QString &needle, int limit) {
+    QVector<SearchHit> out;
+    if (!m_open || needle.isEmpty()) return out;
+
+    QSqlQuery q(m_db);
+    q.prepare("SELECT roomId, sender, text, ts, fromSelf FROM messages "
+              "WHERE text LIKE ? ESCAPE '\\' "
+              "ORDER BY ts DESC LIMIT ?");
+    // Escape SQL LIKE wildcards in user input (% _ \) so "50%" doesn't match
+    // everything containing "50".
+    QString escaped = needle;
+    escaped.replace('\\', QStringLiteral("\\\\"))
+           .replace('%',  QStringLiteral("\\%"))
+           .replace('_',  QStringLiteral("\\_"));
+    q.addBindValue("%" + escaped + "%");
+    q.addBindValue(limit);
+    if (!q.exec()) {
+        qWarning() << "History::search failed:" << q.lastError().text();
+        return out;
+    }
+    while (q.next()) {
+        out.append(SearchHit{
+            q.value(0).toString(),
+            q.value(1).toString(),
+            q.value(2).toString(),
+            q.value(3).toLongLong(),
+            q.value(4).toBool(),
+        });
+    }
+    return out;
+}
+
 }  // namespace fear

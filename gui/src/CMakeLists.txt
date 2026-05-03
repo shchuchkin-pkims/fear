@@ -123,6 +123,7 @@ set(SOURCES
     identitybackupdialog.cpp
     qrshowdialog.cpp
     history.cpp
+    searchdialog.cpp
     theme/theme.cpp
     widgets/avatar.cpp
     widgets/chatlistitem.cpp
@@ -149,6 +150,7 @@ set(HEADERS
     identitybackupdialog.h
     qrshowdialog.h
     history.h
+    searchdialog.h
     theme/theme.h
     widgets/avatar.h
     widgets/chatlistitem.h

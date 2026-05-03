@@ -44,6 +44,18 @@ public:
     /** Drop the entire history table. */
     bool clearAll();
 
+    /** One row of a search result (parallel to MessageEntity on Android). */
+    struct SearchHit {
+        QString roomId;
+        QString sender;
+        QString text;
+        qint64  ts;        // unix millis
+        bool    fromSelf;
+    };
+
+    /** Case-insensitive substring search (LIKE %needle%). */
+    QVector<SearchHit> search(const QString &needle, int limit = 200);
+
 private:
     QSqlDatabase m_db;
     bool m_open = false;

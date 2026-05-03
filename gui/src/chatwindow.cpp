@@ -12,6 +12,7 @@
 #include "identitybackupdialog.h"
 #include "updatedialog.h"
 #include "history.h"
+#include "searchdialog.h"
 
 extern "C" {
 #include "identity.h"
@@ -324,6 +325,7 @@ void ChatWindow::onSidebarMenu(const QPoint &globalPos) {
     QAction *exportIdAct   = menu.addAction(tr("Export identity…"));
     QAction *importIdAct   = menu.addAction(tr("Import identity…"));
     menu.addSeparator();
+    QAction *searchAct     = menu.addAction(tr("Search messages…"));
     QAction *clearHistAct  = menu.addAction(tr("Clear chat history…"));
     menu.addSeparator();
     QAction *updateAct     = menu.addAction(tr("Check for updates"));
@@ -343,6 +345,10 @@ void ChatWindow::onSidebarMenu(const QPoint &globalPos) {
     else if (picked == exportIdAct)   openIdentityBackup(/*export=*/true);
     else if (picked == importIdAct)   openIdentityBackup(/*export=*/false);
     else if (picked == clearHistAct)  clearActiveHistory();
+    else if (picked == searchAct) {
+        SearchDialog dlg(m_history, this);
+        dlg.exec();
+    }
     else if (picked == updateAct)     checkForUpdates(/*silent=*/false);
     else if (picked == aboutAct)      showAbout();
     else if (picked == quitAct)       close();
