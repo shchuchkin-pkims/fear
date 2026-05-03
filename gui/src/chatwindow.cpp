@@ -380,6 +380,20 @@ void ChatWindow::openContacts() {
                        m_backend->serverHost,
                        (uint16_t)m_backend->serverPort,
                        this);
+    /* Phase B-4: double-click on a contact → start a DM with the
+     * deterministic room id. Both sides need to be online for the
+     * ECDH handshake (Phase E §9b will lift that with a server inbox). */
+    QString currentHost = m_backend->serverHost;
+    int     currentPort = m_backend->serverPort;
+    QString currentName = m_backend->currentName;
+    connect(&dlg, &ContactsDialog::openDmRequested, this,
+            [this, currentHost, currentPort, currentName](const QString &room) {
+        if (m_backend->isConnected) m_backend->disconnect();
+        m_backend->connectToServer(currentHost, currentPort, room,
+                                   /*key=*/QString(),
+                                   currentName.isEmpty() ? tr("me") : currentName,
+                                   Backend::JOIN_ROOM);
+    });
     dlg.exec();
 }
 

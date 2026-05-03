@@ -316,6 +316,38 @@ int identity_default_known_keys_path(char *buf, size_t bufsize) {
     return 0;
 }
 
+int identity_dm_room_id(const uint8_t my_pk[IDENTITY_PK_BYTES],
+                        const uint8_t other_pk[IDENTITY_PK_BYTES],
+                        char out[IDENTITY_DM_ROOM_ID_LEN]) {
+    if (!my_pk || !other_pk || !out) return -1;
+
+    /* Lexicographic byte order so both sides land on the same input. */
+    int cmp = memcmp(my_pk, other_pk, IDENTITY_PK_BYTES);
+    const uint8_t *lo = (cmp <= 0) ? my_pk : other_pk;
+    const uint8_t *hi = (cmp <= 0) ? other_pk : my_pk;
+
+    uint8_t concat[IDENTITY_PK_BYTES * 2];
+    memcpy(concat,                         lo, IDENTITY_PK_BYTES);
+    memcpy(concat + IDENTITY_PK_BYTES,     hi, IDENTITY_PK_BYTES);
+
+    uint8_t digest[16];
+    if (crypto_generichash(digest, sizeof(digest),
+                            concat, sizeof(concat), NULL, 0) != 0) {
+        return -1;
+    }
+
+    /* "dm:" prefix + 22-byte base64url-no-pad of 16 raw bytes + null */
+    out[0] = 'd';
+    out[1] = 'm';
+    out[2] = ':';
+    if (sodium_bin2base64(out + 3, IDENTITY_DM_ROOM_ID_LEN - 3,
+                          digest, sizeof(digest),
+                          sodium_base64_VARIANT_URLSAFE_NO_PADDING) == NULL) {
+        return -1;
+    }
+    return 0;
+}
+
 char *identity_pk_fingerprint(const uint8_t pk[IDENTITY_PK_BYTES],
                               char out[IDENTITY_FINGERPRINT_LEN]) {
     /* BLAKE2b hash of public key, take first 8 bytes */

@@ -5,6 +5,7 @@
 
 class QLabel;
 class QListWidget;
+class QListWidgetItem;
 class QPushButton;
 
 namespace fear {
@@ -28,9 +29,14 @@ public:
                    uint16_t       serverPort,
                    QWidget       *parent = nullptr);
 
+signals:
+    /** Emitted when the user wants to open a DM with `dmRoomId` ("dm:..."). */
+    void openDmRequested(const QString &dmRoomId);
+
 private slots:
     void refreshFromServer();
     void addContact();
+    void onContactActivated(QListWidgetItem *item);
 
 private:
     QString  m_identityPath;

@@ -140,6 +140,26 @@ int identity_default_known_keys_path(char *buf, size_t bufsize);
 char *identity_pk_fingerprint(const uint8_t pk[IDENTITY_PK_BYTES],
                               char out[IDENTITY_FINGERPRINT_LEN]);
 
+/* "dm:" + 22-char base64url(16-byte blake2b) + null = 26 bytes */
+#define IDENTITY_DM_ROOM_ID_LEN 32
+
+/**
+ * Deterministic 1-on-1 chat room identifier (Phase B-4, doc §11).
+ *
+ *   room_id = "dm:" + base64url_no_pad(BLAKE2b(min(pk_a, pk_b) || max(pk_a, pk_b), 16))
+ *
+ * Both sides compute the same value without coordination. The "dm:" prefix
+ * lets the UI tell DMs from group rooms at a glance.
+ *
+ * @param my_pk     32-byte own public key
+ * @param other_pk  32-byte peer public key
+ * @param out       Buffer of at least IDENTITY_DM_ROOM_ID_LEN bytes; NUL-terminated on success
+ * @return 0 on success, -1 on error
+ */
+int identity_dm_room_id(const uint8_t my_pk[IDENTITY_PK_BYTES],
+                        const uint8_t other_pk[IDENTITY_PK_BYTES],
+                        char out[IDENTITY_DM_ROOM_ID_LEN]);
+
 /**
  * Mark a known key as manually verified.
  *

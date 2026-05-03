@@ -65,6 +65,8 @@ ContactsDialog::ContactsDialog(const QString &identityPath,
     connect(m_refreshBtn, &QPushButton::clicked, this, &ContactsDialog::refreshFromServer);
     connect(m_addBtn,     &QPushButton::clicked, this, &ContactsDialog::addContact);
     connect(closeBtn,     &QPushButton::clicked, this, &QDialog::accept);
+    connect(m_list, &QListWidget::itemDoubleClicked,
+            this,   &ContactsDialog::onContactActivated);
 
     /* Auto-pull on open so the user doesn't have to click. */
     QMetaObject::invokeMethod(this, &ContactsDialog::refreshFromServer,
@@ -257,9 +259,49 @@ void ContactsDialog::renderJson(const QString &json) {
         QString line = !handle.isEmpty() && !server.isEmpty()
                        ? QString("%1   %2@%3").arg(name, handle, server)
                        : name;
-        if (!line.isEmpty()) m_list->addItem(line);
+        if (!line.isEmpty()) {
+            auto *it = new QListWidgetItem(line);
+            // Stash pk so a double-click can derive the deterministic DM room id.
+            it->setData(Qt::UserRole, o.value("pk").toString());
+            m_list->addItem(it);
+        }
     }
-    m_status->setText(tr("%1 contacts").arg(arr.count()));
+    m_status->setText(tr("%1 contacts — double-click to open DM").arg(arr.count()));
+}
+
+void ContactsDialog::onContactActivated(QListWidgetItem *item) {
+    if (!item) return;
+    const QString pk_b64 = item->data(Qt::UserRole).toString();
+    if (pk_b64.isEmpty()) return;
+
+    /* Decode peer pk and pull our own from the identity file to compute the
+     * deterministic DM room id. We don't need the secret key for this. */
+    uint8_t their_pk[IDENTITY_PK_BYTES];
+    size_t pk_len = 0;
+    QByteArray pkUtf8 = pk_b64.toUtf8();
+    if (sodium_base642bin(their_pk, IDENTITY_PK_BYTES,
+                          pkUtf8.constData(), pkUtf8.size(),
+                          NULL, &pk_len, NULL,
+                          sodium_base64_VARIANT_URLSAFE_NO_PADDING) != 0
+        || pk_len != IDENTITY_PK_BYTES) {
+        QMessageBox::warning(this, tr("Open chat"), tr("Stored pk is malformed."));
+        return;
+    }
+
+    uint8_t my_pk[IDENTITY_PK_BYTES];
+    if (identity_load_pk(m_identityPath.toUtf8().constData(), my_pk) != 0) {
+        QMessageBox::warning(this, tr("Open chat"),
+            tr("No identity yet — connect to a room first."));
+        return;
+    }
+
+    char dmId[IDENTITY_DM_ROOM_ID_LEN];
+    if (identity_dm_room_id(my_pk, their_pk, dmId) != 0) {
+        QMessageBox::warning(this, tr("Open chat"), tr("Could not derive DM room id."));
+        return;
+    }
+    emit openDmRequested(QString::fromUtf8(dmId));
+    accept();
 }
 
 }  // namespace fear
