@@ -80,10 +80,24 @@ typedef enum {
     MSG_TYPE_LOOKUP_HANDLE    = 21, /**< Client → Server: ask which pk owns a handle.
                                           Payload: [handle_len(1)][handle UTF-8].
                                           Server replies with LOOKUP_HANDLE_RESULT. */
-    MSG_TYPE_HANDLE_RESULT    = 22  /**< Server → Client.
+    MSG_TYPE_HANDLE_RESULT    = 22, /**< Server → Client.
                                           Payload: [status(1)][reason_len(1)][reason][pk(0 or 32)].
                                           status: 0=ok, 1=conflict, 2=invalid, 3=server_error.
                                           For lookup, pk is the owner (status=0) or absent (status=1). */
+    /* ===== Phase B-3: per-user encrypted blob storage ===== */
+    MSG_TYPE_BLOB_PUT         = 23, /**< Client → Server: write a blob.
+                                          Payload: [pk(32)][sig(64)][type_len(1)][type][cipher_len(4)][cipher].
+                                          sig is Ed25519(type || cipher) — proves owner of pk.
+                                          Server replies with BLOB_RESULT (no payload-cipher field). */
+    MSG_TYPE_BLOB_GET         = 24, /**< Client → Server: read a blob.
+                                          Payload: [pk(32)][type_len(1)][type].
+                                          No signature — blobs are encrypted client-side, server
+                                          can't decrypt anyway. Server replies with BLOB_RESULT
+                                          (with payload-cipher when found). */
+    MSG_TYPE_BLOB_RESULT      = 25  /**< Server → Client.
+                                          Payload: [status(1)][reason_len(1)][reason][cipher_len(4)][cipher].
+                                          status: 0=ok, 1=not_found, 2=invalid, 3=server_error.
+                                          cipher_len + cipher present only on GET success. */
 } message_type_t;
 
 /* ===== Cryptographic Constants ===== */

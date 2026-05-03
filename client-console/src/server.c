@@ -406,7 +406,123 @@ static int try_handle_command(sock_t fd, const uint8_t *frame, size_t flen) {
         return 1;
     }
 
-    return 0;  /* not a handle command */
+    if (type == MSG_TYPE_BLOB_PUT) {
+        /* payload: [pk(32)][sig(64)][type_len(1)][type][cipher_len(4)][cipher] */
+        if (clen < 32 + 64 + 1 + 4) {
+            send_handle_result(fd, room, room_len, 2, "blob put too short", NULL);
+            return 1;
+        }
+        const uint8_t *pk        = cipher;
+        const uint8_t *sig       = cipher + 32;
+        uint8_t        type_len  = cipher[32 + 64];
+        if (clen < (uint32_t)32 + 64 + 1 + type_len + 4) {
+            send_handle_result(fd, room, room_len, 2, "truncated type", NULL);
+            return 1;
+        }
+        const uint8_t *type_buf  = cipher + 32 + 64 + 1;
+        uint32_t       cipher_len = rd_u32(cipher + 32 + 64 + 1 + type_len);
+        if (clen < (uint32_t)32 + 64 + 1 + type_len + 4 + cipher_len) {
+            send_handle_result(fd, room, room_len, 2, "truncated cipher", NULL);
+            return 1;
+        }
+        const uint8_t *cipher_data = cipher + 32 + 64 + 1 + type_len + 4;
+
+        /* Sig covers (type_bytes || cipher_bytes) — proves the requester
+         * owns identity_pk before we let them write a blob under it. */
+        size_t signed_len = (size_t)type_len + cipher_len;
+        uint8_t *signed_buf = (uint8_t *)malloc(signed_len);
+        if (!signed_buf) {
+            send_handle_result(fd, room, room_len, 3, "oom", NULL);
+            return 1;
+        }
+        memcpy(signed_buf, type_buf, type_len);
+        memcpy(signed_buf + type_len, cipher_data, cipher_len);
+        int sig_ok = crypto_sign_verify_detached(sig, signed_buf, signed_len, pk);
+        free(signed_buf);
+        if (sig_ok != 0) {
+            send_handle_result(fd, room, room_len, 2, "bad signature", NULL);
+            return 1;
+        }
+
+        /* server_db expects a NUL-terminated blob_type string. */
+        char type_str[64];
+        if (type_len >= sizeof(type_str)) type_len = sizeof(type_str) - 1;
+        memcpy(type_str, type_buf, type_len);
+        type_str[type_len] = '\0';
+
+        if (server_db_put_blob(pk, type_str, cipher_data, cipher_len) == 0) {
+            send_handle_result(fd, room, room_len, 0, "ok", NULL);
+            printf("[server] blob '%s' stored (%u bytes)\n", type_str, cipher_len);
+        } else {
+            send_handle_result(fd, room, room_len, 3, "db error", NULL);
+        }
+        return 1;
+    }
+
+    if (type == MSG_TYPE_BLOB_GET) {
+        /* payload: [pk(32)][type_len(1)][type] */
+        if (clen < 32 + 1) {
+            send_handle_result(fd, room, room_len, 2, "blob get too short", NULL);
+            return 1;
+        }
+        const uint8_t *pk       = cipher;
+        uint8_t        type_len = cipher[32];
+        if (clen < (uint32_t)32 + 1 + type_len) {
+            send_handle_result(fd, room, room_len, 2, "truncated type", NULL);
+            return 1;
+        }
+        char type_str[64];
+        if (type_len >= sizeof(type_str)) type_len = sizeof(type_str) - 1;
+        memcpy(type_str, cipher + 33, type_len);
+        type_str[type_len] = '\0';
+
+        uint8_t *blob = NULL; size_t blob_len = 0;
+        int rc = server_db_get_blob(pk, type_str, &blob, &blob_len);
+        if (rc != 0) {
+            send_handle_result(fd, room, room_len,
+                               rc == 1 ? 1 : 3,
+                               rc == 1 ? "not found" : "db error", NULL);
+            return 1;
+        }
+
+        /* Build a BLOB_RESULT frame with [status=0][reason_len=2 "ok"]"ok"
+         * [cipher_len(4)][cipher]. We can't reuse send_handle_result because
+         * it doesn't carry an arbitrary cipher payload. Inline below. */
+        uint8_t  reason_len = 2;
+        size_t   payload_len = 1 + 1 + reason_len + 4 + blob_len;
+        uint8_t *payload     = (uint8_t *)malloc(payload_len);
+        if (!payload) { free(blob); return 1; }
+        payload[0] = 0;
+        payload[1] = reason_len;
+        memcpy(payload + 2, "ok", reason_len);
+        wr_u32(payload + 2 + reason_len, (uint32_t)blob_len);
+        memcpy(payload + 2 + reason_len + 4, blob, blob_len);
+
+        static const char *kSrvName = "server";
+        uint16_t name_len = (uint16_t)strlen(kSrvName);
+        uint8_t  nonce[CRYPTO_NPUBBYTES];
+        memset(nonce, 0, sizeof(nonce));
+        size_t frame_len = 2 + room_len + 2 + name_len + 2 + CRYPTO_NPUBBYTES + 1 + 4 + payload_len;
+        uint8_t *frame = (uint8_t *)malloc(frame_len);
+        if (!frame) { free(blob); free(payload); return 1; }
+        uint8_t *w = frame;
+        wr_u16(w, room_len);                w += 2;
+        memcpy(w, room, room_len);          w += room_len;
+        wr_u16(w, name_len);                w += 2;
+        memcpy(w, kSrvName, name_len);      w += name_len;
+        wr_u16(w, CRYPTO_NPUBBYTES);        w += 2;
+        memcpy(w, nonce, CRYPTO_NPUBBYTES); w += CRYPTO_NPUBBYTES;
+        *w++ = (uint8_t)MSG_TYPE_BLOB_RESULT;
+        wr_u32(w, (uint32_t)payload_len);   w += 4;
+        memcpy(w, payload, payload_len);
+        send_all(fd, frame, frame_len);
+        free(frame);
+        free(payload);
+        free(blob);
+        return 1;
+    }
+
+    return 0;  /* not a handle / blob command */
 }
 
 static void set_tcp_keepalive(sock_t fd) {

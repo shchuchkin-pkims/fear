@@ -43,4 +43,4 @@ updater/CMakeFiles/
 updater/cmake_install.cmake
 
 # Web bridge
-web/node_modules/
+web/node_modules/fear-server.sqlite*
