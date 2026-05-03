@@ -120,11 +120,15 @@ set(SOURCES
     # New Telegram-style UI (Phase 1)
     chatwindow.cpp
     connectiondialog.cpp
+    identitybackupdialog.cpp
     theme/theme.cpp
     widgets/avatar.cpp
     widgets/chatlistitem.cpp
     widgets/sidebar.cpp
     widgets/chatarea.cpp
+    # Phase A: identity backup (encrypted .fbk + QR blob)
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../identity/identity.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../identity/identity_backup.c
 )
 
 set(HEADERS
@@ -140,6 +144,7 @@ set(HEADERS
     mainwindow.h
     chatwindow.h
     connectiondialog.h
+    identitybackupdialog.h
     theme/theme.h
     widgets/avatar.h
     widgets/chatlistitem.h
@@ -174,6 +179,9 @@ else()
     target_include_directories(fear_gui PRIVATE ${LIBSODIUM_INCLUDE_DIRS})
     target_link_directories(fear_gui PRIVATE ${LIBSODIUM_LIBRARY_DIRS})
 endif()
+
+# identity.c / identity_backup.c live in ../../identity, expose their headers
+target_include_directories(fear_gui PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../identity)
 
 # Дополнительные флаги компиляции для статической линковки
 if(WIN32)

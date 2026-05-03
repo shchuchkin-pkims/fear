@@ -9,6 +9,7 @@
 #include "videocalldialog.h"
 #include "settingsdialog.h"
 #include "knownkeysdialog.h"
+#include "identitybackupdialog.h"
 #include "updatedialog.h"
 
 #include <QSplitter>
@@ -296,6 +297,10 @@ void ChatWindow::onSidebarMenu(const QPoint &globalPos) {
                                                  : tr("Switch to dark theme"));
     QAction *settingsAct   = menu.addAction(tr("Settings"));
     QAction *trustedAct    = menu.addAction(tr("Trusted keys"));
+    menu.addSeparator();
+    QAction *exportIdAct   = menu.addAction(tr("Export identity…"));
+    QAction *importIdAct   = menu.addAction(tr("Import identity…"));
+    menu.addSeparator();
     QAction *updateAct     = menu.addAction(tr("Check for updates"));
     QAction *aboutAct      = menu.addAction(tr("About F.E.A.R."));
     menu.addSeparator();
@@ -310,6 +315,8 @@ void ChatWindow::onSidebarMenu(const QPoint &globalPos) {
     else if (picked == themeAct)      toggleTheme();
     else if (picked == settingsAct)   openSettings();
     else if (picked == trustedAct)    openTrustedKeys();
+    else if (picked == exportIdAct)   openIdentityBackup(/*export=*/true);
+    else if (picked == importIdAct)   openIdentityBackup(/*export=*/false);
     else if (picked == updateAct)     checkForUpdates(/*silent=*/false);
     else if (picked == aboutAct)      showAbout();
     else if (picked == quitAct)       close();
@@ -431,6 +438,33 @@ void ChatWindow::openSettings() {
 void ChatWindow::openTrustedKeys() {
     KnownKeysDialog dlg(this);
     dlg.exec();
+}
+
+void ChatWindow::openIdentityBackup(bool exportMode) {
+    if (m_backend->identityFilePath.isEmpty()) {
+        QMessageBox::warning(this, tr("Identity backup"),
+            tr("Identity file path is not configured."));
+        return;
+    }
+    if (exportMode && !QFile::exists(m_backend->identityFilePath)) {
+        QMessageBox::warning(this, tr("Export identity"),
+            tr("No identity file found at %1.\nGenerate one by connecting to a room first.")
+                .arg(m_backend->identityFilePath));
+        return;
+    }
+    if (!exportMode && m_backend->isConnected) {
+        QMessageBox::information(this, tr("Import identity"),
+            tr("Disconnect from the current room before importing a new identity."));
+        return;
+    }
+
+    IdentityBackupDialog dlg(
+        exportMode ? IdentityBackupDialog::Export : IdentityBackupDialog::Import,
+        m_backend->identityFilePath, this);
+    if (dlg.exec() == QDialog::Accepted && !exportMode) {
+        // Backend already cached identity availability flag — refresh it
+        m_backend->identityAvailable = QFile::exists(m_backend->identityFilePath);
+    }
 }
 
 // ───────── Calls ─────────

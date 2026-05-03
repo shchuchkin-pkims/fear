@@ -38,6 +38,7 @@ private:
     void onSidebarMenu(const QPoint &globalPos);
     void openSettings();
     void openTrustedKeys();
+    void openIdentityBackup(bool exportMode);
     void toggleTheme();
     void checkForUpdates(bool silent);
     void showAbout();
