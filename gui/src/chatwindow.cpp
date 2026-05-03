@@ -12,6 +12,11 @@
 #include "identitybackupdialog.h"
 #include "updatedialog.h"
 
+extern "C" {
+#include "identity.h"
+#include <sodium.h>
+}
+
 #include <QSplitter>
 #include <QApplication>
 #include <QGuiApplication>
@@ -323,28 +328,58 @@ void ChatWindow::onSidebarMenu(const QPoint &globalPos) {
 }
 
 void ChatWindow::showAbout() {
-    const QString html = tr(
-        "<div style='font-family:sans-serif'>"
-        "<h2 style='margin-bottom:4px'>F.E.A.R. Messenger</h2>"
-        "<p style='color:#888;margin-top:0'>"
-        "Fully Encrypted Anonymous Routing<br>"
-        "Version %1"
-        "</p>"
-        "<p>End-to-end encrypted text, voice and video over a self-hostable "
-        "TCP relay. Open source, decentralised, no phone numbers.</p>"
-        "<h4>Author</h4>"
-        "<p>Evgenii Shchuchkin<br>"
-        "<a href='mailto:shchuchkin-pkims@yandex.ru'>shchuchkin-pkims@yandex.ru</a></p>"
-        "<h4>Links</h4>"
-        "<ul style='margin-top:0'>"
-        "<li>Site: <a href='https://fear-project.ru/'>fear-project.ru</a></li>"
-        "<li>Desktop: <a href='https://github.com/shchuchkin-pkims/fear'>"
-        "github.com/shchuchkin-pkims/fear</a></li>"
-        "<li>Mobile: <a href='https://github.com/shchuchkin-pkims/fear-mobile'>"
-        "github.com/shchuchkin-pkims/fear-mobile</a></li>"
-        "</ul>"
-        "</div>"
-    ).arg(QStringLiteral(FEAR_VERSION));
+    // Compute the user's identity card from identity_pk (per §1 of
+    // doc/architecture-decisions.md): "name#fpshort" + full 8-byte fp.
+    QString identitySection;
+    {
+        uint8_t pk[IDENTITY_PK_BYTES];
+        if (!m_backend->identityFilePath.isEmpty() &&
+            QFile::exists(m_backend->identityFilePath) &&
+            identity_load_pk(m_backend->identityFilePath.toUtf8().constData(), pk) == 0) {
+
+            uint8_t hash[8];
+            crypto_generichash(hash, sizeof(hash), pk, IDENTITY_PK_BYTES, NULL, 0);
+            QString fpshort;
+            for (int i = 0; i < 4; ++i) fpshort += QString::asprintf("%02x", hash[i]);
+            QString fpfull;
+            for (int i = 0; i < 8; ++i) {
+                fpfull += QString::asprintf("%02x", hash[i]);
+                if (i < 7) fpfull += ':';
+            }
+            QString name = m_backend->currentName.isEmpty() ? tr("anonymous")
+                                                            : m_backend->currentName.toHtmlEscaped();
+            identitySection = QString(
+                "<h4>You</h4>"
+                "<p style='font-weight:600;font-size:13pt'>%1#%2</p>"
+                "<p style='color:#888;font-size:9pt'>fingerprint: %3</p>"
+            ).arg(name, fpshort, fpfull);
+        }
+    }
+
+    const QString html =
+        QString(
+            "<div style='font-family:sans-serif'>"
+            "<h2 style='margin-bottom:4px'>F.E.A.R. Messenger</h2>"
+            "<p style='color:#888;margin-top:0'>"
+            "Fully Encrypted Anonymous Routing<br>"
+            "Version %1"
+            "</p>"
+            "%2"
+            "<p>End-to-end encrypted text, voice and video over a self-hostable "
+            "TCP relay. Open source, decentralised, no phone numbers.</p>"
+            "<h4>Author</h4>"
+            "<p>Evgenii Shchuchkin<br>"
+            "<a href='mailto:shchuchkin-pkims@yandex.ru'>shchuchkin-pkims@yandex.ru</a></p>"
+            "<h4>Links</h4>"
+            "<ul style='margin-top:0'>"
+            "<li>Site: <a href='https://fear-project.ru/'>fear-project.ru</a></li>"
+            "<li>Desktop: <a href='https://github.com/shchuchkin-pkims/fear'>"
+            "github.com/shchuchkin-pkims/fear</a></li>"
+            "<li>Mobile: <a href='https://github.com/shchuchkin-pkims/fear-mobile'>"
+            "github.com/shchuchkin-pkims/fear-mobile</a></li>"
+            "</ul>"
+            "</div>"
+        ).arg(QStringLiteral(FEAR_VERSION), identitySection);
 
     QMessageBox box(this);
     box.setWindowTitle(tr("About F.E.A.R."));
