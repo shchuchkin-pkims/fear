@@ -445,16 +445,17 @@ UI: иконка лупы вверху → поиск по всем чатам �
 ## Phase-план (финальный)
 
 ### **Phase 0 — security baseline (3-5 дней)**
-- Android: identity в EncryptedFile (вместо plaintext)
-- Релизы: minisign-подпись артефактов + ключ в README
+- ✅ Android: identity в EncryptedFile (вместо plaintext) — `b173f05`
+- ⏸ Релизы: minisign-подпись артефактов + ключ в README (отложено до подготовки релиза)
 
 ### **Phase A — foundation (2-3 недели)**
-- §1 Identity-формат `name#fpshort` в UI везде (handle позже в B)
-- §2 Backup: encrypted file (export/import) на обеих платформах
-- §2 Backup: QR generation на обеих, scan на Android, import-from-PNG на Desktop
-- §9a Локальная история (SQLite Desktop / Room Android)
-- §13 Replay protection (sender_seq + server last_seq cache)
-- §17 Локальный FTS5-поиск
+- ✅ §1 Identity-формат `name#fpshort` в UI везде (handle позже в B) — `7c2f8b9` / `661d8e5`
+- ✅ §2 Backup: encrypted file (export/import) на обеих платформах — `35cd9b8` / `df64898`
+- ✅ §2 Backup: QR generation на обеих — `744e3df` / `1551ee3`, full-screen + Save PNG `e1573f0`
+- ✅ §2 Backup: QR import (Android camera, Desktop PNG) — `6b83185` / `e597487`
+- ✅ §9a Локальная история (SQLite Desktop / Room Android) — Android `df64898`-followup, Desktop `+history.cpp`
+- ⏭ §13 Replay protection (sender_seq + server last_seq cache) — **перенесено в Phase D** вместе с wire-format v2
+- ✅ §17 Локальный поиск (LIKE, FTS5 отложен пока корпус мал)
 
 ### **Phase B — server state + UI rebuild (2-3 недели)**
 - §7 Server БД (SQLite в Docker volume), таблицы, квоты, retention-cron
@@ -470,6 +471,7 @@ UI: иконка лупы вверху → поиск по всем чатам �
 
 ### **Phase D — privacy метаданные (1 неделя)**
 - §4 Opaque room_id (HMAC) + sender_alias на проводе
+- §13 Replay protection (sender_seq в AAD) — едет вместе с opaque IDs, чтобы не делать два wire-bump
 - §14 Wire format v2, чистая миграция, отключение v1
 
 ### **Phase E — полноценный мессенджер (2-3 недели)**
