@@ -316,12 +316,12 @@ int identity_default_known_keys_path(char *buf, size_t bufsize) {
     return 0;
 }
 
-int identity_dm_room_id(const uint8_t my_pk[IDENTITY_PK_BYTES],
+int identity_pm_room_id(const uint8_t my_pk[IDENTITY_PK_BYTES],
                         const uint8_t other_pk[IDENTITY_PK_BYTES],
-                        char out[IDENTITY_DM_ROOM_ID_LEN]) {
+                        char out[IDENTITY_PM_ROOM_ID_LEN]) {
     if (!my_pk || !other_pk || !out) return -1;
 
-    /* Lexicographic byte order so both sides land on the same input. */
+    /* Лексикографический порядок — обе стороны попадают в один digest. */
     int cmp = memcmp(my_pk, other_pk, IDENTITY_PK_BYTES);
     const uint8_t *lo = (cmp <= 0) ? my_pk : other_pk;
     const uint8_t *hi = (cmp <= 0) ? other_pk : my_pk;
@@ -336,16 +336,57 @@ int identity_dm_room_id(const uint8_t my_pk[IDENTITY_PK_BYTES],
         return -1;
     }
 
-    /* "dm:" prefix + 22-byte base64url-no-pad of 16 raw bytes + null */
-    out[0] = 'd';
+    /* Префикс "pm:" + 22 base64url-no-pad от 16 байт + NUL */
+    out[0] = 'p';
     out[1] = 'm';
     out[2] = ':';
-    if (sodium_bin2base64(out + 3, IDENTITY_DM_ROOM_ID_LEN - 3,
+    if (sodium_bin2base64(out + 3, IDENTITY_PM_ROOM_ID_LEN - 3,
                           digest, sizeof(digest),
                           sodium_base64_VARIANT_URLSAFE_NO_PADDING) == NULL) {
         return -1;
     }
     return 0;
+}
+
+int identity_pm_room_key(const uint8_t my_sk[IDENTITY_SK_BYTES],
+                         const uint8_t other_pk[IDENTITY_PK_BYTES],
+                         uint8_t out_key[32]) {
+    if (!my_sk || !other_pk || !out_key) return -1;
+
+    /* Конвертируем ed25519 → curve25519. */
+    uint8_t my_x_sk[crypto_scalarmult_curve25519_BYTES];   /* 32 */
+    uint8_t their_x_pk[crypto_scalarmult_curve25519_BYTES];
+    if (crypto_sign_ed25519_sk_to_curve25519(my_x_sk, my_sk) != 0) return -1;
+    if (crypto_sign_ed25519_pk_to_curve25519(their_x_pk, other_pk) != 0) {
+        sodium_memzero(my_x_sk, sizeof(my_x_sk));
+        return -1;
+    }
+
+    /* Plain X25519 — оба получают одинаковый shared secret. */
+    uint8_t shared[crypto_scalarmult_BYTES];               /* 32 */
+    int rc = crypto_scalarmult(shared, my_x_sk, their_x_pk);
+    sodium_memzero(my_x_sk, sizeof(my_x_sk));
+    if (rc != 0) return -1;
+
+    /* lo/hi pk — публичный «info» с фиксированным порядком, доменно
+     * разделено константой "fear.pm.v1.key". my_pk вытащим из my_sk
+     * (последние 32 байта 64-байтового ed25519 sk). */
+    const uint8_t *my_pk = my_sk + 32;
+    int cmp = memcmp(my_pk, other_pk, IDENTITY_PK_BYTES);
+    const uint8_t *lo = (cmp <= 0) ? my_pk : other_pk;
+    const uint8_t *hi = (cmp <= 0) ? other_pk : my_pk;
+
+    static const char ctx[] = "fear.pm.v1.key";
+    uint8_t info[sizeof(ctx) - 1 + IDENTITY_PK_BYTES * 2];
+    memcpy(info,                                       ctx,  sizeof(ctx) - 1);
+    memcpy(info + (sizeof(ctx) - 1),                    lo,  IDENTITY_PK_BYTES);
+    memcpy(info + (sizeof(ctx) - 1) + IDENTITY_PK_BYTES, hi, IDENTITY_PK_BYTES);
+
+    rc = crypto_generichash(out_key, 32,
+                            info, sizeof(info),
+                            shared, sizeof(shared));
+    sodium_memzero(shared, sizeof(shared));
+    return (rc == 0) ? 0 : -1;
 }
 
 char *identity_pk_fingerprint(const uint8_t pk[IDENTITY_PK_BYTES],

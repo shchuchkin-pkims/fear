@@ -400,12 +400,11 @@ void ChatWindow::openContacts() {
     int     currentPort = m_backend->serverPort;
     QString currentName = m_backend->currentName;
     connect(&dlg, &ContactsDialog::openDmRequested, this,
-            [this, currentHost, currentPort, currentName](const QString &room) {
-        if (m_backend->isConnected) m_backend->disconnect();
-        m_backend->connectToServer(currentHost, currentPort, room,
-                                   /*key=*/QString(),
-                                   currentName.isEmpty() ? tr("me") : currentName,
-                                   Backend::AUTO_JOIN);
+            [this](const QString &room) {
+        // ContactsDialog::openDmRequested даёт нам уже готовый pm:... id,
+        // но для switchToDmRoom нужен peerPkB64. Делегируем через единый
+        // путь, который сам найдёт контакт по id.
+        onSidebarChatSelected(room);
     });
     dlg.exec();
 }
@@ -505,10 +504,10 @@ void ChatWindow::rebuildSidebarChats() {
                 || pkLen != IDENTITY_PK_BYTES) {
                 continue;
             }
-            char dmId[IDENTITY_DM_ROOM_ID_LEN];
-            if (identity_dm_room_id(my_pk, their_pk, dmId) != 0) continue;
+            char roomBuf[IDENTITY_PM_ROOM_ID_LEN];
+            if (identity_pm_room_id(my_pk, their_pk, roomBuf) != 0) continue;
             ChatListEntry e;
-            e.id           = QString::fromUtf8(dmId);
+            e.id           = QString::fromUtf8(roomBuf);
             e.title        = c.name.isEmpty() ? c.handle : c.name;
             e.preview      = (!c.handle.isEmpty() && !c.server.isEmpty())
                 ? QString("@%1@%2").arg(c.handle, c.server) : QString();
@@ -524,10 +523,12 @@ void ChatWindow::rebuildSidebarChats() {
     // ---- Group entries: every non-DM room we have history for ---------
     QSet<QString> groupRooms;
     for (auto it = historyTs.constBegin(); it != historyTs.constEnd(); ++it) {
-        if (!it.key().startsWith("dm:")) groupRooms.insert(it.key());
+        const QString &r = it.key();
+        if (!r.startsWith("pm:") && !r.startsWith("dm:")) groupRooms.insert(r);
     }
     if (m_backend->isConnected
         && !m_backend->currentRoom.isEmpty()
+        && !m_backend->currentRoom.startsWith("pm:")
         && !m_backend->currentRoom.startsWith("dm:")) {
         groupRooms.insert(m_backend->currentRoom);
     }
@@ -550,29 +551,42 @@ void ChatWindow::onSidebarChatSelected(const QString &id) {
     // QSplitter layout; we still suppress reconnects).
     if (id == m_backend->currentRoom) return;
 
-    // DM entry → derive the dm: room id from the contact's pk and reconnect.
-    if (id.startsWith("dm:")) {
-        // The dm: id alone is enough — both sides compute the same one,
-        // so we can JOIN by name without needing the contact's pk again.
-        const QString host = m_backend->serverHost;
-        const int     port = m_backend->serverPort;
-        const QString name = m_backend->currentName;
-        if (host.isEmpty()) {
-            QMessageBox::information(this, tr("Open chat"),
-                tr("Connect to a server first."));
+    // ЛС → ключ комнаты вычисляется детерминированно (X25519 ECDH из
+    // identity-ключей обоих собеседников). Гонки нет — оба клиента
+    // независимо получают один и тот же K_pm и подключаются как MANUAL_KEY.
+    if (id.startsWith("pm:") || id.startsWith("dm:")) {
+        // Найдём peerPkB64 для этого id в кэше контактов.
+        QString peerPkB64;
+        for (const auto &c : ContactsStore::instance()->all()) {
+            if (c.pk.isEmpty()) continue;
+            uint8_t their_pk[IDENTITY_PK_BYTES];
+            size_t pkLen = 0;
+            QByteArray pkUtf8 = c.pk.toUtf8();
+            if (sodium_base642bin(their_pk, IDENTITY_PK_BYTES,
+                                  pkUtf8.constData(), pkUtf8.size(),
+                                  nullptr, &pkLen, nullptr,
+                                  sodium_base64_VARIANT_URLSAFE_NO_PADDING) != 0
+                || pkLen != IDENTITY_PK_BYTES) {
+                continue;
+            }
+            uint8_t my_pk[IDENTITY_PK_BYTES];
+            if (identity_load_pk(m_backend->identityFilePath.toUtf8().constData(),
+                                 my_pk) != 0) continue;
+            char roomBuf[IDENTITY_PM_ROOM_ID_LEN];
+            if (identity_pm_room_id(my_pk, their_pk, roomBuf) != 0) continue;
+            if (QString::fromUtf8(roomBuf) == id) { peerPkB64 = c.pk; break; }
+        }
+        if (peerPkB64.isEmpty()) {
+            QMessageBox::warning(this, tr("Open chat"),
+                tr("Не нашли контакт для этой ЛС-комнаты."));
             return;
         }
-        if (m_backend->isConnected) m_backend->disconnect();
-        // AUTO_JOIN: пробуем JOIN, через 5с фолбэчим в CREATE. Иначе тот,
-        // кто открывает ЛС первым, навсегда висит на JOIN.
-        m_backend->connectToServer(host, port, id,
-            /*key=*/QString(),
-            name.isEmpty() ? tr("me") : name,
-            Backend::AUTO_JOIN);
+        switchToDmRoom(peerPkB64);
         return;
     }
 
-    // Group entry that is not the current one — те же AUTO-семантики.
+    // Обычная (групповая) комната — нужен ключ от создателя. Если это не
+    // текущая комната — спрашиваем, прежде чем дисконнектить из текущей.
     auto answer = QMessageBox::question(this, tr("Switch room"),
         tr("Switch to room '%1'? This will disconnect from '%2'.")
             .arg(id, m_backend->currentRoom));
@@ -587,11 +601,13 @@ void ChatWindow::onSidebarChatSelected(const QString &id) {
     m_backend->connectToServer(host, port, id,
         /*key=*/QString(),
         name.isEmpty() ? tr("me") : name,
-        Backend::AUTO_JOIN);
+        Backend::JOIN_ROOM);
 }
 
 void ChatWindow::switchToDmRoom(const QString &peerPkB64) {
-    // Helper used by the peer profile dialog's "Open chat" button.
+    // Открыть ЛС с peer-ом, чей identity_pk = peerPkB64.
+    // Детерминированно вычисляем room_id и K_pm через ECDH, затем
+    // подключаемся в режиме MANUAL_KEY с этим ключом — никакой гонки.
     uint8_t their_pk[IDENTITY_PK_BYTES];
     size_t pkLen = 0;
     QByteArray pkUtf8 = peerPkB64.toUtf8();
@@ -599,13 +615,58 @@ void ChatWindow::switchToDmRoom(const QString &peerPkB64) {
                           pkUtf8.constData(), pkUtf8.size(),
                           nullptr, &pkLen, nullptr,
                           sodium_base64_VARIANT_URLSAFE_NO_PADDING) != 0
-        || pkLen != IDENTITY_PK_BYTES) return;
+        || pkLen != IDENTITY_PK_BYTES) {
+        QMessageBox::warning(this, tr("Open chat"),
+            tr("Stored peer pk is malformed."));
+        return;
+    }
+
+    /* Загружаем свой полный 64-байтовый ed25519 sk + 32-байтовый pk. */
     uint8_t my_pk[IDENTITY_PK_BYTES];
-    if (identity_load_pk(m_backend->identityFilePath.toUtf8().constData(),
-                         my_pk) != 0) return;
-    char dmId[IDENTITY_DM_ROOM_ID_LEN];
-    if (identity_dm_room_id(my_pk, their_pk, dmId) != 0) return;
-    onSidebarChatSelected(QString::fromUtf8(dmId));
+    uint8_t my_sk[IDENTITY_SK_BYTES];
+    if (identity_load(m_backend->identityFilePath.toUtf8().constData(),
+                      my_pk, my_sk) != 0) {
+        QMessageBox::warning(this, tr("Open chat"),
+            tr("No identity yet — connect to a room first."));
+        return;
+    }
+
+    char roomBuf[IDENTITY_PM_ROOM_ID_LEN];
+    if (identity_pm_room_id(my_pk, their_pk, roomBuf) != 0) {
+        sodium_memzero(my_sk, sizeof(my_sk));
+        QMessageBox::warning(this, tr("Open chat"),
+            tr("Could not derive PM room id."));
+        return;
+    }
+    uint8_t key32[32];
+    int rc = identity_pm_room_key(my_sk, their_pk, key32);
+    sodium_memzero(my_sk, sizeof(my_sk));
+    if (rc != 0) {
+        QMessageBox::warning(this, tr("Open chat"),
+            tr("Could not derive PM room key."));
+        return;
+    }
+
+    /* CLI ждёт ключ в base64url-no-pad формате (см. MANUAL_KEY flow). */
+    char keyB64[64];
+    sodium_bin2base64(keyB64, sizeof(keyB64), key32, sizeof(key32),
+                      sodium_base64_VARIANT_URLSAFE_NO_PADDING);
+    sodium_memzero(key32, sizeof(key32));
+
+    const QString room = QString::fromUtf8(roomBuf);
+    const QString host = m_backend->serverHost;
+    const int     port = m_backend->serverPort;
+    const QString name = m_backend->currentName;
+    if (host.isEmpty()) {
+        QMessageBox::information(this, tr("Open chat"),
+            tr("Connect to a server first."));
+        return;
+    }
+    if (m_backend->isConnected) m_backend->disconnect();
+    m_backend->connectToServer(host, port, room,
+        QString::fromUtf8(keyB64),
+        name.isEmpty() ? tr("me") : name,
+        Backend::MANUAL_KEY);
 }
 
 void ChatWindow::openProfile() {

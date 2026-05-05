@@ -140,25 +140,61 @@ int identity_default_known_keys_path(char *buf, size_t bufsize);
 char *identity_pk_fingerprint(const uint8_t pk[IDENTITY_PK_BYTES],
                               char out[IDENTITY_FINGERPRINT_LEN]);
 
-/* "dm:" + 22-char base64url(16-byte blake2b) + null = 26 bytes */
-#define IDENTITY_DM_ROOM_ID_LEN 32
+/* "pm:" + 22-char base64url(16-byte blake2b) + null = 26 bytes */
+#define IDENTITY_PM_ROOM_ID_LEN 32
+
+/* Сохраняем старое имя как алиас, чтобы существующий код собирался во время
+ * переименования. Удалим алиас в Phase C. */
+#define IDENTITY_DM_ROOM_ID_LEN IDENTITY_PM_ROOM_ID_LEN
 
 /**
- * Deterministic 1-on-1 chat room identifier (Phase B-4, doc §11).
+ * Деёрминированный room_id для личного 1-на-1 чата (Phase B-5+).
  *
- *   room_id = "dm:" + base64url_no_pad(BLAKE2b(min(pk_a, pk_b) || max(pk_a, pk_b), 16))
+ *   room_id = "pm:" + base64url_no_pad(BLAKE2b(min(pk_a, pk_b) || max(pk_a, pk_b), 16))
  *
- * Both sides compute the same value without coordination. The "dm:" prefix
- * lets the UI tell DMs from group rooms at a glance.
+ * Обе стороны вычисляют одинаковое значение без координации. Префикс "pm:"
+ * позволяет UI отличать ЛС от групповых комнат.
  *
  * @param my_pk     32-byte own public key
  * @param other_pk  32-byte peer public key
- * @param out       Buffer of at least IDENTITY_DM_ROOM_ID_LEN bytes; NUL-terminated on success
- * @return 0 on success, -1 on error
+ * @param out       Буфер не менее IDENTITY_PM_ROOM_ID_LEN байт; NUL-terminated
+ * @return 0 при успехе, -1 при ошибке
  */
-int identity_dm_room_id(const uint8_t my_pk[IDENTITY_PK_BYTES],
+int identity_pm_room_id(const uint8_t my_pk[IDENTITY_PK_BYTES],
                         const uint8_t other_pk[IDENTITY_PK_BYTES],
-                        char out[IDENTITY_DM_ROOM_ID_LEN]);
+                        char out[IDENTITY_PM_ROOM_ID_LEN]);
+
+/* Совместимость: вызов идёт в новый identity_pm_room_id. Удалим в Phase C. */
+static inline int identity_dm_room_id(const uint8_t my_pk[IDENTITY_PK_BYTES],
+                                      const uint8_t other_pk[IDENTITY_PK_BYTES],
+                                      char out[IDENTITY_DM_ROOM_ID_LEN]) {
+    return identity_pm_room_id(my_pk, other_pk, out);
+}
+
+/**
+ * Деёрминированный 32-байтовый ключ AES-256-GCM для ЛС-комнаты с peer-ом.
+ *
+ * Вычисляется как HKDF-подобная свёртка X25519-shared-secret:
+ *   x_my_sk = ed25519_sk_to_curve25519(my_sk)
+ *   x_other_pk = ed25519_pk_to_curve25519(other_pk)
+ *   shared = X25519(x_my_sk, x_other_pk)
+ *   K_pm   = BLAKE2b(key=shared, data="fear.pm.v1.key" || lo_pk || hi_pk, 32)
+ *
+ * Свойства:
+ *   - оба собеседника получают один и тот же K_pm без обмена сообщениями;
+ *   - никто, кроме обоих обладателей secret-key, не может его вычислить;
+ *   - вход домен-разделён константой "fear.pm.v1.key", а заодно фиксирует
+ *     порядок pk через lo/hi (на случай повторного использования shared
+ *     для других целей в будущем).
+ *
+ * @param my_sk     64-байтовый ed25519 secret key (полный, как в файле)
+ * @param other_pk  32-байтовый ed25519 public key собеседника
+ * @param out_key   Буфер ровно 32 байта — заполнится K_pm
+ * @return 0 при успехе, -1 при ошибке
+ */
+int identity_pm_room_key(const uint8_t my_sk[IDENTITY_SK_BYTES],
+                         const uint8_t other_pk[IDENTITY_PK_BYTES],
+                         uint8_t out_key[32]);
 
 /**
  * Mark a known key as manually verified.

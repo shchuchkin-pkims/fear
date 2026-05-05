@@ -11,7 +11,6 @@
 #include <QClipboard>
 #include <QRegularExpression>
 #include <QStandardPaths>
-#include <QTimer>
 
 Backend::Backend(QObject *parent) : QObject(parent) {
     settings = new QSettings("fear-messenger", "fear-gui", this);
@@ -70,26 +69,6 @@ bool Backend::connectToServer(const QString &host, int port, const QString &room
     if (clientProc) {
         qWarning() << "Client already running";
         return false;
-    }
-
-    // AUTO_JOIN: запускаем как JOIN, но взводим таймер на 5с. Если за это
-    // время не получили ключ комнаты → переключаемся на CREATE с новым
-    // ключом. Поведение совпадает с ConnectMode.AUTO на Android.
-    if (mode == AUTO_JOIN) {
-        autoJoinPending = true;
-        autoJoinHost = host; autoJoinPort = port;
-        autoJoinRoom = room; autoJoinName = name;
-        if (!autoJoinTimer) {
-            autoJoinTimer = new QTimer(this);
-            autoJoinTimer->setSingleShot(true);
-            connect(autoJoinTimer, &QTimer::timeout, this,
-                    &Backend::fallbackAutoJoinToCreate);
-        }
-        autoJoinTimer->start(5000);
-        // Дальше идёт обычный JOIN flow.
-        mode = JOIN_ROOM;
-    } else {
-        cancelAutoJoin();
     }
 
     // Check if executable exists
@@ -274,7 +253,6 @@ bool Backend::createServer(int port, const QString &name) {
 }
 
 bool Backend::disconnect() {
-    cancelAutoJoin();
     if (clientProc) {
         clientProc->terminate();
         if (!clientProc->waitForFinished(1000)) {
@@ -413,39 +391,6 @@ void Backend::onClientStderr() {
     }
 }
 
-void Backend::cancelAutoJoin() {
-    autoJoinPending = false;
-    if (autoJoinTimer && autoJoinTimer->isActive()) {
-        autoJoinTimer->stop();
-    }
-}
-
-void Backend::fallbackAutoJoinToCreate() {
-    if (!autoJoinPending) return;
-    autoJoinPending = false;
-    if (autoJoinTimer) autoJoinTimer->stop();
-
-    // Если CLI ещё жив — корректно его погасим перед перезапуском.
-    if (clientProc) {
-        clientProc->terminate();
-        if (!clientProc->waitForFinished(800)) {
-            clientProc->kill();
-            clientProc->waitForFinished(400);
-        }
-        delete clientProc;
-        clientProc = nullptr;
-    }
-    isConnected = false;
-
-    qDebug() << "AUTO_JOIN: JOIN не удался, пробуем CREATE для комнаты"
-             << autoJoinRoom;
-    emit newMessages(QStringList()
-        << QString("[auto] никто не ответил — создаём комнату %1").arg(autoJoinRoom));
-
-    connectToServer(autoJoinHost, autoJoinPort, autoJoinRoom,
-                    /*key=*/QString(), autoJoinName, CREATE_ROOM);
-}
-
 void Backend::onClientFinished(int exitCode, QProcess::ExitStatus status) {
     isConnected = false;
     qDebug() << "Client process finished with exit code:" << exitCode << "status:" << status;
@@ -454,13 +399,6 @@ void Backend::onClientFinished(int exitCode, QProcess::ExitStatus status) {
     if (clientProc) {
         clientProc->deleteLater();
         clientProc = nullptr;
-    }
-
-    // AUTO_JOIN: процесс умер, не успев получить room key — значит JOIN
-    // не удался (никто не ответил), переключаемся на CREATE.
-    if (autoJoinPending) {
-        QTimer::singleShot(0, this, &Backend::fallbackAutoJoinToCreate);
-        return;
     }
 
     emit disconnected();
@@ -591,9 +529,6 @@ void Backend::parseClientOutput(const QString &s) {
                 if (keyBytes.size() == 32) {
                     roomKeyHex = keyBytes.toHex();
                     qDebug() << "Room key captured (" << km.captured(1) << "), hex length:" << roomKeyHex.length();
-                    // AUTO_JOIN успешно завершился (получили ключ через
-                    // JOIN или CREATE) — снимаем pending-флаг и таймер.
-                    cancelAutoJoin();
                 }
             }
         }
