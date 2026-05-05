@@ -16,6 +16,10 @@
 #include "profilesettings.h"
 #include "profiledialog.h"
 #include "contactsdialog.h"
+#include "peerprofiledialog.h"
+#include <QFile>
+#include <QDir>
+#include <QStandardPaths>
 
 extern "C" {
 #include "identity.h"
@@ -107,6 +111,7 @@ ChatWindow::ChatWindow(QWidget *parent) : QMainWindow(parent) {
     connect(m_chatArea, &ChatArea::audioCallRequested,  this, &ChatWindow::onAudioCallRequested);
     connect(m_chatArea, &ChatArea::videoCallRequested,  this, &ChatWindow::onVideoCallRequested);
     connect(m_chatArea, &ChatArea::attachRequested,     this, &ChatWindow::onAttachRequested);
+    connect(m_chatArea, &ChatArea::senderClicked,       this, &ChatWindow::openPeerProfile);
 
     // Initial empty state
     m_chatArea->showEmptyState(tr("Click ☰ to connect to a room."));
@@ -392,6 +397,106 @@ void ChatWindow::openContacts() {
         m_backend->connectToServer(currentHost, currentPort, room,
                                    /*key=*/QString(),
                                    currentName.isEmpty() ? tr("me") : currentName,
+                                   Backend::JOIN_ROOM);
+    });
+    dlg.exec();
+}
+
+// Sender of the message bubble was clicked → look up whatever we know
+// about that name in the local TOFU known_keys file and show a profile
+// dialog. Offers an "Open chat" action that derives the deterministic DM
+// room id from the peer's pk and switches rooms.
+void ChatWindow::openPeerProfile(const QString &senderName) {
+    const QString sender = senderName.trimmed();
+    if (sender.isEmpty() || sender == "system" || sender == "server") return;
+
+    // Read the known_keys.tsv that FearClient writes on TOFU.
+    QString cfgDir = QStandardPaths::writableLocation(QStandardPaths::AppConfigLocation);
+    if (cfgDir.isEmpty())
+        cfgDir = QDir::homePath() + "/.config/fear";
+    const QString knownKeysPath = cfgDir + "/known_keys.tsv";
+
+    QString pkB64;
+    bool verified = false;
+    QFile f(knownKeysPath);
+    if (f.open(QIODevice::ReadOnly | QIODevice::Text)) {
+        while (!f.atEnd()) {
+            const QString line = QString::fromUtf8(f.readLine()).trimmed();
+            if (line.isEmpty()) continue;
+            const QStringList parts = line.split('\t');
+            if (parts.size() < 2) continue;
+            if (parts[0] == sender) {
+                pkB64 = parts[1];
+                if (parts.size() >= 3) verified = parts[2].toInt() != 0;
+                break;
+            }
+        }
+    }
+
+    // Compute the full hex fingerprint (32 bytes → 64 hex chars, : every byte).
+    QString fingerprint;
+    if (!pkB64.isEmpty()) {
+        unsigned char pk[crypto_sign_PUBLICKEYBYTES];
+        size_t binLen = 0;
+        QByteArray pkUtf8 = pkB64.toUtf8();
+        if (sodium_base642bin(pk, sizeof(pk),
+                              pkUtf8.constData(), pkUtf8.size(),
+                              nullptr, &binLen, nullptr,
+                              sodium_base64_VARIANT_URLSAFE_NO_PADDING) == 0
+            && binLen == sizeof(pk)) {
+            unsigned char hash[32];
+            crypto_generichash(hash, sizeof(hash), pk, sizeof(pk), nullptr, 0);
+            QString fp;
+            for (int i = 0; i < 32; ++i) {
+                if (i > 0) fp += ':';
+                fp += QString("%1").arg(hash[i], 2, 16, QChar('0'));
+            }
+            fingerprint = fp;
+        }
+    }
+
+    // We don't currently have a desktop-side decrypted contacts cache here,
+    // so handle/server stay empty unless the peer is also visible in the
+    // contacts dialog. (Phase B-5 will unify this.)
+    PeerProfileDialog dlg(sender, pkB64, fingerprint,
+                          /*handle=*/QString(), /*server=*/QString(),
+                          verified, this);
+    connect(&dlg, &PeerProfileDialog::openChatRequested, this,
+            [this](const QString &peerPkB64) {
+        // Derive DM room id locally from our pk + theirs.
+        uint8_t their_pk[IDENTITY_PK_BYTES];
+        size_t pkLen = 0;
+        QByteArray pkUtf8 = peerPkB64.toUtf8();
+        if (sodium_base642bin(their_pk, IDENTITY_PK_BYTES,
+                              pkUtf8.constData(), pkUtf8.size(),
+                              nullptr, &pkLen, nullptr,
+                              sodium_base64_VARIANT_URLSAFE_NO_PADDING) != 0
+            || pkLen != IDENTITY_PK_BYTES) {
+            QMessageBox::warning(this, tr("Open chat"),
+                                 tr("Stored pk is malformed."));
+            return;
+        }
+        uint8_t my_pk[IDENTITY_PK_BYTES];
+        if (identity_load_pk(m_backend->identityFilePath.toUtf8().constData(),
+                             my_pk) != 0) {
+            QMessageBox::warning(this, tr("Open chat"),
+                                 tr("No identity yet — connect to a room first."));
+            return;
+        }
+        char dmId[IDENTITY_DM_ROOM_ID_LEN];
+        if (identity_dm_room_id(my_pk, their_pk, dmId) != 0) {
+            QMessageBox::warning(this, tr("Open chat"),
+                                 tr("Could not derive DM room id."));
+            return;
+        }
+        const QString room = QString::fromUtf8(dmId);
+        const QString host = m_backend->serverHost;
+        const int     port = m_backend->serverPort;
+        const QString name = m_backend->currentName;
+        if (m_backend->isConnected) m_backend->disconnect();
+        m_backend->connectToServer(host, port, room,
+                                   /*key=*/QString(),
+                                   name.isEmpty() ? tr("me") : name,
                                    Backend::JOIN_ROOM);
     });
     dlg.exec();

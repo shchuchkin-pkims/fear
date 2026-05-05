@@ -15,6 +15,7 @@
 #include <QFontMetrics>
 #include <QRegularExpression>
 #include <QTextDocument>
+#include <QMouseEvent>
 
 namespace fear {
 
@@ -119,9 +120,29 @@ private:
     bool m_fromSelf;
 };
 
+// Clickable wrapper: re-emits mousePress as a signal, so we can attach
+// an "open peer profile" handler to the avatar and the sender name without
+// subclassing QLabel/Avatar.
+class ClickableBox : public QWidget {
+public:
+    explicit ClickableBox(QWidget *parent, std::function<void()> onClick)
+        : QWidget(parent), m_onClick(std::move(onClick)) {
+        setCursor(Qt::PointingHandCursor);
+    }
+protected:
+    void mousePressEvent(QMouseEvent *ev) override {
+        if (ev->button() == Qt::LeftButton && m_onClick) m_onClick();
+        QWidget::mousePressEvent(ev);
+    }
+private:
+    std::function<void()> m_onClick;
+};
+
 class MessageBubble : public QWidget {
 public:
-    explicit MessageBubble(const Message &m, QWidget *parent = nullptr) : QWidget(parent) {
+    explicit MessageBubble(const Message &m,
+                           std::function<void(const QString&)> onSenderClick,
+                           QWidget *parent = nullptr) : QWidget(parent) {
         const Theme &th = Theme::instance();
         const bool fromSelf = m.fromSelf;
         const bool showSender = !fromSelf && !m.sender.isEmpty();
@@ -132,15 +153,27 @@ public:
 
         if (fromSelf) outer->addStretch(1);
 
+        const QString senderForCb = m.sender;
+        auto fireSenderClick = [onSenderClick, senderForCb]() {
+            if (onSenderClick && !senderForCb.isEmpty()) onSenderClick(senderForCb);
+        };
+
         if (!fromSelf) {
-            auto *av = new Avatar(this);
+            // Wrap avatar in a ClickableBox so users can tap it to see the
+            // peer's profile.
+            auto *avHolder = new ClickableBox(this, fireSenderClick);
+            auto *avHolderLay = new QVBoxLayout(avHolder);
+            avHolderLay->setContentsMargins(0, 0, 0, 0);
+            avHolderLay->setSpacing(0);
+            auto *av = new Avatar(avHolder);
             av->setSeed(m.sender);
             av->setDiameter(kAvatarSize);
+            avHolderLay->addWidget(av, 0, Qt::AlignTop);
 
             auto *avBox = new QVBoxLayout();
             avBox->setContentsMargins(0, 0, 0, 0);
             avBox->setSpacing(0);
-            avBox->addWidget(av, 0, Qt::AlignTop);
+            avBox->addWidget(avHolder, 0, Qt::AlignTop);
             avBox->addStretch(1);
             outer->addLayout(avBox);
         }
@@ -155,14 +188,22 @@ public:
         bubbleLay->setSpacing(2);
 
         if (showSender) {
-            auto *senderLbl = new QLabel(m.sender, m_bubble);
+            // Wrap the sender name in a ClickableBox too so clicking either
+            // the avatar or the name opens the profile dialog.
+            auto *nameHolder = new ClickableBox(m_bubble, fireSenderClick);
+            auto *nameLay = new QHBoxLayout(nameHolder);
+            nameLay->setContentsMargins(0, 0, 0, 0);
+            nameLay->setSpacing(0);
+            auto *senderLbl = new QLabel(m.sender, nameHolder);
             QFont sf = senderLbl->font();
             sf.setWeight(QFont::DemiBold);
             sf.setPixelSize(12);
             senderLbl->setFont(sf);
             senderLbl->setStyleSheet(QString("color: %1; background: transparent;")
                 .arg(th.avatarColor(m.sender).name()));
-            bubbleLay->addWidget(senderLbl);
+            nameLay->addWidget(senderLbl);
+            nameLay->addStretch(1);
+            bubbleLay->addWidget(nameHolder);
         }
 
         // Render U+2028 (LINE SEPARATOR) as a normal newline — it's how we
@@ -420,7 +461,11 @@ void ChatArea::clearMessages() {
 }
 
 void ChatArea::appendMessage(const Message &m) {
-    auto *bubble = new MessageBubble(m, m_messagesContainer);
+    ChatArea *self = this;
+    auto onSenderClick = [self](const QString &name) {
+        self->emitSenderClicked(name);
+    };
+    auto *bubble = new MessageBubble(m, onSenderClick, m_messagesContainer);
     bubble->setMinimumHeight(34);
     m_messagesLayout->insertWidget(m_messagesLayout->count() - 1, bubble);
 

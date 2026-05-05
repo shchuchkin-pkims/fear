@@ -40,6 +40,13 @@ signals:
     void videoCallRequested();
     void chatInfoRequested();
     void attachRequested();
+    /** Emitted when the user clicks a peer's avatar or name inside a
+     *  message bubble — used to open the peer profile dialog. */
+    void senderClicked(const QString &senderName);
+
+public:
+    /** Forward a click from a bubble's avatar/name area. Internal use. */
+    void emitSenderClicked(const QString &senderName) { emit senderClicked(senderName); }
 
 protected:
     bool eventFilter(QObject *obj, QEvent *event) override;

@@ -47,6 +47,7 @@ private:
     void clearActiveHistory();
     void openProfile();
     void openContacts();
+    void openPeerProfile(const QString &senderName);
     void handleFileOffer(const QString &sender, const QString &filename, const QString &sizeStr);
     void updateOnlineStatus();
 
