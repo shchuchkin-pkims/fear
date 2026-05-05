@@ -12,7 +12,7 @@
 # ───── Build stage ─────
 FROM debian:bookworm-slim AS build
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      gcc libc6-dev libsodium-dev pkg-config make \
+      gcc libc6-dev libsodium-dev libsqlite3-dev pkg-config make \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src
@@ -22,32 +22,24 @@ COPY identity       ./identity
 
 # Build directly with gcc — no CMake needed. Mirrors what
 # client-console/CMakeLists.txt does, minus Windows branches.
-RUN gcc -O2 -Wall -Wextra -pthread -o /out/fear \
+# Phase B-2 added server_db.c (SQLite-backed handle registry + opaque
+# user-blob store), so we link against -lsqlite3.
+RUN mkdir -p /out && gcc -O2 -Wall -Wextra -pthread -o /out/fear \
         client-console/src/main.c \
         client-console/src/common.c \
         client-console/src/network.c \
         client-console/src/client.c \
         client-console/src/server.c \
+        client-console/src/server_db.c \
         identity/identity.c \
         -I client-console/include \
         -I identity \
-        -lsodium \
-    || (mkdir -p /out && \
-        gcc -O2 -Wall -Wextra -pthread \
-            client-console/src/main.c \
-            client-console/src/common.c \
-            client-console/src/network.c \
-            client-console/src/client.c \
-            client-console/src/server.c \
-            identity/identity.c \
-            -I client-console/include \
-            -I identity \
-            -lsodium -o /out/fear)
+        -lsodium -lsqlite3
 
 # ───── Runtime stage ─────
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      libsodium23 ca-certificates netcat-openbsd \
+      libsodium23 libsqlite3-0 ca-certificates netcat-openbsd \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --no-create-home --shell /usr/sbin/nologin fear
 
