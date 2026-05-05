@@ -38,6 +38,11 @@ History::History(QObject *parent) : QObject(parent) {
 
 History::~History() {
     if (m_db.isOpen()) m_db.close();
+    // m_db — это value-type с ref-counted соединением. Если её не обнулить
+    // до removeDatabase, Qt пишет warning «connection still in use». На
+    // самом деле это безвредно (соединение освободится в деструкторе
+    // m_db), но шумит в логе и пугает.
+    m_db = QSqlDatabase();
     QSqlDatabase::removeDatabase(QStringLiteral("fear_history"));
 }
 

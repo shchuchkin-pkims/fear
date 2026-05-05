@@ -243,8 +243,19 @@ void Sidebar::selectChat(const QString &id) {
 
 void Sidebar::onDmSelectionChanged() {
     QListWidgetItem *current = m_dmList->currentItem();
-    // Clear group-side selection so visual state matches one-row-active.
-    if (current) m_groupList->clearSelection();
+    // Чистим выделение в другой секции — но БЕЗ повторного триггера
+    // selectionChanged, иначе он позовёт onGroupSelectionChanged → тот
+    // позовёт нас обратно → бесконечная рекурсия → stack overflow.
+    if (current) {
+        const bool wasBlocked = m_groupList->blockSignals(true);
+        m_groupList->clearSelection();
+        m_groupList->blockSignals(wasBlocked);
+        // Всё-таки обновим визуал в группах руками.
+        for (int i = 0; i < m_groupList->count(); ++i) {
+            auto *w = qobject_cast<ChatListItem*>(m_groupList->itemWidget(m_groupList->item(i)));
+            if (w) w->setSelected(false);
+        }
+    }
     for (int i = 0; i < m_dmList->count(); ++i) {
         auto *w = qobject_cast<ChatListItem*>(m_dmList->itemWidget(m_dmList->item(i)));
         if (w) w->setSelected(m_dmList->item(i) == current);
@@ -258,7 +269,15 @@ void Sidebar::onDmSelectionChanged() {
 
 void Sidebar::onGroupSelectionChanged() {
     QListWidgetItem *current = m_groupList->currentItem();
-    if (current) m_dmList->clearSelection();
+    if (current) {
+        const bool wasBlocked = m_dmList->blockSignals(true);
+        m_dmList->clearSelection();
+        m_dmList->blockSignals(wasBlocked);
+        for (int i = 0; i < m_dmList->count(); ++i) {
+            auto *w = qobject_cast<ChatListItem*>(m_dmList->itemWidget(m_dmList->item(i)));
+            if (w) w->setSelected(false);
+        }
+    }
     for (int i = 0; i < m_groupList->count(); ++i) {
         auto *w = qobject_cast<ChatListItem*>(m_groupList->itemWidget(m_groupList->item(i)));
         if (w) w->setSelected(m_groupList->item(i) == current);
