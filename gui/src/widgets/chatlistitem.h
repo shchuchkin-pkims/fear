@@ -11,12 +11,19 @@ namespace fear {
 
 class Avatar;
 
+enum class ChatKind { Group, Dm };
+
 struct ChatListEntry {
     QString id;
     QString title;
     QString preview;
     QDateTime lastActivity;
     int unread = 0;
+    ChatKind kind = ChatKind::Group;
+    /** For DM entries: contact identity_pk (base64url, no padding). Empty
+     *  for group rooms. Lets the sidebar drive a DM open without going
+     *  through the contacts dialog. */
+    QString peerPkB64;
 };
 
 class ChatListItem : public QWidget {

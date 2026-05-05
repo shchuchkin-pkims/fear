@@ -127,6 +127,7 @@ set(SOURCES
     profilesettings.cpp
     profiledialog.cpp
     contactsdialog.cpp
+    contactsstore.cpp
     peerprofiledialog.cpp
     # Phase B-2/B-3 wire helpers — handle registry + per-user blob store
     ${CMAKE_CURRENT_SOURCE_DIR}/../../identity/server_proto.c
@@ -161,6 +162,7 @@ set(HEADERS
     profilesettings.h
     profiledialog.h
     contactsdialog.h
+    contactsstore.h
     peerprofiledialog.h
     theme/theme.h
     widgets/avatar.h

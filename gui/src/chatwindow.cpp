@@ -16,9 +16,11 @@
 #include "profilesettings.h"
 #include "profiledialog.h"
 #include "contactsdialog.h"
+#include "contactsstore.h"
 #include "peerprofiledialog.h"
 #include <QFile>
 #include <QDir>
+#include <QSet>
 #include <QStandardPaths>
 
 extern "C" {
@@ -112,9 +114,22 @@ ChatWindow::ChatWindow(QWidget *parent) : QMainWindow(parent) {
     connect(m_chatArea, &ChatArea::videoCallRequested,  this, &ChatWindow::onVideoCallRequested);
     connect(m_chatArea, &ChatArea::attachRequested,     this, &ChatWindow::onAttachRequested);
     connect(m_chatArea, &ChatArea::senderClicked,       this, &ChatWindow::openPeerProfile);
+    // Phase B-5: unified chat list — sidebar selection routes to DM open
+    // or current-room reuse, "+" opens the contacts dialog.
+    connect(m_sidebar, &Sidebar::chatSelected,
+            this, &ChatWindow::onSidebarChatSelected);
+    connect(m_sidebar, &Sidebar::addNewRequested,
+            this, &ChatWindow::openContacts);
+    connect(ContactsStore::instance(), &ContactsStore::contactsChanged,
+            this, &ChatWindow::rebuildSidebarChats);
 
     // Initial empty state
     m_chatArea->showEmptyState(tr("Click ☰ to connect to a room."));
+
+    // Phase B-5: paint the sidebar with whatever we already know about
+    // (cached contacts + previous group rooms). Identity may not be loaded
+    // yet, in which case DM entries get filled in after the first connect.
+    rebuildSidebarChats();
 }
 
 void ChatWindow::showEvent(QShowEvent *e) {
@@ -173,15 +188,8 @@ void ChatWindow::handleConnected() {
         m_profile->markRegistered(m_backend->serverHost);
     }
 
-    ChatListEntry e;
-    e.id           = m_backend->currentRoom;
-    e.title        = m_backend->currentRoom;
-    e.preview      = QString();
-    e.lastActivity = QDateTime::currentDateTime();
-    e.unread       = 0;
-    m_sidebar->clearChats();
-    m_sidebar->addOrUpdateChat(e);
-    m_sidebar->selectChat(e.id);
+    rebuildSidebarChats();
+    m_sidebar->selectChat(m_backend->currentRoom);
 
     m_chatArea->clearMessages();
 
@@ -455,51 +463,151 @@ void ChatWindow::openPeerProfile(const QString &senderName) {
         }
     }
 
-    // We don't currently have a desktop-side decrypted contacts cache here,
-    // so handle/server stay empty unless the peer is also visible in the
-    // contacts dialog. (Phase B-5 will unify this.)
+    // Use the cached contacts list to fill handle/server when known.
+    QString handle, server;
+    for (const auto &c : ContactsStore::instance()->all()) {
+        if (c.pk == pkB64) { handle = c.handle; server = c.server; break; }
+    }
     PeerProfileDialog dlg(sender, pkB64, fingerprint,
-                          /*handle=*/QString(), /*server=*/QString(),
-                          verified, this);
+                          handle, server, verified, this);
     connect(&dlg, &PeerProfileDialog::openChatRequested, this,
-            [this](const QString &peerPkB64) {
-        // Derive DM room id locally from our pk + theirs.
-        uint8_t their_pk[IDENTITY_PK_BYTES];
-        size_t pkLen = 0;
-        QByteArray pkUtf8 = peerPkB64.toUtf8();
-        if (sodium_base642bin(their_pk, IDENTITY_PK_BYTES,
-                              pkUtf8.constData(), pkUtf8.size(),
-                              nullptr, &pkLen, nullptr,
-                              sodium_base64_VARIANT_URLSAFE_NO_PADDING) != 0
-            || pkLen != IDENTITY_PK_BYTES) {
-            QMessageBox::warning(this, tr("Open chat"),
-                                 tr("Stored pk is malformed."));
-            return;
+            &ChatWindow::switchToDmRoom);
+    dlg.exec();
+}
+
+// Phase B-5: rebuild the sidebar list from contacts cache + history.
+// Each saved contact becomes a DM entry with the deterministic dm:...
+// room id; each room we have history for becomes a Group entry; the
+// currently-joined group room is included even if it has no history yet.
+void ChatWindow::rebuildSidebarChats() {
+    QVector<ChatListEntry> chats;
+
+    // ---- DM entries from cached contacts ------------------------------
+    uint8_t my_pk[IDENTITY_PK_BYTES];
+    bool haveIdentity = (identity_load_pk(
+        m_backend->identityFilePath.toUtf8().constData(), my_pk) == 0);
+
+    QHash<QString, qint64> historyTs;
+    if (m_history) {
+        for (const auto &s : m_history->allRoomSummaries())
+            historyTs.insert(s.roomId, s.lastTs);
+    }
+
+    if (haveIdentity) {
+        for (const auto &c : ContactsStore::instance()->all()) {
+            uint8_t their_pk[IDENTITY_PK_BYTES];
+            size_t  pkLen = 0;
+            QByteArray pkUtf8 = c.pk.toUtf8();
+            if (sodium_base642bin(their_pk, IDENTITY_PK_BYTES,
+                                  pkUtf8.constData(), pkUtf8.size(),
+                                  nullptr, &pkLen, nullptr,
+                                  sodium_base64_VARIANT_URLSAFE_NO_PADDING) != 0
+                || pkLen != IDENTITY_PK_BYTES) {
+                continue;
+            }
+            char dmId[IDENTITY_DM_ROOM_ID_LEN];
+            if (identity_dm_room_id(my_pk, their_pk, dmId) != 0) continue;
+            ChatListEntry e;
+            e.id           = QString::fromUtf8(dmId);
+            e.title        = c.name.isEmpty() ? c.handle : c.name;
+            e.preview      = (!c.handle.isEmpty() && !c.server.isEmpty())
+                ? QString("@%1@%2").arg(c.handle, c.server) : QString();
+            e.kind         = ChatKind::Dm;
+            e.peerPkB64    = c.pk;
+            const auto ts = historyTs.value(e.id, 0);
+            e.lastActivity = ts ? QDateTime::fromMSecsSinceEpoch(ts)
+                                : QDateTime::currentDateTime();
+            chats.append(e);
         }
-        uint8_t my_pk[IDENTITY_PK_BYTES];
-        if (identity_load_pk(m_backend->identityFilePath.toUtf8().constData(),
-                             my_pk) != 0) {
-            QMessageBox::warning(this, tr("Open chat"),
-                                 tr("No identity yet — connect to a room first."));
-            return;
-        }
-        char dmId[IDENTITY_DM_ROOM_ID_LEN];
-        if (identity_dm_room_id(my_pk, their_pk, dmId) != 0) {
-            QMessageBox::warning(this, tr("Open chat"),
-                                 tr("Could not derive DM room id."));
-            return;
-        }
-        const QString room = QString::fromUtf8(dmId);
+    }
+
+    // ---- Group entries: every non-DM room we have history for ---------
+    QSet<QString> groupRooms;
+    for (auto it = historyTs.constBegin(); it != historyTs.constEnd(); ++it) {
+        if (!it.key().startsWith("dm:")) groupRooms.insert(it.key());
+    }
+    if (m_backend->isConnected
+        && !m_backend->currentRoom.isEmpty()
+        && !m_backend->currentRoom.startsWith("dm:")) {
+        groupRooms.insert(m_backend->currentRoom);
+    }
+    for (const QString &room : groupRooms) {
+        ChatListEntry e;
+        e.id           = room;
+        e.title        = room;
+        e.kind         = ChatKind::Group;
+        const auto ts = historyTs.value(room, 0);
+        e.lastActivity = ts ? QDateTime::fromMSecsSinceEpoch(ts)
+                            : QDateTime::currentDateTime();
+        chats.append(e);
+    }
+
+    m_sidebar->setChats(chats);
+}
+
+void ChatWindow::onSidebarChatSelected(const QString &id) {
+    // Already on this room → just bring the chat pane forward (no-op for
+    // QSplitter layout; we still suppress reconnects).
+    if (id == m_backend->currentRoom) return;
+
+    // DM entry → derive the dm: room id from the contact's pk and reconnect.
+    if (id.startsWith("dm:")) {
+        // The dm: id alone is enough — both sides compute the same one,
+        // so we can JOIN by name without needing the contact's pk again.
         const QString host = m_backend->serverHost;
         const int     port = m_backend->serverPort;
         const QString name = m_backend->currentName;
+        if (host.isEmpty()) {
+            QMessageBox::information(this, tr("Open chat"),
+                tr("Connect to a server first."));
+            return;
+        }
         if (m_backend->isConnected) m_backend->disconnect();
-        m_backend->connectToServer(host, port, room,
-                                   /*key=*/QString(),
-                                   name.isEmpty() ? tr("me") : name,
-                                   Backend::JOIN_ROOM);
-    });
-    dlg.exec();
+        m_backend->connectToServer(host, port, id,
+            /*key=*/QString(),
+            name.isEmpty() ? tr("me") : name,
+            Backend::JOIN_ROOM);
+        return;
+    }
+
+    // Group entry that is not the current one — Desktop has no AUTO mode
+    // yet, so prompt before disconnecting from the current room.
+    auto answer = QMessageBox::question(this, tr("Switch room"),
+        tr("Switch to room '%1'? This will disconnect from '%2'.")
+            .arg(id, m_backend->currentRoom));
+    if (answer != QMessageBox::Yes) {
+        m_sidebar->selectChat(m_backend->currentRoom);
+        return;
+    }
+    const QString host = m_backend->serverHost;
+    const int     port = m_backend->serverPort;
+    const QString name = m_backend->currentName;
+    if (m_backend->isConnected) m_backend->disconnect();
+    // Try JOIN first; if no peer is in the room the user can use the
+    // ☰ → "Connect…" dialog to CREATE with a fresh key. (Desktop AUTO
+    // is on the follow-up list.)
+    m_backend->connectToServer(host, port, id,
+        /*key=*/QString(),
+        name.isEmpty() ? tr("me") : name,
+        Backend::JOIN_ROOM);
+}
+
+void ChatWindow::switchToDmRoom(const QString &peerPkB64) {
+    // Helper used by the peer profile dialog's "Open chat" button.
+    uint8_t their_pk[IDENTITY_PK_BYTES];
+    size_t pkLen = 0;
+    QByteArray pkUtf8 = peerPkB64.toUtf8();
+    if (sodium_base642bin(their_pk, IDENTITY_PK_BYTES,
+                          pkUtf8.constData(), pkUtf8.size(),
+                          nullptr, &pkLen, nullptr,
+                          sodium_base64_VARIANT_URLSAFE_NO_PADDING) != 0
+        || pkLen != IDENTITY_PK_BYTES) return;
+    uint8_t my_pk[IDENTITY_PK_BYTES];
+    if (identity_load_pk(m_backend->identityFilePath.toUtf8().constData(),
+                         my_pk) != 0) return;
+    char dmId[IDENTITY_DM_ROOM_ID_LEN];
+    if (identity_dm_room_id(my_pk, their_pk, dmId) != 0) return;
+    onSidebarChatSelected(QString::fromUtf8(dmId));
 }
 
 void ChatWindow::openProfile() {

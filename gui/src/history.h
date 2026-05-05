@@ -56,6 +56,17 @@ public:
     /** Case-insensitive substring search (LIKE %needle%). */
     QVector<SearchHit> search(const QString &needle, int limit = 200);
 
+    /** One distinct room id with the timestamp of its newest message. */
+    struct RoomSummary {
+        QString roomId;
+        qint64  lastTs;        // unix millis
+    };
+
+    /** All rooms we have any history for, newest first. Used to populate
+     *  the unified chat list (Phase B-5) so a room the user has visited
+     *  stays in the sidebar even after they switch away. */
+    QVector<RoomSummary> allRoomSummaries();
+
 private:
     QSqlDatabase m_db;
     bool m_open = false;

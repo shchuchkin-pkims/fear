@@ -150,4 +150,19 @@ QVector<History::SearchHit> History::search(const QString &needle, int limit) {
     return out;
 }
 
+QVector<History::RoomSummary> History::allRoomSummaries() {
+    QVector<RoomSummary> out;
+    if (!m_open) return out;
+    QSqlQuery q(m_db);
+    if (!q.exec("SELECT roomId, MAX(ts) AS lastTs FROM messages "
+                "GROUP BY roomId ORDER BY lastTs DESC")) {
+        qWarning() << "History::allRoomSummaries failed:" << q.lastError().text();
+        return out;
+    }
+    while (q.next()) {
+        out.append(RoomSummary{ q.value(0).toString(), q.value(1).toLongLong() });
+    }
+    return out;
+}
+
 }  // namespace fear

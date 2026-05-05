@@ -1,4 +1,5 @@
 #include "contactsdialog.h"
+#include "contactsstore.h"
 
 #include <QApplication>
 #include <QDateTime>
@@ -251,21 +252,26 @@ void ContactsDialog::renderJson(const QString &json) {
         m_status->setText(tr("No contacts yet."));
         return;
     }
+    QVector<ContactsStore::Record> cached;
     for (const auto &v : arr) {
         const auto o = v.toObject();
         QString name = o.value("name").toString();
         QString handle = o.value("handle").toString();
         QString server = o.value("server").toString();
+        QString pk     = o.value("pk").toString();
         QString line = !handle.isEmpty() && !server.isEmpty()
                        ? QString("%1   %2@%3").arg(name, handle, server)
                        : name;
         if (!line.isEmpty()) {
             auto *it = new QListWidgetItem(line);
             // Stash pk so a double-click can derive the deterministic DM room id.
-            it->setData(Qt::UserRole, o.value("pk").toString());
+            it->setData(Qt::UserRole, pk);
             m_list->addItem(it);
         }
+        cached.append({ name, handle, server, pk, false });
     }
+    // Phase B-5: persist for sidebar use across restarts.
+    ContactsStore::instance()->replaceAll(cached);
     m_status->setText(tr("%1 contacts — double-click to open DM").arg(arr.count()));
 }
 

@@ -1,22 +1,38 @@
 #include "sidebar.h"
 #include "../theme/theme.h"
 
+#include <QHBoxLayout>
+#include <QLabel>
+#include <QLineEdit>
 #include <QListWidget>
 #include <QListWidgetItem>
-#include <QLineEdit>
 #include <QPushButton>
+#include <QResizeEvent>
+#include <QToolButton>
 #include <QVBoxLayout>
-#include <QHBoxLayout>
 
 namespace fear {
 
+namespace {
+
+QToolButton *makeToggle(QWidget *parent) {
+    auto *b = new QToolButton(parent);
+    b->setCursor(Qt::PointingHandCursor);
+    b->setAutoRaise(true);
+    b->setFocusPolicy(Qt::NoFocus);
+    b->setFixedSize(20, 20);
+    b->setText(QStringLiteral("−"));   // expanded → minus, collapsed → plus
+    return b;
+}
+
+}  // namespace
+
 Sidebar::Sidebar(QWidget *parent) : QWidget(parent) {
     setObjectName("Sidebar");
-    // Sidebar paints its own bg from QSS — needs both attributes to render
-    // properly across themes.
     setAttribute(Qt::WA_StyledBackground, true);
     setAutoFillBackground(true);
 
+    // -- Header (hamburger + search) -------------------------------------
     auto *header = new QWidget(this);
     header->setObjectName("SidebarHeader");
     header->setAttribute(Qt::WA_StyledBackground, true);
@@ -24,7 +40,7 @@ Sidebar::Sidebar(QWidget *parent) : QWidget(parent) {
     header->setFixedHeight(54);
 
     m_menuBtn = new QPushButton(header);
-    m_menuBtn->setText(QString::fromUtf8("☰")); // ☰
+    m_menuBtn->setText(QString::fromUtf8("☰"));
     m_menuBtn->setFixedSize(36, 36);
     m_menuBtn->setCursor(Qt::PointingHandCursor);
     m_menuBtn->setToolTip(tr("Menu"));
@@ -40,35 +56,100 @@ Sidebar::Sidebar(QWidget *parent) : QWidget(parent) {
     headerLay->addWidget(m_menuBtn);
     headerLay->addWidget(m_search, 1);
 
-    m_list = new QListWidget(this);
-    m_list->setObjectName("ChatList");
-    m_list->setFrameShape(QFrame::NoFrame);
-    m_list->setSelectionMode(QAbstractItemView::SingleSelection);
-    m_list->setVerticalScrollMode(QAbstractItemView::ScrollPerPixel);
-    m_list->setSpacing(0);
-    m_list->setUniformItemSizes(true);
-    m_list->setAttribute(Qt::WA_MacShowFocusRect, false);
+    // -- Section header builder ------------------------------------------
+    auto buildSectionHeader = [this](const QString &label, QToolButton *&toggleOut, QLabel *&titleOut) {
+        auto *bar = new QWidget(this);
+        bar->setObjectName("SectionHeader");
+        bar->setAttribute(Qt::WA_StyledBackground, true);
+        bar->setAutoFillBackground(true);
+        bar->setFixedHeight(28);
+        auto *lay = new QHBoxLayout(bar);
+        lay->setContentsMargins(8, 0, 8, 0);
+        lay->setSpacing(6);
+        toggleOut = makeToggle(bar);
+        titleOut = new QLabel(label, bar);
+        QFont f = titleOut->font();
+        f.setPixelSize(11);
+        f.setCapitalization(QFont::AllUppercase);
+        f.setLetterSpacing(QFont::PercentageSpacing, 110);
+        titleOut->setFont(f);
+        titleOut->setStyleSheet("color: gray;");
+        lay->addWidget(toggleOut);
+        lay->addWidget(titleOut, 1);
+        return bar;
+    };
+
+    // -- Contacts section -------------------------------------------------
+    auto *dmHeader = buildSectionHeader(tr("Контакты"), m_dmToggle, m_dmTitle);
+    m_dmList = new QListWidget(this);
+    m_dmList->setObjectName("ChatList");
+    m_dmList->setFrameShape(QFrame::NoFrame);
+    m_dmList->setSelectionMode(QAbstractItemView::SingleSelection);
+    m_dmList->setVerticalScrollMode(QAbstractItemView::ScrollPerPixel);
+    m_dmList->setUniformItemSizes(true);
+
+    // -- Groups section ---------------------------------------------------
+    auto *groupHeader = buildSectionHeader(tr("Группы"), m_groupToggle, m_groupTitle);
+    m_groupList = new QListWidget(this);
+    m_groupList->setObjectName("ChatList");
+    m_groupList->setFrameShape(QFrame::NoFrame);
+    m_groupList->setSelectionMode(QAbstractItemView::SingleSelection);
+    m_groupList->setVerticalScrollMode(QAbstractItemView::ScrollPerPixel);
+    m_groupList->setUniformItemSizes(true);
 
     auto *root = new QVBoxLayout(this);
     root->setContentsMargins(0, 0, 0, 0);
     root->setSpacing(0);
     root->addWidget(header);
-    root->addWidget(m_list, 1);
+    root->addWidget(dmHeader);
+    root->addWidget(m_dmList, 1);
+    root->addWidget(groupHeader);
+    root->addWidget(m_groupList, 1);
 
+    // -- Floating "+" button (overlay) -----------------------------------
+    m_addBtn = new QPushButton(this);
+    m_addBtn->setText(QStringLiteral("+"));
+    m_addBtn->setCursor(Qt::PointingHandCursor);
+    m_addBtn->setFixedSize(44, 44);
+    m_addBtn->setToolTip(tr("Новый чат"));
+    m_addBtn->setStyleSheet(
+        "QPushButton { background: #2196F3; color: white; border: none;"
+        "              border-radius: 22px; font-size: 22px; }"
+        "QPushButton:hover { background: #1976D2; }");
+    m_addBtn->raise();
+
+    // -- Wiring -----------------------------------------------------------
     connect(m_menuBtn, &QPushButton::clicked, this, [this]() {
         emit menuRequested(m_menuBtn->mapToGlobal(QPoint(0, m_menuBtn->height() + 4)));
     });
     connect(m_search, &QLineEdit::textChanged, this, &Sidebar::searchChanged);
-    connect(m_list, &QListWidget::itemSelectionChanged, this, &Sidebar::onSelectionChanged);
+    connect(m_dmList,    &QListWidget::itemSelectionChanged,
+            this,        &Sidebar::onDmSelectionChanged);
+    connect(m_groupList, &QListWidget::itemSelectionChanged,
+            this,        &Sidebar::onGroupSelectionChanged);
+    connect(m_addBtn, &QPushButton::clicked, this, &Sidebar::addNewRequested);
 
-    // Force the sidebar palette to follow the theme: Window for bg, plus the
-    // text-role colors so any unstyled child label inherits the right color.
-    auto applyTheme = [this, header]() {
+    auto toggleSection = [this](bool &flag, QListWidget *list, QToolButton *btn) {
+        flag = !flag;
+        list->setVisible(flag);
+        btn->setText(flag ? QStringLiteral("−") : QStringLiteral("+"));
+    };
+    connect(m_dmToggle, &QToolButton::clicked, this,
+            [this, toggleSection]() { toggleSection(m_dmExpanded,    m_dmList,    m_dmToggle); });
+    connect(m_groupToggle, &QToolButton::clicked, this,
+            [this, toggleSection]() { toggleSection(m_groupExpanded, m_groupList, m_groupToggle); });
+
+    // Theme application — all containers paint their own background so
+    // they need to follow the active palette.
+    auto applyTheme = [this, header, dmHeader, groupHeader]() {
         const Theme &th = Theme::instance();
         const QColor bg = th.sidebarBackground();
         const QColor fg = th.textPrimary();
-        for (QWidget *w : {static_cast<QWidget*>(this), header,
-                           static_cast<QWidget*>(m_list)}) {
+        const QList<QWidget*> all = {
+            static_cast<QWidget*>(this), header, dmHeader, groupHeader,
+            static_cast<QWidget*>(m_dmList), static_cast<QWidget*>(m_groupList)
+        };
+        for (QWidget *w : all) {
             QPalette p = w->palette();
             p.setColor(QPalette::Window,     bg);
             p.setColor(QPalette::Base,       bg);
@@ -82,54 +163,92 @@ Sidebar::Sidebar(QWidget *parent) : QWidget(parent) {
             [applyTheme](Theme::Mode){ applyTheme(); });
 }
 
+void Sidebar::resizeEvent(QResizeEvent *e) {
+    QWidget::resizeEvent(e);
+    if (m_addBtn) {
+        const int margin = 16;
+        m_addBtn->move(width() - m_addBtn->width() - margin,
+                       height() - m_addBtn->height() - margin);
+        m_addBtn->raise();
+    }
+}
+
+void Sidebar::setChats(const QVector<ChatListEntry> &chats) {
+    m_entries.clear();
+    for (const auto &e : chats) m_entries.insert(e.id, e);
+    rebuildLists();
+}
+
 void Sidebar::addOrUpdateChat(const ChatListEntry &e) {
-    QListWidgetItem *existing = nullptr;
-    for (int i = 0; i < m_list->count(); ++i) {
-        QListWidgetItem *it = m_list->item(i);
-        if (it->data(Qt::UserRole).toString() == e.id) { existing = it; break; }
-    }
-
-    QListWidgetItem *item = existing;
-    if (!item) {
-        item = new QListWidgetItem(m_list);
-        item->setData(Qt::UserRole, e.id);
-        item->setSizeHint(QSize(280, 64));
-    }
-
-    auto *widget = qobject_cast<ChatListItem*>(m_list->itemWidget(item));
-    if (!widget) {
-        widget = new ChatListItem(m_list);
-        m_list->setItemWidget(item, widget);
-    }
-    widget->setEntry(e);
+    m_entries.insert(e.id, e);
+    rebuildLists();
 }
 
 void Sidebar::clearChats() {
-    m_list->clear();
+    m_entries.clear();
     m_currentId.clear();
+    rebuildLists();
+}
+
+void Sidebar::rebuildLists() {
+    m_dmList->clear();
+    m_groupList->clear();
+
+    QVector<ChatListEntry> dms, groups;
+    for (const auto &e : m_entries) {
+        (e.kind == ChatKind::Dm ? dms : groups).append(e);
+    }
+    auto byActivityDesc = [](const ChatListEntry &a, const ChatListEntry &b) {
+        return a.lastActivity > b.lastActivity;
+    };
+    std::sort(dms.begin(),    dms.end(),    byActivityDesc);
+    std::sort(groups.begin(), groups.end(), byActivityDesc);
+
+    auto fill = [](QListWidget *list, const QVector<ChatListEntry> &src) {
+        for (const auto &e : src) {
+            auto *item = new QListWidgetItem(list);
+            item->setData(Qt::UserRole, e.id);
+            item->setSizeHint(QSize(280, 64));
+            auto *w = new ChatListItem(list);
+            list->setItemWidget(item, w);
+            w->setEntry(e);
+        }
+    };
+    fill(m_dmList,    dms);
+    fill(m_groupList, groups);
+
+    selectChat(m_currentId);
+    updateSectionHeaders();
+}
+
+void Sidebar::updateSectionHeaders() {
+    m_dmTitle->setText(tr("Контакты (%1)").arg(m_dmList->count()));
+    m_groupTitle->setText(tr("Группы (%1)").arg(m_groupList->count()));
 }
 
 void Sidebar::selectChat(const QString &id) {
-    for (int i = 0; i < m_list->count(); ++i) {
-        QListWidgetItem *it = m_list->item(i);
-        if (it->data(Qt::UserRole).toString() == id) {
-            m_list->setCurrentItem(it);
-            return;
+    if (id.isEmpty()) return;
+    auto pickIn = [id](QListWidget *list) -> bool {
+        for (int i = 0; i < list->count(); ++i) {
+            QListWidgetItem *it = list->item(i);
+            if (it->data(Qt::UserRole).toString() == id) {
+                list->setCurrentItem(it);
+                return true;
+            }
         }
-    }
+        return false;
+    };
+    pickIn(m_dmList) || pickIn(m_groupList);
 }
 
-void Sidebar::onSelectionChanged() {
-    QListWidgetItem *current = m_list->currentItem();
-
-    // Sync selected state on every item widget so its text colors update.
-    for (int i = 0; i < m_list->count(); ++i) {
-        QListWidgetItem *it = m_list->item(i);
-        if (auto *w = qobject_cast<ChatListItem*>(m_list->itemWidget(it))) {
-            w->setSelected(it == current);
-        }
+void Sidebar::onDmSelectionChanged() {
+    QListWidgetItem *current = m_dmList->currentItem();
+    // Clear group-side selection so visual state matches one-row-active.
+    if (current) m_groupList->clearSelection();
+    for (int i = 0; i < m_dmList->count(); ++i) {
+        auto *w = qobject_cast<ChatListItem*>(m_dmList->itemWidget(m_dmList->item(i)));
+        if (w) w->setSelected(m_dmList->item(i) == current);
     }
-
     if (!current) return;
     const QString id = current->data(Qt::UserRole).toString();
     if (id == m_currentId) return;
@@ -137,4 +256,18 @@ void Sidebar::onSelectionChanged() {
     emit chatSelected(id);
 }
 
+void Sidebar::onGroupSelectionChanged() {
+    QListWidgetItem *current = m_groupList->currentItem();
+    if (current) m_dmList->clearSelection();
+    for (int i = 0; i < m_groupList->count(); ++i) {
+        auto *w = qobject_cast<ChatListItem*>(m_groupList->itemWidget(m_groupList->item(i)));
+        if (w) w->setSelected(m_groupList->item(i) == current);
+    }
+    if (!current) return;
+    const QString id = current->data(Qt::UserRole).toString();
+    if (id == m_currentId) return;
+    m_currentId = id;
+    emit chatSelected(id);
 }
+
+}  // namespace fear
