@@ -405,7 +405,7 @@ void ChatWindow::openContacts() {
         m_backend->connectToServer(currentHost, currentPort, room,
                                    /*key=*/QString(),
                                    currentName.isEmpty() ? tr("me") : currentName,
-                                   Backend::JOIN_ROOM);
+                                   Backend::AUTO_JOIN);
     });
     dlg.exec();
 }
@@ -563,15 +563,16 @@ void ChatWindow::onSidebarChatSelected(const QString &id) {
             return;
         }
         if (m_backend->isConnected) m_backend->disconnect();
+        // AUTO_JOIN: пробуем JOIN, через 5с фолбэчим в CREATE. Иначе тот,
+        // кто открывает ЛС первым, навсегда висит на JOIN.
         m_backend->connectToServer(host, port, id,
             /*key=*/QString(),
             name.isEmpty() ? tr("me") : name,
-            Backend::JOIN_ROOM);
+            Backend::AUTO_JOIN);
         return;
     }
 
-    // Group entry that is not the current one — Desktop has no AUTO mode
-    // yet, so prompt before disconnecting from the current room.
+    // Group entry that is not the current one — те же AUTO-семантики.
     auto answer = QMessageBox::question(this, tr("Switch room"),
         tr("Switch to room '%1'? This will disconnect from '%2'.")
             .arg(id, m_backend->currentRoom));
@@ -583,13 +584,10 @@ void ChatWindow::onSidebarChatSelected(const QString &id) {
     const int     port = m_backend->serverPort;
     const QString name = m_backend->currentName;
     if (m_backend->isConnected) m_backend->disconnect();
-    // Try JOIN first; if no peer is in the room the user can use the
-    // ☰ → "Connect…" dialog to CREATE with a fresh key. (Desktop AUTO
-    // is on the follow-up list.)
     m_backend->connectToServer(host, port, id,
         /*key=*/QString(),
         name.isEmpty() ? tr("me") : name,
-        Backend::JOIN_ROOM);
+        Backend::AUTO_JOIN);
 }
 
 void ChatWindow::switchToDmRoom(const QString &peerPkB64) {

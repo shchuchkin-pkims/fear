@@ -37,8 +37,13 @@ class Backend : public QObject {
     Q_OBJECT
 
 public:
-    /** Connection mode for key exchange */
-    enum ConnectMode { MANUAL_KEY, CREATE_ROOM, JOIN_ROOM };
+    /** Connection mode for key exchange.
+     *
+     *  AUTO_JOIN: try JOIN first; if no peer responds within ~5 seconds
+     *  (or the CLI exits), retry as CREATE_ROOM with a fresh key. Used
+     *  by the unified chat list to open a DM regardless of who is there
+     *  first — same UX as the Android FearViewModel AUTO mode. */
+    enum ConnectMode { MANUAL_KEY, CREATE_ROOM, JOIN_ROOM, AUTO_JOIN };
 
     /**
      * @brief Constructs a new backend
@@ -249,6 +254,16 @@ private:
     QProcess *clientProc;      ///< Client process handle
     QProcess *serverProc;      ///< Server process handle
     int lastMessageId;         ///< Last processed message ID
+
+    // ---- AUTO_JOIN state (Phase B-5 Desktop) ----
+    class QTimer *autoJoinTimer = nullptr;
+    bool          autoJoinPending = false;
+    QString       autoJoinHost;
+    int           autoJoinPort = 0;
+    QString       autoJoinRoom;
+    QString       autoJoinName;
+    void cancelAutoJoin();
+    void fallbackAutoJoinToCreate();
 };
 
 #endif // BACKEND_H
