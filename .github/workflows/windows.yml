@@ -1,0 +1,167 @@
+name: Build Windows release
+
+# Сборка ПК-клиента под Windows. Без подписи кода (sertificat не куплен,
+# Windows SmartScreen покажет «Неизвестный издатель»; обходной путь
+# описан в Wiki → Installation-Desktop). Артефакт — zip с fear_gui.exe,
+# fear.exe, развёрнутыми Qt-DLL и системными зависимостями MSYS2/MinGW.
+#
+# Триггеры:
+#   - push в main или dev — собирает и кладёт zip как build artifact
+#     (хранится 90 дней, ссылка в логе run-а);
+#   - тег v* — дополнительно прикладывает zip к GitHub Release;
+#   - workflow_dispatch — кнопка «Run workflow» в Actions.
+
+on:
+  push:
+    branches: [main, dev]
+    tags: ['v*']
+    paths:
+      - 'CMakeLists.txt'
+      - 'client-console/**'
+      - 'gui/**'
+      - 'identity/**'
+      - '.github/workflows/windows.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    name: Windows x64 (MSYS2 / MinGW)
+
+    defaults:
+      run:
+        shell: msys2 {0}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up MSYS2 (MINGW64)
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: false
+          install: >-
+            base-devel
+            git
+            mingw-w64-x86_64-toolchain
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-ninja
+            mingw-w64-x86_64-pkgconf
+            mingw-w64-x86_64-libsodium
+            mingw-w64-x86_64-sqlite3
+            mingw-w64-x86_64-qrencode
+            mingw-w64-x86_64-zbar
+            mingw-w64-x86_64-qt6-base
+            mingw-w64-x86_64-qt6-tools
+
+      - name: Show toolchain versions
+        run: |
+          gcc --version | head -n1
+          cmake --version | head -n1
+          ninja --version
+          pkg-config --modversion libsodium libqrencode zbar sqlite3 || true
+          ls -1 /mingw64/bin/windeployqt*.exe 2>/dev/null || echo "windeployqt not found in /mingw64/bin"
+
+      - name: Configure (FEAR_GUI_ONLY=ON, Release, Ninja)
+        run: |
+          cmake -S . -B build \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DFEAR_GUI_ONLY=ON
+
+      - name: Build console client (fear.exe)
+        run: cmake --build build --target fear -j
+
+      - name: Build GUI client (fear_gui.exe)
+        run: cmake --build build --target fear_gui -j
+
+      - name: Stage release directory
+        run: |
+          set -e
+          mkdir -p release/fear
+          cp build/bin/fear.exe       release/fear/fear.exe
+          cp build/fear_gui.exe       release/fear/fear_gui.exe
+
+          # Run windeployqt to bundle Qt DLLs and plugins next to the exe.
+          # Pick whichever name MSYS2 ships under: windeployqt6.exe in newer
+          # qt6-tools, windeployqt-qt6.exe in some older builds, plain
+          # windeployqt.exe otherwise.
+          deploy=""
+          for cand in /mingw64/bin/windeployqt6.exe /mingw64/bin/windeployqt-qt6.exe /mingw64/bin/windeployqt.exe; do
+            if [ -x "$cand" ]; then deploy="$cand"; break; fi
+          done
+          if [ -z "$deploy" ]; then
+            echo "ERROR: no windeployqt binary found in /mingw64/bin" >&2
+            ls /mingw64/bin/*.exe | grep -i deploy || true
+            exit 1
+          fi
+          echo "Using $deploy"
+          "$deploy" \
+            --release \
+            --no-translations \
+            --no-system-d3d-compiler \
+            --no-opengl-sw \
+            --compiler-runtime \
+            "release/fear/fear_gui.exe"
+
+          # Copy MinGW + system DLLs that windeployqt does not pick up.
+          # We ldd-walk both binaries and pick anything from /mingw64/bin.
+          missing_dlls() {
+            local exe="$1"
+            ldd "$exe" 2>/dev/null \
+              | awk '$3 ~ "/mingw64/bin/" {print $3}' \
+              | sort -u
+          }
+          for exe in release/fear/fear.exe release/fear/fear_gui.exe; do
+            for dll in $(missing_dlls "$exe"); do
+              dst="release/fear/$(basename "$dll")"
+              if [ ! -f "$dst" ]; then
+                cp -v "$dll" "$dst"
+              fi
+            done
+          done
+
+          # Extra runtime files used by fear_gui.exe at runtime
+          # (resources are baked into qrc, but a README is useful).
+          {
+            printf '%s\n' "F.E.A.R. Messenger — Windows portable build"
+            printf '\n'
+            printf '%s\n' "Run fear_gui.exe to start the graphical client."
+            printf '%s\n' "The console client (fear.exe) is included for advanced use."
+            printf '\n'
+            printf '%s\n' "This build is unsigned. Windows SmartScreen will warn the first time"
+            printf '%s\n' "you run it: click 'More info' -> 'Run anyway'."
+            printf '\n'
+            printf '%s\n' "See https://fear-project.ru and the project Wiki for documentation."
+          } > release/fear/README.txt
+
+          ls -la release/fear/
+
+      - name: Make zip
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $sha = "${{ github.sha }}".Substring(0, 7)
+          $name = "fear-windows-x64-$tag-$sha.zip"
+          # Sanitise: branch names like "dev"/"main" become part of filename
+          $name = $name -replace '/', '_'
+          Compress-Archive -Path "release/fear/*" -DestinationPath "release/$name"
+          echo "ZIP_NAME=$name" >> $env:GITHUB_ENV
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ZIP_NAME }}
+          path: release/${{ env.ZIP_NAME }}
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Attach to GitHub Release (only on tag push)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/${{ env.ZIP_NAME }}

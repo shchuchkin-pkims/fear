@@ -71,18 +71,33 @@ else()
     message(STATUS "Using system libraries on Linux")
 endif()
 
+# Опция «только GUI и консольный клиент» — пропускает audio_call,
+# video_call, key-exchange, updater. Нужно для Windows-сборки в CI, где
+# у нас нет prebuilt opus / portaudio / ffmpeg / sdl3, а основные
+# артефакты — fear.exe и fear_gui.exe.
+option(FEAR_GUI_ONLY "Skip audio_call/video_call/key-exchange/updater subprojects" OFF)
+
 # Включение субмодулей
 add_subdirectory(client-console)
-add_subdirectory(key-exchange)
-add_subdirectory(updater)
-add_subdirectory(audio_call)
-add_subdirectory(video_call)
+if(NOT FEAR_GUI_ONLY)
+    add_subdirectory(key-exchange)
+    add_subdirectory(updater)
+    add_subdirectory(audio_call)
+    add_subdirectory(video_call)
+endif()
 
 # Создание пользовательских целей для удобства
-add_custom_target(build-all
-    DEPENDS fear key-exchange updater audio_call video_call
-    COMMENT "Building all executables: fear.exe, key-exchange.exe, updater.exe, audio_call.exe, video_call.exe"
-)
+if(NOT FEAR_GUI_ONLY)
+    add_custom_target(build-all
+        DEPENDS fear key-exchange updater audio_call video_call
+        COMMENT "Building all executables: fear.exe, key-exchange.exe, updater.exe, audio_call.exe, video_call.exe"
+    )
+else()
+    add_custom_target(build-all
+        DEPENDS fear
+        COMMENT "Building minimal set: fear.exe (FEAR_GUI_ONLY=ON)"
+    )
+endif()
 
 add_custom_target(clean-all
     COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR} --target clean
@@ -104,38 +119,43 @@ set_target_properties(fear PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${BIN_DIRECTORY}"
 )
 
-set_target_properties(key-exchange PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY "${BIN_DIRECTORY}"
-)
+if(NOT FEAR_GUI_ONLY)
+    set_target_properties(key-exchange PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${BIN_DIRECTORY}"
+    )
 
-set_target_properties(updater PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY "${BIN_DIRECTORY}"
-)
+    set_target_properties(updater PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${BIN_DIRECTORY}"
+    )
 
-set_target_properties(audio_call PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY "${BIN_DIRECTORY}"
-)
+    set_target_properties(audio_call PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${BIN_DIRECTORY}"
+    )
 
-set_target_properties(video_call PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY "${BIN_DIRECTORY}"
-)
+    set_target_properties(video_call PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${BIN_DIRECTORY}"
+    )
+endif()
 
-# Автоматическое копирование необходимых файлов при ЛЮБОЙ сборке
-add_custom_target(copy-runtime-files ALL
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${CMAKE_SOURCE_DIR}/updater/cacert.pem"
-        "${BIN_DIRECTORY}/cacert.pem"
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${CMAKE_SOURCE_DIR}/updater/libcurl-x64.dll"
-        "${BIN_DIRECTORY}/libcurl-x64.dll"
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${CMAKE_SOURCE_DIR}/updater/updater.conf"
-        "${BIN_DIRECTORY}/updater.conf"
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${CMAKE_SOURCE_DIR}/doc/manual.pdf"
-        "${DOC_DIRECTORY}/manual.pdf"
-    COMMENT "Copying runtime files to output directory"
-)
+# Автоматическое копирование вспомогательных файлов. Под FEAR_GUI_ONLY
+# вспомогательного апдейтера нет, и updater/* отсутствуют — пропускаем.
+if(NOT FEAR_GUI_ONLY)
+    add_custom_target(copy-runtime-files ALL
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_SOURCE_DIR}/updater/cacert.pem"
+            "${BIN_DIRECTORY}/cacert.pem"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_SOURCE_DIR}/updater/libcurl-x64.dll"
+            "${BIN_DIRECTORY}/libcurl-x64.dll"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_SOURCE_DIR}/updater/updater.conf"
+            "${BIN_DIRECTORY}/updater.conf"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_SOURCE_DIR}/doc/manual.pdf"
+            "${DOC_DIRECTORY}/manual.pdf"
+        COMMENT "Copying runtime files to output directory"
+    )
+endif()
 
 # Копирование DLL при сборке на Windows (только для динамически слинкованных библиотек)
 if(WIN32)

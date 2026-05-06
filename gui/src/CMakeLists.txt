@@ -32,66 +32,32 @@ if(WIN32)
     find_program(WINDEPLOYQT_EXECUTABLE windeployqt HINTS "${QT_BIN_DIR}")
 endif()
 
-# Конфигурация libsodium для разных платформ
-if(WIN32)
-    # Для Windows используем прямые слеши для путей
-    set(LIBSODIUM_PATH "${CMAKE_SOURCE_DIR}/../../lib/libsodium-win64" CACHE PATH "Path to libsodium directory (should contain include/ and lib/ folders)")
+# Конфигурация libsodium для разных платформ.
+#
+# Под Windows исторически использовался prebuilt-архив libsodium-win64
+# в каталоге `lib/`. Если его нет — пробуем pkg-config (это работает в
+# CI через MSYS2 / pacman -S mingw-w64-x86_64-libsodium). На Linux всегда
+# идём через pkg-config.
+set(LIBSODIUM_PATH "${CMAKE_SOURCE_DIR}/../../lib/libsodium-win64" CACHE PATH
+    "Optional path to a libsodium prebuilt directory (Windows)")
 
-    if(LIBSODIUM_PATH)
-        message(STATUS "Using libsodium from: ${LIBSODIUM_PATH}")
+if(WIN32 AND EXISTS "${LIBSODIUM_PATH}/include/sodium.h")
+    message(STATUS "Using libsodium from: ${LIBSODIUM_PATH}")
+    set(LIBSODIUM_INCLUDE_DIRS ${LIBSODIUM_PATH}/include)
 
-        # Проверяем существование директории
-        if(NOT EXISTS ${LIBSODIUM_PATH})
-            message(FATAL_ERROR "Libsodium directory not found: ${LIBSODIUM_PATH}")
-        endif()
-
-        # Include директории
-        if(EXISTS ${LIBSODIUM_PATH}/include)
-            set(LIBSODIUM_INCLUDE_DIRS ${LIBSODIUM_PATH}/include)
-            message(STATUS "Found include directory: ${LIBSODIUM_INCLUDE_DIRS}")
-        else()
-            message(FATAL_ERROR "Cannot find include directory in ${LIBSODIUM_PATH}")
-        endif()
-
-        # Проверяем наличие заголовочного файла
-        if(NOT EXISTS ${LIBSODIUM_INCLUDE_DIRS}/sodium.h)
-            message(FATAL_ERROR "sodium.h not found in ${LIBSODIUM_INCLUDE_DIRS}")
-        endif()
-
-        # Принудительно используем статическую библиотеку
-        # В первую очередь ищем статическую библиотеку libsodium.a
-        if(EXISTS ${LIBSODIUM_PATH}/lib/libsodium.a)
-            set(LIBSODIUM_LIBRARIES ${LIBSODIUM_PATH}/lib/libsodium.a)
-            message(STATUS "Using static libsodium.a: ${LIBSODIUM_LIBRARIES}")
-        # Затем ищем libsodium.lib (статическая для MSVC)
-        elseif(EXISTS ${LIBSODIUM_PATH}/lib/libsodium.lib)
-            set(LIBSODIUM_LIBRARIES ${LIBSODIUM_PATH}/lib/libsodium.lib)
-            message(STATUS "Using static libsodium.lib: ${LIBSODIUM_LIBRARIES}")
-        # Если статических нет, только тогда используем динамические
-        elseif(EXISTS ${LIBSODIUM_PATH}/lib/libsodium.dll.a)
-            set(LIBSODIUM_LIBRARIES ${LIBSODIUM_PATH}/lib/libsodium.dll.a)
-            message(STATUS "WARNING: Using dynamic libsodium.dll.a (static not found): ${LIBSODIUM_LIBRARIES}")
-        else()
-            # Выводим список файлов в lib директории для отладки
-            file(GLOB LIB_FILES "${LIBSODIUM_PATH}/lib/*")
-            message(STATUS "Files in lib directory: ${LIB_FILES}")
-            message(FATAL_ERROR "Cannot find libsodium library in ${LIBSODIUM_PATH}/lib/")
-        endif()
+    if(EXISTS ${LIBSODIUM_PATH}/lib/libsodium.a)
+        set(LIBSODIUM_LIBRARIES ${LIBSODIUM_PATH}/lib/libsodium.a)
+    elseif(EXISTS ${LIBSODIUM_PATH}/lib/libsodium.lib)
+        set(LIBSODIUM_LIBRARIES ${LIBSODIUM_PATH}/lib/libsodium.lib)
+    elseif(EXISTS ${LIBSODIUM_PATH}/lib/libsodium.dll.a)
+        set(LIBSODIUM_LIBRARIES ${LIBSODIUM_PATH}/lib/libsodium.dll.a)
     else()
-        message(FATAL_ERROR "Please set LIBSODIUM_PATH to the libsodium directory")
+        message(FATAL_ERROR "Cannot find libsodium library in ${LIBSODIUM_PATH}/lib/")
     endif()
 else()
-    # Для Linux/Unix используем системную библиотеку
     find_package(PkgConfig REQUIRED)
     pkg_check_modules(LIBSODIUM REQUIRED libsodium)
-
-    if(LIBSODIUM_FOUND)
-        message(STATUS "Using system libsodium")
-        message(STATUS "  Include dirs: ${LIBSODIUM_INCLUDE_DIRS}")
-        message(STATUS "  Libraries: ${LIBSODIUM_LIBRARIES}")
-    else()
-        message(FATAL_ERROR "libsodium not found. Install it with: sudo apt-get install libsodium-dev")
-    endif()
+    message(STATUS "Using libsodium via pkg-config: ${LIBSODIUM_LIBRARIES}")
 endif()
 
 # Qt setup (compatible with Qt 6.2+)

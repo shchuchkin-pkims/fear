@@ -63,7 +63,7 @@ if(WIN32)
     if(FOUND_SODIUM_PATH)
         message(STATUS "Found libsodium at: ${FOUND_SODIUM_PATH}")
         target_include_directories(${TARGET_NAME} PRIVATE ${FOUND_SODIUM_PATH}/include)
-        
+
         # Поиск библиотеки
         if(EXISTS "${FOUND_SODIUM_PATH}/lib/libsodium.a")
             target_link_libraries(${TARGET_NAME} ${FOUND_SODIUM_PATH}/lib/libsodium.a ws2_32)
@@ -75,8 +75,19 @@ if(WIN32)
             message(FATAL_ERROR "libsodium library not found in ${FOUND_SODIUM_PATH}/lib/")
         endif()
     else()
-        message(FATAL_ERROR "libsodium not found. Please install libsodium for Windows and set LIBSODIUM_ROOT")
+        # Fallback to pkg-config (works under MSYS2 / MinGW where libsodium
+        # is installed via pacman). The CI Windows build relies on this.
+        find_package(PkgConfig REQUIRED)
+        pkg_check_modules(LIBSODIUM REQUIRED libsodium)
+        target_include_directories(${TARGET_NAME} PRIVATE ${LIBSODIUM_INCLUDE_DIRS})
+        target_link_libraries(${TARGET_NAME} ${LIBSODIUM_LIBRARIES} ws2_32)
     endif()
+    # SQLite3 нужен серверной части (server_db.c). Под MSYS2 ставится через
+    # pacman -S mingw-w64-x86_64-sqlite3 и предоставляет .pc-файл.
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(SQLITE3 REQUIRED sqlite3)
+    target_include_directories(${TARGET_NAME} PRIVATE ${SQLITE3_INCLUDE_DIRS})
+    target_link_libraries(${TARGET_NAME} ${SQLITE3_LIBRARIES})
 else()
     # Поиск libsodium на Linux
     find_package(PkgConfig)
