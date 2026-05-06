@@ -146,6 +146,31 @@ int server_db_lookup_handle(const char *handle, uint8_t pk_out[32]) {
     return out;
 }
 
+int server_db_lookup_handle_by_pk(const uint8_t pk[32],
+                                  char *handle_out, size_t handle_cap) {
+    if (!g_db || !pk || !handle_out || handle_cap < 2) return -1;
+
+    sqlite3_stmt *q = NULL;
+    int rc = sqlite3_prepare_v2(g_db,
+        "SELECT handle FROM handles WHERE identity_pk = ? LIMIT 1",
+        -1, &q, NULL);
+    if (rc != SQLITE_OK) return -1;
+    sqlite3_bind_blob(q, 1, pk, 32, SQLITE_STATIC);
+
+    int out = 1;
+    if (sqlite3_step(q) == SQLITE_ROW) {
+        const unsigned char *txt = sqlite3_column_text(q, 0);
+        int n = sqlite3_column_bytes(q, 0);
+        if (txt && n > 0 && (size_t)n < handle_cap) {
+            memcpy(handle_out, txt, (size_t)n);
+            handle_out[n] = '\0';
+            out = 0;
+        }
+    }
+    sqlite3_finalize(q);
+    return out;
+}
+
 int server_db_put_blob(const uint8_t pk[32], const char *blob_type,
                        const uint8_t *cipher, size_t cipher_len) {
     if (!g_db) return -1;

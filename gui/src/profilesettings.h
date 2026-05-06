@@ -31,7 +31,22 @@ public:
     void markRegistered(const QString &host);
     void forgetRegistration(const QString &host);
 
-    /** "@evgenii@fear-project.ru" or empty if name/registration missing. */
+    /**
+     * Bind a specific handle string to a host. Used by ConnectScreen after
+     * successful REGISTER_HANDLE or LOOKUP_HANDLE_BY_PK round-trip.
+     * Persists the (host, handle) pair so the «@nick@host» label can be
+     * shown without further server queries.
+     */
+    void markRegisteredAs(const QString &host, const QString &handle);
+
+    /** Return the stored handle for `host` (lowercase nickname, no «@»);
+     *  empty string when host has no registration. */
+    QString handleFor(const QString &host) const;
+
+    /** "@evgenii@fear-project.ru" — full identifier including the «@»
+     *  prefix and host, or empty if the host has no registration.
+     *  Falls back to displayName() when the host is registered but no
+     *  explicit handle has been recorded (legacy entries). */
     QString handleAtServer(const QString &host) const;
 
 signals:

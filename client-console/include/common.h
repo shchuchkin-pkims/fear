@@ -94,10 +94,19 @@ typedef enum {
                                           No signature — blobs are encrypted client-side, server
                                           can't decrypt anyway. Server replies with BLOB_RESULT
                                           (with payload-cipher when found). */
-    MSG_TYPE_BLOB_RESULT      = 25  /**< Server → Client.
+    MSG_TYPE_BLOB_RESULT      = 25, /**< Server → Client.
                                           Payload: [status(1)][reason_len(1)][reason][cipher_len(4)][cipher].
                                           status: 0=ok, 1=not_found, 2=invalid, 3=server_error.
                                           cipher_len + cipher present only on GET success. */
+    /* ===== Phase B-7: reverse lookup of handle by pk ===== */
+    MSG_TYPE_LOOKUP_HANDLE_BY_PK = 26, /**< Client → Server: which handle is registered for this pk?
+                                          Payload: [pk(32)].
+                                          Server replies with HANDLE_RESULT.
+                                          status=0: payload is [0][reason_len(1)][reason][handle_len(1)][handle].
+                                          status=1: pk has no registered handle on this server.
+                                          Used by clients to detect a pre-existing registration after
+                                          identity import (.fbk / QR) without forcing the user to guess
+                                          their handle. */
 } message_type_t;
 
 /* ===== Cryptographic Constants ===== */

@@ -8,6 +8,7 @@ namespace {
 constexpr const char *kGroup    = "profile";
 constexpr const char *kName     = "displayName";
 constexpr const char *kServers  = "registeredServers";
+constexpr const char *kHandles  = "handlesByHost"; /* QVariantMap host→handle */
 constexpr const char *kLegacyRoot = "connect";
 constexpr const char *kLegacyName = "name";
 }
@@ -77,10 +78,34 @@ void ProfileSettings::forgetRegistration(const QString &host) {
     emit registrationsChanged();
 }
 
+void ProfileSettings::markRegisteredAs(const QString &host, const QString &handle) {
+    const QString h = handle.trimmed().toLower();
+    if (host.isEmpty() || h.isEmpty()) return;
+    QSettings s("fear-messenger", "fear-gui");
+    s.beginGroup(kGroup);
+    QVariantMap map = s.value(kHandles).toMap();
+    map.insert(host, h);
+    s.setValue(kHandles, map);
+    s.endGroup();
+    markRegistered(host);   /* also adds to legacy hosts list — covers UIs reading either */
+}
+
+QString ProfileSettings::handleFor(const QString &host) const {
+    QSettings s("fear-messenger", "fear-gui");
+    s.beginGroup(kGroup);
+    return s.value(kHandles).toMap().value(host).toString();
+}
+
 QString ProfileSettings::handleAtServer(const QString &host) const {
-    const QString name = displayName();
-    if (name.isEmpty() || !isRegistered(host)) return QString();
-    return QString("@%1@%2").arg(name, host);
+    const QString h = handleFor(host);
+    if (!h.isEmpty()) return QStringLiteral("@%1@%2").arg(h, host);
+    /* Legacy fallback: no recorded handle but host is in the registered set —
+     * display name was used as handle (Phase B-1 behaviour). */
+    if (isRegistered(host)) {
+        const QString name = displayName();
+        if (!name.isEmpty()) return QStringLiteral("@%1@%2").arg(name.toLower(), host);
+    }
+    return QString();
 }
 
 }  // namespace fear

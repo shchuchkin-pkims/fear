@@ -40,12 +40,13 @@ typedef int sock_t;
 #define SP_NAME       "__svc__"
 
 /* MSG_TYPE_* values — keep in sync with client-console/include/common.h */
-#define MT_REGISTER_HANDLE 20
-#define MT_LOOKUP_HANDLE   21
-#define MT_HANDLE_RESULT   22
-#define MT_BLOB_PUT        23
-#define MT_BLOB_GET        24
-#define MT_BLOB_RESULT     25
+#define MT_REGISTER_HANDLE       20
+#define MT_LOOKUP_HANDLE         21
+#define MT_HANDLE_RESULT         22
+#define MT_BLOB_PUT              23
+#define MT_BLOB_GET              24
+#define MT_BLOB_RESULT           25
+#define MT_LOOKUP_HANDLE_BY_PK   26
 
 /* ===== little-endian primitives ===== */
 static void wr_u16(uint8_t *p, uint16_t v) { p[0]=(uint8_t)v; p[1]=(uint8_t)(v>>8); }
@@ -204,6 +205,50 @@ sp_status_t sp_lookup_handle(const char *host, uint16_t port,
     if (st == SP_OK) {
         if (clen >= 2u + reason_len + 32u) {
             memcpy(pk_out, cipher + 2 + reason_len, 32);
+        } else {
+            st = SP_BAD_REPLY;
+        }
+    }
+    free(cipher);
+    return st;
+}
+
+sp_status_t sp_lookup_handle_by_pk(const char *host, uint16_t port,
+                                   const uint8_t pk[32],
+                                   char *handle_out, size_t handle_cap) {
+    if (!host || !pk || !handle_out || handle_cap < 2) return SP_INVALID;
+
+    sock_t s = connect_tcp(host, port);
+    if (s < 0) return SP_NETWORK_ERROR;
+
+    /* payload: [pk(32)] */
+    if (send_frame(s, MT_LOOKUP_HANDLE_BY_PK, pk, 32) < 0) {
+        close_socket(s); return SP_NETWORK_ERROR;
+    }
+
+    uint8_t reply_type;
+    uint8_t *cipher = NULL;
+    uint32_t clen = 0;
+    if (recv_frame(s, &reply_type, &cipher, &clen) < 0) {
+        close_socket(s); return SP_NETWORK_ERROR;
+    }
+    close_socket(s);
+    if (reply_type != MT_HANDLE_RESULT || clen < 2) { free(cipher); return SP_BAD_REPLY; }
+
+    uint8_t status     = cipher[0];
+    uint8_t reason_len = cipher[1];
+    sp_status_t st = status_from_byte(status);
+    if (st == SP_OK) {
+        /* Layout for OK reply: [0][reason_len][reason][handle_len(1)][handle] */
+        if (clen >= 2u + reason_len + 1u) {
+            uint8_t handle_len = cipher[2 + reason_len];
+            if (handle_len > 0 && (size_t)handle_len < handle_cap
+                && clen >= 2u + reason_len + 1u + handle_len) {
+                memcpy(handle_out, cipher + 2 + reason_len + 1, handle_len);
+                handle_out[handle_len] = '\0';
+            } else {
+                st = SP_BAD_REPLY;
+            }
         } else {
             st = SP_BAD_REPLY;
         }

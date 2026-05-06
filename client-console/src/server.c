@@ -406,6 +406,65 @@ static int try_handle_command(sock_t fd, const uint8_t *frame, size_t flen) {
         return 1;
     }
 
+    if (type == MSG_TYPE_LOOKUP_HANDLE_BY_PK) {
+        /* Reverse lookup — given identity_pk, return registered handle.
+         * Used by clients after identity import to detect a pre-existing
+         * registration. Payload: [pk(32)].
+         * Reply: HANDLE_RESULT with status=0 and payload
+         *        [status(1)][reason_len(1)][reason][handle_len(1)][handle]
+         * (the standard pk(32) suffix is replaced by handle_len + handle).
+         */
+        if (clen < 32) {
+            send_handle_result(fd, room, room_len, 2, "missing pk", NULL);
+            return 1;
+        }
+        char handle[64];
+        int rc = server_db_lookup_handle_by_pk(cipher, handle, sizeof(handle));
+        if (rc == 0) {
+            /* Build custom payload manually since send_handle_result writes
+             * pk(32) instead of handle_len+handle. */
+            uint8_t  payload[256];
+            size_t   payload_len = 0;
+            payload[payload_len++] = 0;          /* status = ok */
+            const char *reason     = "ok";
+            uint8_t reason_len     = (uint8_t)strlen(reason);
+            payload[payload_len++] = reason_len;
+            memcpy(payload + payload_len, reason, reason_len);
+            payload_len += reason_len;
+            uint8_t handle_len = (uint8_t)strlen(handle);
+            payload[payload_len++] = handle_len;
+            memcpy(payload + payload_len, handle, handle_len);
+            payload_len += handle_len;
+
+            static const char *kSrvName = "server";
+            uint16_t name_len = (uint16_t)strlen(kSrvName);
+            uint8_t  nonce[CRYPTO_NPUBBYTES];
+            memset(nonce, 0, sizeof(nonce));
+            size_t frame_len = 2 + room_len + 2 + name_len + 2
+                             + CRYPTO_NPUBBYTES + 1 + 4 + payload_len;
+            uint8_t *frame = (uint8_t *)malloc(frame_len);
+            if (frame) {
+                uint8_t *w = frame;
+                wr_u16(w, room_len);            w += 2;
+                memcpy(w, room, room_len);      w += room_len;
+                wr_u16(w, name_len);            w += 2;
+                memcpy(w, kSrvName, name_len);  w += name_len;
+                wr_u16(w, CRYPTO_NPUBBYTES);    w += 2;
+                memcpy(w, nonce, CRYPTO_NPUBBYTES); w += CRYPTO_NPUBBYTES;
+                *w++ = (uint8_t)MSG_TYPE_HANDLE_RESULT;
+                wr_u32(w, (uint32_t)payload_len); w += 4;
+                memcpy(w, payload, payload_len);
+                send_all(fd, frame, frame_len);
+                free(frame);
+            }
+        } else if (rc == 1) {
+            send_handle_result(fd, room, room_len, 1, "not found", NULL);
+        } else {
+            send_handle_result(fd, room, room_len, 3, "server error", NULL);
+        }
+        return 1;
+    }
+
     if (type == MSG_TYPE_BLOB_PUT) {
         /* payload: [pk(32)][sig(64)][type_len(1)][type][cipher_len(4)][cipher] */
         if (clen < 32 + 64 + 1 + 4) {

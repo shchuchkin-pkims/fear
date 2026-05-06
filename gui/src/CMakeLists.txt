@@ -19,7 +19,7 @@ set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib")
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")  # Статическая линковка для MSVC
 set(CMAKE_POSITION_INDEPENDENT_CODE OFF)  # Отключаем PIC для статической линковки
 
-find_package(Qt6 REQUIRED COMPONENTS Widgets Network Sql)
+find_package(Qt6 REQUIRED COMPONENTS Widgets Network Sql Concurrent)
 
 # Bake version into GUI for the auto-update check (must match PROGRAM_VERSION in
 # client-console/src/main.c).
@@ -120,6 +120,7 @@ set(SOURCES
     # New Telegram-style UI (Phase 1)
     chatwindow.cpp
     connectiondialog.cpp
+    registerhandledialog.cpp
     identitybackupdialog.cpp
     qrshowdialog.cpp
     history.cpp
@@ -155,6 +156,7 @@ set(HEADERS
     mainwindow.h
     chatwindow.h
     connectiondialog.h
+    registerhandledialog.h
     identitybackupdialog.h
     qrshowdialog.h
     history.h
@@ -190,6 +192,7 @@ target_link_libraries(fear_gui PRIVATE
     Qt6::Widgets
     Qt6::Network
     Qt6::Sql
+    Qt6::Concurrent
     ${LIBSODIUM_LIBRARIES}
     qrencode
     zbar

@@ -62,6 +62,21 @@ handle_register_result_t server_db_register_handle(
 int  server_db_lookup_handle(const char *handle, uint8_t pk_out[32]);
 
 /**
+ * Reverse lookup — given an identity_pk, return the handle it registered
+ * (if any). Used by clients after identity import to detect that a handle
+ * is already claimed for them on this server, so the user is not asked
+ * to register again.
+ *
+ * @param pk           32-byte identity public key.
+ * @param handle_out   Caller-supplied buffer; receives a NUL-terminated
+ *                     handle string on success.
+ * @param handle_cap   Capacity of handle_out (>= 64 recommended).
+ * @return 0 on found, 1 on not found, -1 on db error.
+ */
+int  server_db_lookup_handle_by_pk(const uint8_t pk[32],
+                                   char *handle_out, size_t handle_cap);
+
+/**
  * Store / replace an encrypted blob for `pk` of kind `blob_type`.
  * Used for the contacts blob (Phase B-3) and any future per-user state.
  * @return 0 on success.

@@ -153,7 +153,7 @@ void ChatWindow::requestConnect() {
         m_backend->disconnect();
     }
 
-    ConnectionDialog dlg(this);
+    ConnectionDialog dlg(m_profile, m_backend->identityFilePath, this);
     if (dlg.exec() != QDialog::Accepted) return;
 
     if (dlg.host().isEmpty() || dlg.room().isEmpty() || dlg.name().isEmpty()) {

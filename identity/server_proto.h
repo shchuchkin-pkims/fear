@@ -39,6 +39,21 @@ sp_status_t sp_lookup_handle(const char *host, uint16_t port,
                              uint8_t pk_out[32]);
 
 /**
+ * Reverse lookup — given an identity_pk, ask the server which handle is
+ * registered to it. On SP_OK the handle string is written to `handle_out`
+ * as NUL-terminated UTF-8 (caller-allocated, capacity at least 64 bytes).
+ * Returns SP_NOT_FOUND when the pk has no registration on this server.
+ *
+ * Used by clients after `.fbk` / QR identity import to discover the
+ * existing handle on the user's behalf, so the ConnectScreen can show
+ * the «Already registered as @nick» state without forcing the user to
+ * guess their own handle.
+ */
+sp_status_t sp_lookup_handle_by_pk(const char *host, uint16_t port,
+                                   const uint8_t pk[32],
+                                   char *handle_out, size_t handle_cap);
+
+/**
  * Register `handle` for `pk` on the relay. The signature is computed
  * locally with `sk` over the handle bytes.
  */

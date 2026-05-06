@@ -1,19 +1,43 @@
 #include "connectiondialog.h"
+#include "profilesettings.h"
+#include "registerhandledialog.h"
 
+#include <QComboBox>
+#include <QFormLayout>
+#include <QFutureWatcher>
+#include <QHBoxLayout>
+#include <QIntValidator>
+#include <QLabel>
 #include <QLineEdit>
 #include <QPlainTextEdit>
 #include <QPushButton>
-#include <QLabel>
-#include <QComboBox>
-#include <QVBoxLayout>
-#include <QHBoxLayout>
-#include <QFormLayout>
 #include <QSettings>
-#include <QIntValidator>
+#include <QTimer>
+#include <QVBoxLayout>
+#include <QtConcurrent>
+
+extern "C" {
+#include "identity.h"
+#include "server_proto.h"
+}
 
 namespace fear {
 
-ConnectionDialog::ConnectionDialog(QWidget *parent) : QDialog(parent) {
+namespace {
+struct ProbeResult {
+    quint64     seq = 0;
+    sp_status_t status = SP_NETWORK_ERROR;
+    QString     handle;
+};
+}
+
+ConnectionDialog::ConnectionDialog(ProfileSettings *profile,
+                                   const QString   &identityPath,
+                                   QWidget         *parent)
+    : QDialog(parent),
+      m_profile(profile),
+      m_identityPath(identityPath)
+{
     setWindowTitle(tr("Connect to F.E.A.R."));
     setModal(true);
     setMinimumWidth(460);
@@ -37,7 +61,7 @@ ConnectionDialog::ConnectionDialog(QWidget *parent) : QDialog(parent) {
     subtitle->setWordWrap(true);
     root->addWidget(subtitle);
 
-    // Mode toggle row
+    /* Mode toggle row */
     auto *modeRow = new QHBoxLayout();
     modeRow->setSpacing(8);
     m_createBtn = new QPushButton(tr("Create"), this);
@@ -58,8 +82,6 @@ ConnectionDialog::ConnectionDialog(QWidget *parent) : QDialog(parent) {
     form->setVerticalSpacing(10);
     form->setFormAlignment(Qt::AlignTop);
 
-    // Server picker — preset public nodes plus a free-form custom entry.
-    // QComboBox::setEditable(true) lets the user type any host they want.
     m_host = new QComboBox(this);
     m_host->setEditable(true);
     m_host->setInsertPolicy(QComboBox::NoInsert);
@@ -68,8 +90,6 @@ ConnectionDialog::ConnectionDialog(QWidget *parent) : QDialog(parent) {
     m_host->insertSeparator(m_host->count());
     m_host->addItem(tr("Custom server… (type below)"),            QStringLiteral(""));
     m_host->lineEdit()->setPlaceholderText(tr("e.g. fear-project.ru or 192.168.1.1"));
-    // When user picks a preset (with non-empty data) — copy that to the line edit.
-    // For the "Custom" entry we just clear and let them type.
     connect(m_host, QOverload<int>::of(&QComboBox::activated), this, [this](int idx) {
         const QString preset = m_host->itemData(idx).toString();
         if (!preset.isEmpty()) m_host->setEditText(preset);
@@ -100,25 +120,51 @@ ConnectionDialog::ConnectionDialog(QWidget *parent) : QDialog(parent) {
 
     root->addLayout(form);
 
+    /* Status line — shows whether we are registered on the chosen host. */
+    m_statusLabel = new QLabel(this);
+    m_statusLabel->setWordWrap(true);
+    m_statusLabel->setStyleSheet(QStringLiteral("color: gray;"));
+    root->addWidget(m_statusLabel);
+
     auto *btnRow = new QHBoxLayout();
     btnRow->addStretch(1);
     m_cancelBtn = new QPushButton(tr("Cancel"), this);
     m_cancelBtn->setProperty("flat", true);
     m_cancelBtn->setFlat(true);
-    m_connectBtn = new QPushButton(tr("Connect"), this);
+    m_registerBtn = new QPushButton(tr("Register"), this);
+    m_connectBtn  = new QPushButton(tr("Connect"), this);
     m_connectBtn->setDefault(true);
     btnRow->addWidget(m_cancelBtn);
+    btnRow->addWidget(m_registerBtn);
     btnRow->addWidget(m_connectBtn);
     root->addLayout(btnRow);
 
     connect(m_createBtn, &QPushButton::clicked, this, [this]{ setMode(Backend::CREATE_ROOM); });
     connect(m_joinBtn,   &QPushButton::clicked, this, [this]{ setMode(Backend::JOIN_ROOM);   });
     connect(m_manualBtn, &QPushButton::clicked, this, [this]{ setMode(Backend::MANUAL_KEY);  });
-    connect(m_cancelBtn, &QPushButton::clicked, this, &QDialog::reject);
-    connect(m_connectBtn, &QPushButton::clicked, this, &QDialog::accept);
+    connect(m_cancelBtn,   &QPushButton::clicked, this, &QDialog::reject);
+    connect(m_connectBtn,  &QPushButton::clicked, this, &QDialog::accept);
+    connect(m_registerBtn, &QPushButton::clicked, this, &ConnectionDialog::onRegisterClicked);
+
+    /* Registration probe: debounce typing into the host field by ~400 ms
+     * so we don't spam the relay on every keystroke. */
+    m_probeDebounce = new QTimer(this);
+    m_probeDebounce->setSingleShot(true);
+    m_probeDebounce->setInterval(400);
+    connect(m_probeDebounce, &QTimer::timeout, this, &ConnectionDialog::runRegistrationProbe);
+
+    connect(m_host->lineEdit(), &QLineEdit::textChanged, this,
+            [this](const QString &) { onHostChanged(); });
+    connect(m_port, &QLineEdit::textChanged, this,
+            [this](const QString &) { onHostChanged(); });
 
     loadFromSettings();
     setMode(m_mode);
+
+    /* First-paint status: read whatever ProfileSettings already knows, then
+     * kick a probe to refresh from the server. */
+    setRegistrationStatus(RegUnknown);
+    onHostChanged();
 }
 
 QString ConnectionDialog::host() const { return m_host->currentText().trimmed(); }
@@ -146,7 +192,6 @@ void ConnectionDialog::updateModeUi() {
 void ConnectionDialog::loadFromSettings() {
     QSettings s("fear-messenger", "fear-gui");
     s.beginGroup("connect");
-    // Default to the public NL node; user can override.
     m_host->setCurrentText(s.value("host", "fear-project.ru").toString());
     m_port->setText(s.value("port", 8888).toString());
     m_room->setText(s.value("room").toString());
@@ -168,4 +213,123 @@ void ConnectionDialog::saveToSettings() const {
     s.endGroup();
 }
 
+/* ---------- Registration logic ---------- */
+
+void ConnectionDialog::onHostChanged() {
+    /* Step 1 — instantly reflect what we already know locally. */
+    if (m_profile) {
+        const QString h = m_profile->handleFor(host());
+        if (!h.isEmpty()) setRegistrationStatus(RegYes, h);
+        else              setRegistrationStatus(RegUnknown);
+    }
+    /* Step 2 — schedule a server probe to verify or correct the local view. */
+    scheduleRegistrationProbe();
 }
+
+void ConnectionDialog::scheduleRegistrationProbe() {
+    m_probeDebounce->start();
+}
+
+void ConnectionDialog::runRegistrationProbe() {
+    if (host().isEmpty() || port() <= 0) {
+        setRegistrationStatus(RegUnknown);
+        return;
+    }
+    setRegistrationStatus(RegProbing);
+
+    const quint64    mySeq = ++m_probeSeq;
+    const QByteArray hb    = host().toUtf8();
+    const uint16_t   prt   = static_cast<uint16_t>(port());
+    const QByteArray ip    = m_identityPath.toUtf8();
+
+    auto *watcher = new QFutureWatcher<ProbeResult>(this);
+    connect(watcher, &QFutureWatcher<ProbeResult>::finished, this,
+            [this, watcher, mySeq]() {
+        watcher->deleteLater();
+        if (mySeq != m_probeSeq) return; /* superseded by a later probe */
+        const ProbeResult r = watcher->result();
+        if (r.status == SP_OK && !r.handle.isEmpty()) {
+            if (m_profile) m_profile->markRegisteredAs(host(), r.handle);
+            setRegistrationStatus(RegYes, r.handle);
+        } else if (r.status == SP_NOT_FOUND) {
+            if (m_profile) m_profile->forgetRegistration(host());
+            setRegistrationStatus(RegNo);
+        } else {
+            /* network error, bad reply, etc. — don't pretend, but don't
+             * lock the user out either: fall back to the locally cached
+             * value if we have one. */
+            const QString cached = m_profile ? m_profile->handleFor(host()) : QString();
+            if (!cached.isEmpty()) setRegistrationStatus(RegYes, cached);
+            else                   setRegistrationStatus(RegError);
+        }
+    });
+
+    auto future = QtConcurrent::run([hb, prt, ip, mySeq]() -> ProbeResult {
+        ProbeResult r; r.seq = mySeq;
+        uint8_t pk[IDENTITY_PK_BYTES];
+        if (identity_load_pk(ip.constData(), pk) != 0) {
+            r.status = SP_INVALID;
+            return r;
+        }
+        char handle[64] = {0};
+        r.status = sp_lookup_handle_by_pk(hb.constData(), prt, pk, handle, sizeof(handle));
+        if (r.status == SP_OK) r.handle = QString::fromUtf8(handle);
+        return r;
+    });
+    watcher->setFuture(future);
+}
+
+void ConnectionDialog::setRegistrationStatus(RegStatus st, const QString &handle) {
+    m_regStatus = st;
+    m_currentHandle = handle;
+    switch (st) {
+        case RegYes:
+            m_statusLabel->setText(tr("Registered as @%1@%2 on this server.")
+                                       .arg(handle, host()));
+            m_statusLabel->setStyleSheet(QStringLiteral("color: #2e7d32;"));
+            break;
+        case RegNo:
+            m_statusLabel->setText(tr("Registration is required to enter this server. "
+                                      "Pick a short name and click Register."));
+            m_statusLabel->setStyleSheet(QStringLiteral("color: #c62828;"));
+            break;
+        case RegProbing:
+            m_statusLabel->setText(tr("Checking registration status…"));
+            m_statusLabel->setStyleSheet(QStringLiteral("color: gray;"));
+            break;
+        case RegError:
+            m_statusLabel->setText(tr("Cannot reach the server to verify registration. "
+                                      "Connect button stays disabled until we know."));
+            m_statusLabel->setStyleSheet(QStringLiteral("color: #ef6c00;"));
+            break;
+        case RegUnknown:
+        default:
+            m_statusLabel->setText(tr("Enter a server to check your registration status."));
+            m_statusLabel->setStyleSheet(QStringLiteral("color: gray;"));
+            break;
+    }
+    refreshButtons();
+}
+
+void ConnectionDialog::refreshButtons() {
+    const bool canConnect  = (m_regStatus == RegYes);
+    const bool canRegister = (m_regStatus == RegNo);
+    m_connectBtn->setEnabled(canConnect);
+    m_registerBtn->setEnabled(canRegister);
+}
+
+void ConnectionDialog::onRegisterClicked() {
+    if (host().isEmpty() || port() <= 0) return;
+    /* Suggest the current display name as a starting point — the user can
+     * override before submitting. */
+    const QString suggest = m_profile ? m_profile->displayName().toLower() : QString();
+    RegisterHandleDialog dlg(host(), static_cast<uint16_t>(port()),
+                             m_identityPath, suggest, this);
+    if (dlg.exec() != QDialog::Accepted) return;
+    const QString chosen = dlg.chosenHandle();
+    if (chosen.isEmpty()) return;
+    if (m_profile) m_profile->markRegisteredAs(host(), chosen);
+    setRegistrationStatus(RegYes, chosen);
+}
+
+}  // namespace fear
