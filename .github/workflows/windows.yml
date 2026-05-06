@@ -156,9 +156,12 @@ jobs:
         run: |
           $tag = "${{ github.ref_name }}"
           $sha = "${{ github.sha }}".Substring(0, 7)
-          $name = "fear-windows-x64-$tag-$sha.zip"
-          # Sanitise: branch names like "dev"/"main" become part of filename
-          $name = $name -replace '/', '_'
+          if ("${{ github.ref }}" -like "refs/tags/v*") {
+            $name = "fear-windows-x64-$tag.zip"
+          } else {
+            # Sanitise: branch names like "dev"/"main" become part of filename
+            $name = ("fear-windows-x64-$tag-$sha.zip") -replace '/', '_'
+          }
           Compress-Archive -Path "release/fear/*" -DestinationPath "release/$name"
           echo "ZIP_NAME=$name" >> $env:GITHUB_ENV
 

@@ -89,7 +89,11 @@ jobs:
         run: |
           tag="${{ github.ref_name }}"
           sha=$(echo "${{ github.sha }}" | cut -c1-7)
-          name="fear-linux-x86_64-${tag//\//_}-${sha}.zip"
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            name="fear-linux-x86_64-${tag}.zip"
+          else
+            name="fear-linux-x86_64-${tag//\//_}-${sha}.zip"
+          fi
           (cd release && zip -r "${name}" fear)
           echo "ZIP_NAME=${name}" >> "$GITHUB_ENV"
 
