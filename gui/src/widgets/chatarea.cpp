@@ -395,8 +395,8 @@ ChatArea::ChatArea(QWidget *parent) : QWidget(parent) {
     connect(&Theme::instance(), &Theme::modeChanged, this,
             [applyPanelBg](Theme::Mode){ applyPanelBg(); });
 
-    m_attachBtn = makeIconButton(QString::fromUtf8("\u{1F4CE}"), tr("Attach"), m_inputArea);
-    m_emojiBtn  = makeIconButton(QString::fromUtf8("\u{1F642}"), tr("Emoji"),  m_inputArea);
+    m_attachBtn = makeIconButton(QString::fromUtf8("\U0001F4CE"), tr("Attach"), m_inputArea);
+    m_emojiBtn  = makeIconButton(QString::fromUtf8("\U0001F642"), tr("Emoji"),  m_inputArea);
     m_sendBtn   = makeIconButton(QString::fromUtf8("➤"),    tr("Send"),   m_inputArea);
     m_sendBtn->setObjectName("SendButton");
 
