@@ -89,39 +89,67 @@ handle_register_result_t server_db_register_handle(
     if (!g_db) return HANDLE_REGISTER_DB_ERROR;
     if (!server_db_handle_is_valid(handle)) return HANDLE_REGISTER_INVALID;
 
+    /* Шаг 1: запрашиваемый handle уже занят кем-то другим? */
     sqlite3_stmt *q = NULL;
     int rc = sqlite3_prepare_v2(g_db,
         "SELECT identity_pk FROM handles WHERE handle = ?", -1, &q, NULL);
     if (rc != SQLITE_OK) return HANDLE_REGISTER_DB_ERROR;
     sqlite3_bind_text(q, 1, handle, -1, SQLITE_STATIC);
-
-    handle_register_result_t result;
     rc = sqlite3_step(q);
     if (rc == SQLITE_ROW) {
         const void *existing = sqlite3_column_blob(q, 0);
         int existing_len = sqlite3_column_bytes(q, 0);
-        if (existing_len == 32 && memcmp(existing, pk, 32) == 0) {
-            result = HANDLE_REGISTER_OK;        /* same owner re-claiming */
-        } else {
-            result = HANDLE_REGISTER_CONFLICT;
-        }
+        const int same_owner =
+            (existing_len == 32 && memcmp(existing, pk, 32) == 0);
         sqlite3_finalize(q);
-        return result;
+        if (same_owner) return HANDLE_REGISTER_OK;  /* re-claim, no-op */
+        return HANDLE_REGISTER_CONFLICT;            /* taken by other pk */
     }
     sqlite3_finalize(q);
 
-    /* Not present — insert. */
+    /* Шаг 2: атомарно заменяем все ранее зарегистрированные handle
+     * этого pk на новый. Один pk = один handle. Если у pk были другие
+     * handle (которые пользователь забросил, когда переименовался) —
+     * освобождаем их. Без этого LOOKUP_HANDLE_BY_PK может вернуть
+     * устаревшее имя, и новый клиент логинится под старым handle. */
+    char *err = NULL;
+    rc = sqlite3_exec(g_db, "BEGIN IMMEDIATE", NULL, NULL, &err);
+    if (rc != SQLITE_OK) { sqlite3_free(err); return HANDLE_REGISTER_DB_ERROR; }
+
+    sqlite3_stmt *del = NULL;
+    rc = sqlite3_prepare_v2(g_db,
+        "DELETE FROM handles WHERE identity_pk = ?", -1, &del, NULL);
+    if (rc != SQLITE_OK) {
+        sqlite3_exec(g_db, "ROLLBACK", NULL, NULL, NULL);
+        return HANDLE_REGISTER_DB_ERROR;
+    }
+    sqlite3_bind_blob(del, 1, pk, 32, SQLITE_STATIC);
+    rc = sqlite3_step(del);
+    sqlite3_finalize(del);
+    if (rc != SQLITE_DONE) {
+        sqlite3_exec(g_db, "ROLLBACK", NULL, NULL, NULL);
+        return HANDLE_REGISTER_DB_ERROR;
+    }
+
     sqlite3_stmt *ins = NULL;
     rc = sqlite3_prepare_v2(g_db,
         "INSERT INTO handles(handle, identity_pk, claimed_at) VALUES (?, ?, ?)",
         -1, &ins, NULL);
-    if (rc != SQLITE_OK) return HANDLE_REGISTER_DB_ERROR;
-    sqlite3_bind_text(ins, 1, handle, -1, SQLITE_STATIC);
-    sqlite3_bind_blob(ins, 2, pk, 32, SQLITE_STATIC);
+    if (rc != SQLITE_OK) {
+        sqlite3_exec(g_db, "ROLLBACK", NULL, NULL, NULL);
+        return HANDLE_REGISTER_DB_ERROR;
+    }
+    sqlite3_bind_text (ins, 1, handle, -1, SQLITE_STATIC);
+    sqlite3_bind_blob (ins, 2, pk, 32, SQLITE_STATIC);
     sqlite3_bind_int64(ins, 3, (sqlite3_int64)time(NULL));
     rc = sqlite3_step(ins);
     sqlite3_finalize(ins);
-    return rc == SQLITE_DONE ? HANDLE_REGISTER_OK : HANDLE_REGISTER_DB_ERROR;
+    if (rc != SQLITE_DONE) {
+        sqlite3_exec(g_db, "ROLLBACK", NULL, NULL, NULL);
+        return HANDLE_REGISTER_DB_ERROR;
+    }
+    sqlite3_exec(g_db, "COMMIT", NULL, NULL, NULL);
+    return HANDLE_REGISTER_OK;
 }
 
 int server_db_lookup_handle(const char *handle, uint8_t pk_out[32]) {
