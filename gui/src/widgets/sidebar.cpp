@@ -8,6 +8,7 @@
 #include <QLineEdit>
 #include <QListWidget>
 #include <QListWidgetItem>
+#include <QMouseEvent>
 #include <QPushButton>
 #include <QResizeEvent>
 #include <QToolButton>
@@ -99,23 +100,12 @@ Sidebar::Sidebar(QWidget *parent) : QWidget(parent) {
     m_groupList->setVerticalScrollMode(QAbstractItemView::ScrollPerPixel);
     m_groupList->setUniformItemSizes(true);
 
-    // Right-click context menu — «Delete chat». На обоих списках.
-    auto installCtx = [this](QListWidget *list) {
-        list->setContextMenuPolicy(Qt::CustomContextMenu);
-        connect(list, &QListWidget::customContextMenuRequested, this,
-                [this, list](const QPoint &pos) {
-            QListWidgetItem *it = list->itemAt(pos);
-            if (!it) return;
-            const QString id = it->data(Qt::UserRole).toString();
-            QMenu menu(this);
-            QAction *del = menu.addAction(tr("Delete chat"));
-            if (menu.exec(list->mapToGlobal(pos)) == del) {
-                emit deleteChatRequested(id);
-            }
-        });
-    };
-    installCtx(m_dmList);
-    installCtx(m_groupList);
+    // Right-click context menu — «Delete chat». Handled via eventFilter on
+    // each list's viewport so the underlying QListWidget never sees the
+    // RightButton press: that's what was switching currentItem and emitting
+    // chatSelected → "Switch room?" prompt before our menu even appeared.
+    m_dmList->viewport()->installEventFilter(this);
+    m_groupList->viewport()->installEventFilter(this);
 
     auto *root = new QVBoxLayout(this);
     root->setContentsMargins(0, 0, 0, 0);
@@ -181,6 +171,29 @@ Sidebar::Sidebar(QWidget *parent) : QWidget(parent) {
     applyTheme();
     connect(&Theme::instance(), &Theme::modeChanged, this,
             [applyTheme](Theme::Mode){ applyTheme(); });
+}
+
+bool Sidebar::eventFilter(QObject *obj, QEvent *event) {
+    if (event->type() == QEvent::MouseButtonPress) {
+        auto *me = static_cast<QMouseEvent *>(event);
+        if (me->button() == Qt::RightButton) {
+            QListWidget *list = nullptr;
+            if (obj == m_dmList->viewport())         list = m_dmList;
+            else if (obj == m_groupList->viewport()) list = m_groupList;
+            if (list) {
+                QListWidgetItem *it = list->itemAt(me->pos());
+                if (!it) return true;            // empty area — swallow click
+                const QString id = it->data(Qt::UserRole).toString();
+                QMenu menu(this);
+                QAction *del = menu.addAction(tr("Delete chat"));
+                if (menu.exec(list->viewport()->mapToGlobal(me->pos())) == del) {
+                    emit deleteChatRequested(id);
+                }
+                return true;                     // do not let QListWidget see it
+            }
+        }
+    }
+    return QWidget::eventFilter(obj, event);
 }
 
 void Sidebar::resizeEvent(QResizeEvent *e) {

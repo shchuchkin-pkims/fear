@@ -35,6 +35,10 @@ public:
 
 protected:
     void resizeEvent(QResizeEvent *e) override;
+    /** Intercept right-click on either list's viewport so it shows our
+     *  context menu without letting QListWidget switch the current item
+     *  (which would emit chatSelected and prompt to reconnect). */
+    bool eventFilter(QObject *obj, QEvent *event) override;
 
 signals:
     void menuRequested(const QPoint &globalPos);
