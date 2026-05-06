@@ -454,15 +454,19 @@ void ChatWindow::promptAndConnectRoom(Backend::ConnectMode mode) {
                                                &ok).trimmed();
     if (!ok || room.isEmpty()) return;
 
+    // Snapshot endpoint/name BEFORE disconnect — Backend::disconnect()
+    // clears serverHost/serverPort/currentName, so reading them after the
+    // tear-down would launch the CLI with empty --host/--name args and the
+    // UI would just sit on "switching room…" / "Disconnected".
+    const QString host = m_backend->serverHost;
+    const int     port = m_backend->serverPort;
+    const QString name = m_backend->currentName;
+
     if (m_backend->isConnected) m_backend->disconnect();
     m_lastMode = mode;
     m_connectStarted = QDateTime::currentDateTime();
-    if (!m_backend->connectToServer(m_backend->serverHost,
-                                    m_backend->serverPort,
-                                    room,
-                                    /*key=*/QString(),
-                                    m_backend->currentName,
-                                    mode)) {
+    if (!m_backend->connectToServer(host, port, room,
+                                    /*key=*/QString(), name, mode)) {
         QMessageBox::warning(this, title,
             tr("Failed to start connection. Check the CLI path in Settings."));
     }
