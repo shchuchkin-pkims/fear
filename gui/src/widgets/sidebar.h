@@ -43,6 +43,9 @@ signals:
     /** Emitted when the user clicks the floating "+" — host opens the
      *  contacts dialog (which also lets the user start a new group). */
     void addNewRequested();
+    /** Right-click → "Delete chat" on a sidebar entry. Host removes the
+     *  contact (for DMs) and clears the local message history for `id`. */
+    void deleteChatRequested(const QString &id);
 
 private:
     void onDmSelectionChanged();

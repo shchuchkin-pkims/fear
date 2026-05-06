@@ -469,8 +469,8 @@ ChatArea::ChatArea(QWidget *parent) : QWidget(parent) {
     // Меню действий, относящихся к текущему чату. Открывается под кнопкой «⋮».
     connect(m_menuBtn, &QPushButton::clicked, this, [this]() {
         QMenu menu(this);
-        QAction *aSearch = menu.addAction(tr("Поиск сообщений…"));
-        QAction *aClear  = menu.addAction(tr("Очистить историю комнаты…"));
+        QAction *aSearch = menu.addAction(tr("Search messages…"));
+        QAction *aClear  = menu.addAction(tr("Clear chat history…"));
         QPoint pos = m_menuBtn->mapToGlobal(QPoint(0, m_menuBtn->height()));
         QAction *picked = menu.exec(pos);
         if      (picked == aSearch) emit searchInChatRequested();

@@ -130,6 +130,8 @@ ChatWindow::ChatWindow(QWidget *parent) : QMainWindow(parent) {
             this, &ChatWindow::onSidebarChatSelected);
     connect(m_sidebar, &Sidebar::addNewRequested,
             this, &ChatWindow::openContacts);
+    connect(m_sidebar, &Sidebar::deleteChatRequested,
+            this, &ChatWindow::onDeleteChatRequested);
     connect(ContactsStore::instance(), &ContactsStore::contactsChanged,
             this, &ChatWindow::rebuildSidebarChats);
 
@@ -510,7 +512,7 @@ void ChatWindow::onChatHeaderClicked() {
             }
         }
         QMessageBox::information(this, tr("Profile"),
-            tr("Не нашли контакт для этой ЛС-комнаты."));
+            tr("No contact found for this PM room."));
         return;
     }
 
@@ -695,7 +697,7 @@ void ChatWindow::onSidebarChatSelected(const QString &id) {
         }
         if (peerPkB64.isEmpty()) {
             QMessageBox::warning(this, tr("Open chat"),
-                tr("Не нашли контакт для этой ЛС-комнаты."));
+                tr("No contact found for this PM room."));
             return;
         }
         switchToDmRoom(peerPkB64);
@@ -801,6 +803,79 @@ void ChatWindow::openProfile() {
                             ? static_cast<uint16_t>(m_backend->serverPort) : 8888,
         this);
     dlg.exec();
+}
+
+void ChatWindow::onDeleteChatRequested(const QString &roomId) {
+    if (roomId.isEmpty()) return;
+    const bool isPm = roomId.startsWith("pm:") || roomId.startsWith("dm:");
+    QString question;
+    if (isPm) {
+        question = tr("Delete chat with this contact?\n\n"
+                      "Local message history for this PM room will be erased "
+                      "and the contact will be removed from your address book. "
+                      "This does not delete the conversation on their side.");
+    } else {
+        question = tr("Delete local history for room '%1'?\n\n"
+                      "Messages on the server and on other participants' "
+                      "devices remain intact.").arg(roomId);
+    }
+    if (QMessageBox::question(this, tr("Delete chat"), question,
+                              QMessageBox::Yes | QMessageBox::No) != QMessageBox::Yes) {
+        return;
+    }
+
+    // Если пользователь стирает текущую активную комнату — отключаемся,
+    // чтобы не остаться в комнате, которой больше нет в UI.
+    if (roomId == m_backend->currentRoom && m_backend->isConnected) {
+        m_backend->disconnect();
+    }
+
+    // Локальная история — атомарная очистка по roomId.
+    if (m_history) m_history->clearRoom(roomId);
+
+    // Для PM — убираем контакт из локального кэша и пушим обновлённый blob.
+    if (isPm) {
+        // Найдём контакт по совпадению pm room id и удалим его.
+        auto cs = ContactsStore::instance();
+        auto contacts = cs->all();
+        QVector<ContactsStore::Record> kept;
+        kept.reserve(contacts.size());
+
+        uint8_t my_pk[IDENTITY_PK_BYTES];
+        const bool haveMine =
+            (identity_load_pk(m_backend->identityFilePath.toUtf8().constData(),
+                              my_pk) == 0);
+
+        for (const auto &c : contacts) {
+            bool drop = false;
+            if (haveMine && !c.pk.isEmpty()) {
+                uint8_t their_pk[IDENTITY_PK_BYTES];
+                size_t pkLen = 0;
+                QByteArray pkUtf8 = c.pk.toUtf8();
+                if (sodium_base642bin(their_pk, IDENTITY_PK_BYTES,
+                                      pkUtf8.constData(), pkUtf8.size(),
+                                      nullptr, &pkLen, nullptr,
+                                      sodium_base64_VARIANT_URLSAFE_NO_PADDING) == 0
+                    && pkLen == IDENTITY_PK_BYTES) {
+                    char buf[IDENTITY_PM_ROOM_ID_LEN];
+                    if (identity_pm_room_id(my_pk, their_pk, buf) == 0
+                        && QString::fromUtf8(buf) == roomId) {
+                        drop = true;
+                    }
+                }
+            }
+            if (!drop) kept.append(c);
+        }
+        cs->replaceAll(kept);   // пересчитает sidebar через signal
+    }
+
+    // Чистим chat area если активная комната была удалённой.
+    if (roomId == m_backend->currentRoom) {
+        m_chatArea->clearMessages();
+        m_chatArea->showEmptyState(tr("Chat deleted. Pick another from the sidebar."));
+    }
+
+    rebuildSidebarChats();
 }
 
 void ChatWindow::clearActiveHistory() {

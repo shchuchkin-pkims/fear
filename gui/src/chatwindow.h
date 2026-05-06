@@ -48,6 +48,10 @@ private:
     void openProfile();
     void openContacts();
     void openPeerProfile(const QString &senderName);
+    /** «Delete chat» from sidebar context menu. Wipes local history for
+     *  `roomId` and, for DMs, also removes the corresponding contact
+     *  from ContactsStore + sends a fresh blob to the relay. */
+    void onDeleteChatRequested(const QString &roomId);
     /** Тап по заголовку чата (аватар или название). DM → профиль
      *  собеседника; групповая комната → диалог участников. */
     void onChatHeaderClicked();

@@ -13,7 +13,7 @@ GroupParticipantsDialog::GroupParticipantsDialog(const QString    &roomTitle,
                                                  QWidget          *parent)
     : QDialog(parent)
 {
-    setWindowTitle(tr("Участники комнаты"));
+    setWindowTitle(tr("Room participants"));
     setModal(true);
     setMinimumWidth(360);
 
@@ -29,14 +29,14 @@ GroupParticipantsDialog::GroupParticipantsDialog(const QString    &roomTitle,
     root->addWidget(title);
 
     auto *count = new QLabel(
-        tr("В комнате участников: %1").arg(participants.size()), this);
+        tr("%1 participant(s) currently online").arg(participants.size()), this);
     count->setStyleSheet(QStringLiteral("color: gray;"));
     root->addWidget(count);
 
     m_list = new QListWidget(this);
     m_list->setAlternatingRowColors(true);
     if (participants.isEmpty()) {
-        m_list->addItem(tr("Сервер ещё не прислал список участников."));
+        m_list->addItem(tr("The server has not yet sent the participant list."));
         m_list->item(0)->setFlags(Qt::NoItemFlags);
     } else {
         for (const QString &p : participants) {
@@ -54,7 +54,7 @@ GroupParticipantsDialog::GroupParticipantsDialog(const QString    &roomTitle,
 
     auto *btnRow = new QHBoxLayout();
     btnRow->addStretch(1);
-    auto *closeBtn = new QPushButton(tr("Закрыть"), this);
+    auto *closeBtn = new QPushButton(tr("Close"), this);
     connect(closeBtn, &QPushButton::clicked, this, &QDialog::reject);
     btnRow->addWidget(closeBtn);
     root->addLayout(btnRow);

@@ -84,9 +84,9 @@ ProfileDialog::ProfileDialog(ProfileSettings *settings,
     layout->addWidget(m_handlesList);
 
     auto *handleBtnRow = new QHBoxLayout();
-    m_removeHandleBtn = new QPushButton(tr("Удалить выбранный"), this);
+    m_removeHandleBtn = new QPushButton(tr("Remove selected"), this);
     m_removeHandleBtn->setEnabled(false);
-    m_registerHandleBtn = new QPushButton(tr("Зарегистрировать новый…"), this);
+    m_registerHandleBtn = new QPushButton(tr("Register new…"), this);
     handleBtnRow->addWidget(m_removeHandleBtn);
     handleBtnRow->addStretch(1);
     handleBtnRow->addWidget(m_registerHandleBtn);
@@ -147,11 +147,11 @@ void ProfileDialog::onRemoveHandle() {
     /* Каждый item хранит host в Qt::UserRole. */
     const QString host = it->data(Qt::UserRole).toString();
     if (host.isEmpty()) return;
-    auto answer = QMessageBox::question(this, tr("Забыть handle"),
-        tr("Удалить локальную запись о регистрации @%1@%2?\n\n"
-           "На сервере handle останется зарезервированным за вашим ключом.\n"
-           "При следующей регистрации того же ключа старый handle будет\n"
-           "автоматически освобождён сервером.")
+    auto answer = QMessageBox::question(this, tr("Forget handle"),
+        tr("Forget the local record of @%1@%2?\n\n"
+           "On the server the handle stays reserved for your key.\n"
+           "It will be released automatically when the same key registers\n"
+           "a different handle.")
             .arg(m_settings->handleFor(host), host));
     if (answer != QMessageBox::Yes) return;
     m_settings->forgetRegistration(host);
@@ -162,8 +162,8 @@ void ProfileDialog::onRegisterHandle() {
     QString host = m_defaultHost;
     if (host.isEmpty()) {
         bool ok = false;
-        host = QInputDialog::getText(this, tr("Сервер"),
-            tr("Адрес сервера (host[:port]):"),
+        host = QInputDialog::getText(this, tr("Server"),
+            tr("Server address (host[:port]):"),
             QLineEdit::Normal, QStringLiteral("fear-project.ru"), &ok);
         if (!ok) return;
         host = host.trimmed();
@@ -237,7 +237,7 @@ void ProfileDialog::rebuildIdentityLabels() {
     const auto servers = m_settings->registeredServers();
     if (servers.isEmpty()) {
         auto *placeholder = new QListWidgetItem(
-            tr("Пока нет зарегистрированных handle. Нажмите «Зарегистрировать новый…»."));
+            tr("No handles registered yet. Click 'Register new…'."));
         placeholder->setFlags(Qt::NoItemFlags);
         placeholder->setForeground(Qt::gray);
         m_handlesList->addItem(placeholder);

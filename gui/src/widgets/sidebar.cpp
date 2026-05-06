@@ -1,7 +1,9 @@
 #include "sidebar.h"
 #include "../theme/theme.h"
 
+#include <QAction>
 #include <QHBoxLayout>
+#include <QMenu>
 #include <QLabel>
 #include <QLineEdit>
 #include <QListWidget>
@@ -80,7 +82,7 @@ Sidebar::Sidebar(QWidget *parent) : QWidget(parent) {
     };
 
     // -- Contacts section -------------------------------------------------
-    auto *dmHeader = buildSectionHeader(tr("Контакты"), m_dmToggle, m_dmTitle);
+    auto *dmHeader = buildSectionHeader(tr("Contacts"), m_dmToggle, m_dmTitle);
     m_dmList = new QListWidget(this);
     m_dmList->setObjectName("ChatList");
     m_dmList->setFrameShape(QFrame::NoFrame);
@@ -89,13 +91,31 @@ Sidebar::Sidebar(QWidget *parent) : QWidget(parent) {
     m_dmList->setUniformItemSizes(true);
 
     // -- Groups section ---------------------------------------------------
-    auto *groupHeader = buildSectionHeader(tr("Группы"), m_groupToggle, m_groupTitle);
+    auto *groupHeader = buildSectionHeader(tr("Groups"), m_groupToggle, m_groupTitle);
     m_groupList = new QListWidget(this);
     m_groupList->setObjectName("ChatList");
     m_groupList->setFrameShape(QFrame::NoFrame);
     m_groupList->setSelectionMode(QAbstractItemView::SingleSelection);
     m_groupList->setVerticalScrollMode(QAbstractItemView::ScrollPerPixel);
     m_groupList->setUniformItemSizes(true);
+
+    // Right-click context menu — «Delete chat». На обоих списках.
+    auto installCtx = [this](QListWidget *list) {
+        list->setContextMenuPolicy(Qt::CustomContextMenu);
+        connect(list, &QListWidget::customContextMenuRequested, this,
+                [this, list](const QPoint &pos) {
+            QListWidgetItem *it = list->itemAt(pos);
+            if (!it) return;
+            const QString id = it->data(Qt::UserRole).toString();
+            QMenu menu(this);
+            QAction *del = menu.addAction(tr("Delete chat"));
+            if (menu.exec(list->mapToGlobal(pos)) == del) {
+                emit deleteChatRequested(id);
+            }
+        });
+    };
+    installCtx(m_dmList);
+    installCtx(m_groupList);
 
     auto *root = new QVBoxLayout(this);
     root->setContentsMargins(0, 0, 0, 0);
@@ -111,7 +131,7 @@ Sidebar::Sidebar(QWidget *parent) : QWidget(parent) {
     m_addBtn->setText(QStringLiteral("+"));
     m_addBtn->setCursor(Qt::PointingHandCursor);
     m_addBtn->setFixedSize(44, 44);
-    m_addBtn->setToolTip(tr("Новый чат"));
+    m_addBtn->setToolTip(tr("New chat"));
     m_addBtn->setStyleSheet(
         "QPushButton { background: #2196F3; color: white; border: none;"
         "              border-radius: 22px; font-size: 22px; }"
@@ -222,8 +242,8 @@ void Sidebar::rebuildLists() {
 }
 
 void Sidebar::updateSectionHeaders() {
-    m_dmTitle->setText(tr("Контакты (%1)").arg(m_dmList->count()));
-    m_groupTitle->setText(tr("Группы (%1)").arg(m_groupList->count()));
+    m_dmTitle->setText(tr("Contacts (%1)").arg(m_dmList->count()));
+    m_groupTitle->setText(tr("Groups (%1)").arg(m_groupList->count()));
 }
 
 void Sidebar::selectChat(const QString &id) {
