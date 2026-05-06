@@ -39,6 +39,7 @@ extern "C" {
 #include <QRegularExpression>
 #include <QMessageBox>
 #include <QMenu>
+#include <QInputDialog>
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QDir>
@@ -129,7 +130,7 @@ ChatWindow::ChatWindow(QWidget *parent) : QMainWindow(parent) {
     connect(m_sidebar, &Sidebar::chatSelected,
             this, &ChatWindow::onSidebarChatSelected);
     connect(m_sidebar, &Sidebar::addNewRequested,
-            this, &ChatWindow::openContacts);
+            this, &ChatWindow::onAddNewRequested);
     connect(m_sidebar, &Sidebar::deleteChatRequested,
             this, &ChatWindow::onDeleteChatRequested);
     connect(ContactsStore::instance(), &ContactsStore::contactsChanged,
@@ -419,6 +420,52 @@ void ChatWindow::openContacts() {
         onSidebarChatSelected(room);
     });
     dlg.exec();
+}
+
+void ChatWindow::onAddNewRequested() {
+    QMenu menu(this);
+    QAction *aContact = menu.addAction(tr("Add contact"));
+    QAction *aJoin    = menu.addAction(tr("Join room…"));
+    QAction *aCreate  = menu.addAction(tr("Create new room…"));
+    QAction *picked   = menu.exec(QCursor::pos());
+    if (!picked) return;
+    if (picked == aContact)      openContacts();
+    else if (picked == aJoin)    promptAndConnectRoom(Backend::JOIN_ROOM);
+    else if (picked == aCreate)  promptAndConnectRoom(Backend::CREATE_ROOM);
+}
+
+void ChatWindow::promptAndConnectRoom(Backend::ConnectMode mode) {
+    if (m_backend->serverHost.isEmpty()) {
+        QMessageBox::information(this, tr("Connect to server"),
+            tr("Connect to a server first — joining or creating a room "
+               "needs a relay endpoint."));
+        return;
+    }
+    const bool isCreate = (mode == Backend::CREATE_ROOM);
+    bool ok = false;
+    const QString prompt = isCreate
+        ? tr("Pick a room name. A fresh encryption key will be generated "
+             "and shared with anyone who joins later.")
+        : tr("Enter the name of an existing room. The encryption key will "
+             "be fetched from a participant who is already inside.");
+    const QString title = isCreate ? tr("Create new room") : tr("Join room");
+    const QString room = QInputDialog::getText(this, title, prompt,
+                                               QLineEdit::Normal, QString(),
+                                               &ok).trimmed();
+    if (!ok || room.isEmpty()) return;
+
+    if (m_backend->isConnected) m_backend->disconnect();
+    m_lastMode = mode;
+    m_connectStarted = QDateTime::currentDateTime();
+    if (!m_backend->connectToServer(m_backend->serverHost,
+                                    m_backend->serverPort,
+                                    room,
+                                    /*key=*/QString(),
+                                    m_backend->currentName,
+                                    mode)) {
+        QMessageBox::warning(this, title,
+            tr("Failed to start connection. Check the CLI path in Settings."));
+    }
 }
 
 // Sender of the message bubble was clicked → look up whatever we know

@@ -47,6 +47,13 @@ private:
     void clearActiveHistory();
     void openProfile();
     void openContacts();
+    /** Sidebar "+" button → popup menu offering "Add contact",
+     *  "Join room…" and "Create new room…". */
+    void onAddNewRequested();
+    /** Prompt the user for a room name and connect with the chosen mode
+     *  (JOIN_ROOM or CREATE_ROOM). Reuses the currently connected
+     *  server endpoint or falls back to the saved profile defaults. */
+    void promptAndConnectRoom(Backend::ConnectMode mode);
     void openPeerProfile(const QString &senderName);
     /** «Delete chat» from sidebar context menu. Wipes local history for
      *  `roomId` and, for DMs, also removes the corresponding contact
