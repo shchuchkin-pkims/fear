@@ -40,6 +40,10 @@ signals:
     void videoCallRequested();
     void chatInfoRequested();
     void attachRequested();
+    /** Пункт меню «Поиск сообщений» в шапке чата — открывает search dialog. */
+    void searchInChatRequested();
+    /** Пункт меню «Очистить историю» — стирает локальную историю текущей комнаты. */
+    void clearChatRequested();
     /** Emitted when the user clicks a peer's avatar or name inside a
      *  message bubble — used to open the peer profile dialog. */
     void senderClicked(const QString &senderName);
@@ -70,7 +74,6 @@ private:
     QLabel      *m_statusLbl;
     QPushButton *m_audioCallBtn;
     QPushButton *m_videoCallBtn;
-    QPushButton *m_searchBtn;
     QPushButton *m_menuBtn;
 
     // Body

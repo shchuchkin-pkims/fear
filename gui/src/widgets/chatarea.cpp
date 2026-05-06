@@ -16,6 +16,8 @@
 #include <QRegularExpression>
 #include <QTextDocument>
 #include <QMouseEvent>
+#include <QMenu>
+#include <QAction>
 
 namespace fear {
 
@@ -293,7 +295,6 @@ ChatArea::ChatArea(QWidget *parent) : QWidget(parent) {
 
     m_audioCallBtn = makeIconButton(QString::fromUtf8("☎"), tr("Audio call"), m_header);
     m_videoCallBtn = makeIconButton(QString::fromUtf8("▶"), tr("Video call"), m_header);
-    m_searchBtn    = makeIconButton(QString::fromUtf8("⌕"), tr("Search"),     m_header);
     m_menuBtn      = makeIconButton(QString::fromUtf8("⋮"), tr("More"),       m_header);
 
     // Кликабельная зона: аватар + title — единый clickable контейнер.
@@ -312,7 +313,6 @@ ChatArea::ChatArea(QWidget *parent) : QWidget(parent) {
     headerLay->addWidget(clickable, 1);
     headerLay->addWidget(m_audioCallBtn);
     headerLay->addWidget(m_videoCallBtn);
-    headerLay->addWidget(m_searchBtn);
     headerLay->addWidget(m_menuBtn);
 
     // ─── Messages scroll ───
@@ -466,7 +466,16 @@ ChatArea::ChatArea(QWidget *parent) : QWidget(parent) {
     connect(m_sendBtn,      &QPushButton::clicked, this, &ChatArea::onSendClicked);
     connect(m_audioCallBtn, &QPushButton::clicked, this, &ChatArea::audioCallRequested);
     connect(m_videoCallBtn, &QPushButton::clicked, this, &ChatArea::videoCallRequested);
-    connect(m_menuBtn,      &QPushButton::clicked, this, &ChatArea::chatInfoRequested);
+    // Меню действий, относящихся к текущему чату. Открывается под кнопкой «⋮».
+    connect(m_menuBtn, &QPushButton::clicked, this, [this]() {
+        QMenu menu(this);
+        QAction *aSearch = menu.addAction(tr("Поиск сообщений…"));
+        QAction *aClear  = menu.addAction(tr("Очистить историю комнаты…"));
+        QPoint pos = m_menuBtn->mapToGlobal(QPoint(0, m_menuBtn->height()));
+        QAction *picked = menu.exec(pos);
+        if      (picked == aSearch) emit searchInChatRequested();
+        else if (picked == aClear)  emit clearChatRequested();
+    });
     connect(m_attachBtn,    &QPushButton::clicked, this, &ChatArea::attachRequested);
 }
 

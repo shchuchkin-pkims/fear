@@ -85,8 +85,8 @@ ConnectionDialog::ConnectionDialog(ProfileSettings *profile,
     m_host = new QComboBox(this);
     m_host->setEditable(true);
     m_host->setInsertPolicy(QComboBox::NoInsert);
-    m_host->addItem(tr("fear-project.ru — Netherlands (Meppel)"), QStringLiteral("fear-project.ru"));
-    m_host->addItem(tr("81.200.28.93 — Russia (Moscow)"),         QStringLiteral("81.200.28.93"));
+    m_host->addItem(tr("fear-project.ru — основной сервер"),       QStringLiteral("fear-project.ru"));
+    m_host->addItem(tr("77.221.145.132 — Netherlands (Meppel)"),   QStringLiteral("77.221.145.132"));
     m_host->insertSeparator(m_host->count());
     m_host->addItem(tr("Custom server… (type below)"),            QStringLiteral(""));
     m_host->lineEdit()->setPlaceholderText(tr("e.g. fear-project.ru or 192.168.1.1"));

@@ -116,6 +116,14 @@ ChatWindow::ChatWindow(QWidget *parent) : QMainWindow(parent) {
     connect(m_chatArea, &ChatArea::attachRequested,     this, &ChatWindow::onAttachRequested);
     connect(m_chatArea, &ChatArea::senderClicked,       this, &ChatWindow::openPeerProfile);
     connect(m_chatArea, &ChatArea::headerClicked,       this, &ChatWindow::onChatHeaderClicked);
+    // Меню «⋮» в шапке чата: поиск по сообщениям и очистка истории
+    // относятся к текущему чату, поэтому живут здесь, а не в главном меню.
+    connect(m_chatArea, &ChatArea::searchInChatRequested, this, [this]() {
+        SearchDialog dlg(m_history, this);
+        dlg.exec();
+    });
+    connect(m_chatArea, &ChatArea::clearChatRequested,
+            this, &ChatWindow::clearActiveHistory);
     // Phase B-5: unified chat list — sidebar selection routes to DM open
     // or current-room reuse, "+" opens the contacts dialog.
     connect(m_sidebar, &Sidebar::chatSelected,
@@ -209,14 +217,17 @@ void ChatWindow::handleConnected() {
 
 void ChatWindow::updateOnlineStatus() {
     if (m_backend->currentRoom.isEmpty()) return;
-    // Two independent sources: the server's [USERS] broadcast count, and the
-    // set of peers we've actually heard messages from. Take the max — joiners
-    // sometimes miss the [USERS] frame during ECDH handshake, but messages
-    // they receive afterwards still let us count.
     const int fromPeers = m_seenPeers.size() + 1;          // +1 for self
     const int total     = qMax(m_reportedCount, fromPeers);
-    QString status = (total <= 1) ? tr("just you online")
-                                  : tr("%1 online").arg(total);
+    const bool isPm     = m_backend->currentRoom.startsWith("pm:")
+                       || m_backend->currentRoom.startsWith("dm:");
+    QString status;
+    if (isPm) {
+        status = (total >= 2) ? tr("online") : tr("offline");
+    } else {
+        status = (total <= 1) ? tr("just you online")
+                              : tr("%1 online").arg(total);
+    }
     m_chatArea->setChat(m_backend->currentRoom,
                         prettyRoomTitle(m_backend->currentRoom), status);
 }
@@ -356,9 +367,8 @@ void ChatWindow::onSidebarMenu(const QPoint &globalPos) {
     QAction *exportIdAct   = menu.addAction(tr("Export identity…"));
     QAction *importIdAct   = menu.addAction(tr("Import identity…"));
     menu.addSeparator();
-    QAction *searchAct     = menu.addAction(tr("Search messages…"));
-    QAction *clearHistAct  = menu.addAction(tr("Clear chat history…"));
-    menu.addSeparator();
+    /* Search messages / clear chat history относятся к текущему чату и
+     * вызываются из меню «⋮» в шапке ChatArea — здесь больше не дублируются. */
     QAction *updateAct     = menu.addAction(tr("Check for updates"));
     QAction *aboutAct      = menu.addAction(tr("About F.E.A.R."));
     menu.addSeparator();
@@ -377,11 +387,6 @@ void ChatWindow::onSidebarMenu(const QPoint &globalPos) {
     else if (picked == trustedAct)    openTrustedKeys();
     else if (picked == exportIdAct)   openIdentityBackup(/*export=*/true);
     else if (picked == importIdAct)   openIdentityBackup(/*export=*/false);
-    else if (picked == clearHistAct)  clearActiveHistory();
-    else if (picked == searchAct) {
-        SearchDialog dlg(m_history, this);
-        dlg.exec();
-    }
     else if (picked == updateAct)     checkForUpdates(/*silent=*/false);
     else if (picked == aboutAct)      showAbout();
     else if (picked == quitAct)       close();
@@ -456,8 +461,10 @@ void ChatWindow::onChatHeaderClicked() {
     if (room.isEmpty()) return;
 
     if (room.startsWith("pm:") || room.startsWith("dm:")) {
-        // Найдём имя собеседника по контакту с совпадающим pm room_id
-        // и передадим в openPeerProfile (тот покажет PeerProfileDialog).
+        // Для ЛС берём pk и handle/server напрямую из ContactsStore —
+        // это даёт сразу полный профиль (имя + fingerprint + handle@server),
+        // не полагаясь на TOFU-таблицу, где имя могло отсутствовать или
+        // быть в другом регистре.
         for (const auto &c : ContactsStore::instance()->all()) {
             if (c.pk.isEmpty()) continue;
             uint8_t their_pk[IDENTITY_PK_BYTES];
@@ -476,10 +483,34 @@ void ChatWindow::onChatHeaderClicked() {
             char buf[IDENTITY_PM_ROOM_ID_LEN];
             if (identity_pm_room_id(my_pk, their_pk, buf) != 0) continue;
             if (QString::fromUtf8(buf) == room) {
-                openPeerProfile(c.name.isEmpty() ? c.handle : c.name);
+                /* Полный fingerprint = blake2b(pk, 32 байта)[0..32]
+                 * в формате xx:xx:... */
+                QString fingerprint;
+                {
+                    unsigned char hash[32];
+                    crypto_generichash(hash, sizeof(hash),
+                                       their_pk, IDENTITY_PK_BYTES,
+                                       nullptr, 0);
+                    QString fp;
+                    for (int i = 0; i < 32; ++i) {
+                        if (i > 0) fp += ':';
+                        fp += QString("%1").arg(hash[i], 2, 16, QChar('0'));
+                    }
+                    fingerprint = fp;
+                }
+                const QString display =
+                    c.name.isEmpty() ? (c.handle.isEmpty() ? room : c.handle)
+                                     : c.name;
+                PeerProfileDialog dlg(display, c.pk, fingerprint,
+                                      c.handle, c.server, c.verified, this);
+                connect(&dlg, &PeerProfileDialog::openChatRequested, this,
+                        &ChatWindow::switchToDmRoom);
+                dlg.exec();
                 return;
             }
         }
+        QMessageBox::information(this, tr("Profile"),
+            tr("Не нашли контакт для этой ЛС-комнаты."));
         return;
     }
 
