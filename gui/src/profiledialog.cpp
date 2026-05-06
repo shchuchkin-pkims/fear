@@ -1,11 +1,13 @@
 #include "profiledialog.h"
 #include "profilesettings.h"
+#include "registerhandledialog.h"
 
 #include <QApplication>
 #include <QClipboard>
 #include <QFile>
 #include <QFontDatabase>
 #include <QHBoxLayout>
+#include <QInputDialog>
 #include <QLabel>
 #include <QLineEdit>
 #include <QListWidget>
@@ -24,12 +26,16 @@ ProfileDialog::ProfileDialog(ProfileSettings *settings,
                              const QString &identityPath,
                              std::function<void()> onExport,
                              std::function<void()> onShowQr,
+                             const QString &defaultHost,
+                             uint16_t defaultPort,
                              QWidget *parent)
     : QDialog(parent),
       m_settings(settings),
       m_identityPath(identityPath),
       m_onExport(std::move(onExport)),
-      m_onShowQr(std::move(onShowQr)) {
+      m_onShowQr(std::move(onShowQr)),
+      m_defaultHost(defaultHost),
+      m_defaultPort(defaultPort) {
 
     setWindowTitle(tr("My Profile"));
     setModal(true);
@@ -74,10 +80,17 @@ ProfileDialog::ProfileDialog(ProfileSettings *settings,
 
     m_handlesList = new QListWidget(this);
     m_handlesList->setMaximumHeight(120);
-    m_handlesList->setToolTip(
-        tr("Click a handle to copy. Phase B-2 will add 'Hold @name on this "
-           "server' so handles get reserved server-side."));
+    m_handlesList->setToolTip(tr("Click a handle to copy."));
     layout->addWidget(m_handlesList);
+
+    auto *handleBtnRow = new QHBoxLayout();
+    m_removeHandleBtn = new QPushButton(tr("Удалить выбранный"), this);
+    m_removeHandleBtn->setEnabled(false);
+    m_registerHandleBtn = new QPushButton(tr("Зарегистрировать новый…"), this);
+    handleBtnRow->addWidget(m_removeHandleBtn);
+    handleBtnRow->addStretch(1);
+    handleBtnRow->addWidget(m_registerHandleBtn);
+    layout->addLayout(handleBtnRow);
 
     // ── Fingerprint ──────────────────────────────────────────
     auto *fpHeader = new QLabel(tr("Cryptographic identity"), this);
@@ -120,6 +133,60 @@ ProfileDialog::ProfileDialog(ProfileSettings *settings,
     });
     connect(m_handlesList, &QListWidget::itemClicked, this,
             [this](QListWidgetItem *it) { copyToClipboard(it->text()); });
+    connect(m_handlesList, &QListWidget::itemSelectionChanged, this, [this]() {
+        auto *it = m_handlesList->currentItem();
+        m_removeHandleBtn->setEnabled(it && (it->flags() & Qt::ItemIsEnabled));
+    });
+    connect(m_removeHandleBtn,   &QPushButton::clicked, this, &ProfileDialog::onRemoveHandle);
+    connect(m_registerHandleBtn, &QPushButton::clicked, this, &ProfileDialog::onRegisterHandle);
+}
+
+void ProfileDialog::onRemoveHandle() {
+    auto *it = m_handlesList->currentItem();
+    if (!it) return;
+    /* Каждый item хранит host в Qt::UserRole. */
+    const QString host = it->data(Qt::UserRole).toString();
+    if (host.isEmpty()) return;
+    auto answer = QMessageBox::question(this, tr("Забыть handle"),
+        tr("Удалить локальную запись о регистрации @%1@%2?\n\n"
+           "На сервере handle останется зарезервированным за вашим ключом.\n"
+           "При следующей регистрации того же ключа старый handle будет\n"
+           "автоматически освобождён сервером.")
+            .arg(m_settings->handleFor(host), host));
+    if (answer != QMessageBox::Yes) return;
+    m_settings->forgetRegistration(host);
+    rebuildIdentityLabels();
+}
+
+void ProfileDialog::onRegisterHandle() {
+    QString host = m_defaultHost;
+    if (host.isEmpty()) {
+        bool ok = false;
+        host = QInputDialog::getText(this, tr("Сервер"),
+            tr("Адрес сервера (host[:port]):"),
+            QLineEdit::Normal, QStringLiteral("fear-project.ru"), &ok);
+        if (!ok) return;
+        host = host.trimmed();
+        if (host.isEmpty()) return;
+    }
+    /* Допускаем формат host:port в строке. */
+    uint16_t port = m_defaultPort > 0 ? m_defaultPort : 8888;
+    int colon = host.lastIndexOf(':');
+    if (colon > 0) {
+        bool okp = false;
+        const int parsed = host.mid(colon + 1).toInt(&okp);
+        if (okp && parsed > 0 && parsed < 65536) {
+            port = static_cast<uint16_t>(parsed);
+            host = host.left(colon);
+        }
+    }
+    const QString suggest = m_settings->displayName().toLower();
+    RegisterHandleDialog dlg(host, port, m_identityPath, suggest, this);
+    if (dlg.exec() != QDialog::Accepted) return;
+    const QString chosen = dlg.chosenHandle();
+    if (chosen.isEmpty()) return;
+    m_settings->markRegisteredAs(host, chosen);
+    rebuildIdentityLabels();
 }
 
 void ProfileDialog::saveDisplayName() {
@@ -163,21 +230,27 @@ void ProfileDialog::rebuildIdentityLabels() {
         ? tr("Connect to a room first to generate your identity.")
         : fpFull);
 
-    // Refresh handles list
+    // Refresh handles list — берём актуальный handle из ProfileSettings
+    // для каждого host. Каждому item-у привязываем host через UserRole,
+    // чтобы кнопка «Удалить» знала, какую запись чистить.
     m_handlesList->clear();
     const auto servers = m_settings->registeredServers();
     if (servers.isEmpty()) {
         auto *placeholder = new QListWidgetItem(
-            tr("No server handles registered yet. They'll appear here as you "
-               "connect to new servers."));
+            tr("Пока нет зарегистрированных handle. Нажмите «Зарегистрировать новый…»."));
         placeholder->setFlags(Qt::NoItemFlags);
         placeholder->setForeground(Qt::gray);
         m_handlesList->addItem(placeholder);
     } else {
         for (const QString &h : servers) {
-            m_handlesList->addItem(QString("@%1@%2").arg(name, h));
+            const QString full = m_settings->handleAtServer(h);
+            auto *item = new QListWidgetItem(full.isEmpty()
+                ? QStringLiteral("@?@%1").arg(h) : full);
+            item->setData(Qt::UserRole, h);
+            m_handlesList->addItem(item);
         }
     }
+    if (m_removeHandleBtn) m_removeHandleBtn->setEnabled(false);
 }
 
 }  // namespace fear

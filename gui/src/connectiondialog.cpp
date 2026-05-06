@@ -128,8 +128,8 @@ ConnectionDialog::ConnectionDialog(ProfileSettings *profile,
     m_host = new QComboBox(this);
     m_host->setEditable(true);
     m_host->setInsertPolicy(QComboBox::NoInsert);
-    m_host->addItem(tr("fear-project.ru — основной сервер"),       QStringLiteral("fear-project.ru"));
-    m_host->addItem(tr("77.221.145.132 — Netherlands (Meppel)"),   QStringLiteral("77.221.145.132"));
+    m_host->addItem(tr("fear-project.ru — Russia (Moscow)"),     QStringLiteral("fear-project.ru"));
+    m_host->addItem(tr("77.221.145.132 — Netherlands (Meppel)"), QStringLiteral("77.221.145.132"));
     m_host->insertSeparator(m_host->count());
     m_host->addItem(tr("Custom server… (type below)"),            QStringLiteral(""));
     m_host->lineEdit()->setPlaceholderText(tr("e.g. fear-project.ru or 192.168.1.1"));
@@ -385,6 +385,8 @@ void ConnectionDialog::onIdentityCardClicked() {
     ProfileDialog dlg(m_profile, m_identityPath,
                       /*onExport=*/ [](){},
                       /*onShowQr=*/ [](){},
+                      /*defaultHost=*/ host(),
+                      /*defaultPort=*/ static_cast<uint16_t>(qMax(1, port())),
                       this);
     dlg.exec();
     refreshIdentityCard();

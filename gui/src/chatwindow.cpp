@@ -796,6 +796,9 @@ void ChatWindow::openProfile() {
             // checkbox prefilled.
             openIdentityBackup(/*export=*/true);
         },
+        /*defaultHost=*/ m_backend->serverHost,
+        /*defaultPort=*/ m_backend->serverPort > 0
+                            ? static_cast<uint16_t>(m_backend->serverPort) : 8888,
         this);
     dlg.exec();
 }
