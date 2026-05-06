@@ -328,6 +328,27 @@ ChatArea::ChatArea(QWidget *parent) : QWidget(parent) {
 
     m_scroll->setWidget(m_messagesContainer);
 
+    // Авто-прокрутка к нижнему краю при добавлении сообщения. После
+    // вставки нового bubble layout пересчитает range scrollbar-а и
+    // сигнал rangeChanged даст нам гарантированный момент, когда
+    // maximum уже актуален. До этого мы прокручиваем «оптимистично»
+    // в appendMessage(), но maximum часто ещё старый. Подписка
+    // решает оба случая.
+    connect(m_scroll->verticalScrollBar(), &QScrollBar::rangeChanged,
+            this, [this](int /*min*/, int max) {
+        // Прокручиваем только когда юзер уже у нижнего края — иначе
+        // он не сможет читать историю выше: каждое новое сообщение
+        // выбрасывало бы его обратно в самый низ.
+        auto *bar = m_scroll->verticalScrollBar();
+        if (m_stickToBottom) bar->setValue(max);
+    });
+    connect(m_scroll->verticalScrollBar(), &QScrollBar::valueChanged,
+            this, [this](int v) {
+        auto *bar = m_scroll->verticalScrollBar();
+        // 4 пикселя — терпимая неточность для трекпада.
+        m_stickToBottom = (v >= bar->maximum() - 4);
+    });
+
     m_emptyHint = new QLabel(this);
     m_emptyHint->setObjectName("EmptyChatHint");
     m_emptyHint->setAlignment(Qt::AlignCenter);
