@@ -18,6 +18,7 @@
 #include "contactsdialog.h"
 #include "contactsstore.h"
 #include "peerprofiledialog.h"
+#include "groupparticipantsdialog.h"
 #include <QFile>
 #include <QDir>
 #include <QSet>
@@ -114,6 +115,7 @@ ChatWindow::ChatWindow(QWidget *parent) : QMainWindow(parent) {
     connect(m_chatArea, &ChatArea::videoCallRequested,  this, &ChatWindow::onVideoCallRequested);
     connect(m_chatArea, &ChatArea::attachRequested,     this, &ChatWindow::onAttachRequested);
     connect(m_chatArea, &ChatArea::senderClicked,       this, &ChatWindow::openPeerProfile);
+    connect(m_chatArea, &ChatArea::headerClicked,       this, &ChatWindow::onChatHeaderClicked);
     // Phase B-5: unified chat list — sidebar selection routes to DM open
     // or current-room reuse, "+" opens the contacts dialog.
     connect(m_sidebar, &Sidebar::chatSelected,
@@ -215,7 +217,8 @@ void ChatWindow::updateOnlineStatus() {
     const int total     = qMax(m_reportedCount, fromPeers);
     QString status = (total <= 1) ? tr("just you online")
                                   : tr("%1 online").arg(total);
-    m_chatArea->setChat(m_backend->currentRoom, m_backend->currentRoom, status);
+    m_chatArea->setChat(m_backend->currentRoom,
+                        prettyRoomTitle(m_backend->currentRoom), status);
 }
 
 void ChatWindow::handleDisconnected() {
@@ -241,7 +244,9 @@ void ChatWindow::handleDisconnected() {
     m_chatArea->appendMessage(m);
 
     if (!m_backend->currentRoom.isEmpty()) {
-        m_chatArea->setChat(m_backend->currentRoom, m_backend->currentRoom, tr("disconnected"));
+        m_chatArea->setChat(m_backend->currentRoom,
+                            prettyRoomTitle(m_backend->currentRoom),
+                            tr("disconnected"));
     }
 }
 
@@ -413,6 +418,87 @@ void ChatWindow::openContacts() {
 // about that name in the local TOFU known_keys file and show a profile
 // dialog. Offers an "Open chat" action that derives the deterministic DM
 // room id from the peer's pk and switches rooms.
+QString ChatWindow::prettyRoomTitle(const QString &roomId) const {
+    // Для ЛС-комнаты ищем контакт, чьё pmRoomId совпадает с roomId, и
+    // возвращаем его displayName / handle. Иначе — id как есть.
+    if (!roomId.startsWith("pm:") && !roomId.startsWith("dm:")) return roomId;
+
+    uint8_t my_pk[IDENTITY_PK_BYTES];
+    if (identity_load_pk(m_backend->identityFilePath.toUtf8().constData(),
+                         my_pk) != 0) {
+        return roomId;
+    }
+    for (const auto &c : ContactsStore::instance()->all()) {
+        if (c.pk.isEmpty()) continue;
+        uint8_t their_pk[IDENTITY_PK_BYTES];
+        size_t pkLen = 0;
+        QByteArray pkUtf8 = c.pk.toUtf8();
+        if (sodium_base642bin(their_pk, IDENTITY_PK_BYTES,
+                              pkUtf8.constData(), pkUtf8.size(),
+                              nullptr, &pkLen, nullptr,
+                              sodium_base64_VARIANT_URLSAFE_NO_PADDING) != 0
+            || pkLen != IDENTITY_PK_BYTES) {
+            continue;
+        }
+        char buf[IDENTITY_PM_ROOM_ID_LEN];
+        if (identity_pm_room_id(my_pk, their_pk, buf) != 0) continue;
+        if (QString::fromUtf8(buf) == roomId) {
+            if (!c.name.isEmpty())   return c.name;
+            if (!c.handle.isEmpty()) return c.handle;
+            return roomId;
+        }
+    }
+    return roomId;
+}
+
+void ChatWindow::onChatHeaderClicked() {
+    const QString &room = m_backend->currentRoom;
+    if (room.isEmpty()) return;
+
+    if (room.startsWith("pm:") || room.startsWith("dm:")) {
+        // Найдём имя собеседника по контакту с совпадающим pm room_id
+        // и передадим в openPeerProfile (тот покажет PeerProfileDialog).
+        for (const auto &c : ContactsStore::instance()->all()) {
+            if (c.pk.isEmpty()) continue;
+            uint8_t their_pk[IDENTITY_PK_BYTES];
+            size_t pkLen = 0;
+            QByteArray pkUtf8 = c.pk.toUtf8();
+            if (sodium_base642bin(their_pk, IDENTITY_PK_BYTES,
+                                  pkUtf8.constData(), pkUtf8.size(),
+                                  nullptr, &pkLen, nullptr,
+                                  sodium_base64_VARIANT_URLSAFE_NO_PADDING) != 0
+                || pkLen != IDENTITY_PK_BYTES) {
+                continue;
+            }
+            uint8_t my_pk[IDENTITY_PK_BYTES];
+            if (identity_load_pk(m_backend->identityFilePath.toUtf8().constData(),
+                                 my_pk) != 0) break;
+            char buf[IDENTITY_PM_ROOM_ID_LEN];
+            if (identity_pm_room_id(my_pk, their_pk, buf) != 0) continue;
+            if (QString::fromUtf8(buf) == room) {
+                openPeerProfile(c.name.isEmpty() ? c.handle : c.name);
+                return;
+            }
+        }
+        return;
+    }
+
+    // Group room — собираем известных участников и показываем диалог.
+    QStringList participants;
+    for (const QString &p : m_seenPeers) participants.append(p);
+    if (!m_backend->currentName.isEmpty())
+        participants.append(m_backend->currentName);
+    participants.removeDuplicates();
+    participants.sort(Qt::CaseInsensitive);
+
+    auto *dlg = new GroupParticipantsDialog(prettyRoomTitle(room),
+                                            participants, this);
+    connect(dlg, &GroupParticipantsDialog::peerSelected, this,
+            &ChatWindow::openPeerProfile);
+    dlg->setAttribute(Qt::WA_DeleteOnClose);
+    dlg->open();
+}
+
 void ChatWindow::openPeerProfile(const QString &senderName) {
     const QString sender = senderName.trimmed();
     if (sender.isEmpty() || sender == "system" || sender == "server") return;

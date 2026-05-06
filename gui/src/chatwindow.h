@@ -48,6 +48,13 @@ private:
     void openProfile();
     void openContacts();
     void openPeerProfile(const QString &senderName);
+    /** Тап по заголовку чата (аватар или название). DM → профиль
+     *  собеседника; групповая комната → диалог участников. */
+    void onChatHeaderClicked();
+    /** Возвращает понятное имя текущей комнаты для UI: для pm:..."
+     *  ищет имя контакта в ContactsStore, иначе возвращает room id
+     *  как есть. Используется для setChat() и headerClicked. */
+    QString prettyRoomTitle(const QString &roomId) const;
     void rebuildSidebarChats();
     void onSidebarChatSelected(const QString &id);
     void switchToDmRoom(const QString &peerPkB64);

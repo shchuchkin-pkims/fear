@@ -43,10 +43,16 @@ signals:
     /** Emitted when the user clicks a peer's avatar or name inside a
      *  message bubble — used to open the peer profile dialog. */
     void senderClicked(const QString &senderName);
+    /** Emitted when the user clicks the avatar or title in the chat
+     *  header. Host opens the peer profile (DM) or participants list
+     *  (group) accordingly. */
+    void headerClicked();
 
 public:
     /** Forward a click from a bubble's avatar/name area. Internal use. */
     void emitSenderClicked(const QString &senderName) { emit senderClicked(senderName); }
+    /** Forward a click from the header click area. Internal use. */
+    void emitHeaderClicked() { emit headerClicked(); }
 
 protected:
     bool eventFilter(QObject *obj, QEvent *event) override;

@@ -296,11 +296,20 @@ ChatArea::ChatArea(QWidget *parent) : QWidget(parent) {
     m_searchBtn    = makeIconButton(QString::fromUtf8("⌕"), tr("Search"),     m_header);
     m_menuBtn      = makeIconButton(QString::fromUtf8("⋮"), tr("More"),       m_header);
 
+    // Кликабельная зона: аватар + title — единый clickable контейнер.
+    // Тап → headerClicked(), хост открывает профиль собеседника
+    // (для ЛС) или диалог участников (для групповой комнаты).
+    auto *clickable = new ClickableBox(m_header, [this]() { emitHeaderClicked(); });
+    auto *clickableLay = new QHBoxLayout(clickable);
+    clickableLay->setContentsMargins(0, 0, 0, 0);
+    clickableLay->setSpacing(10);
+    clickableLay->addWidget(m_headerAvatar);
+    clickableLay->addLayout(titleCol, 1);
+
     auto *headerLay = new QHBoxLayout(m_header);
     headerLay->setContentsMargins(12, 8, 12, 8);
     headerLay->setSpacing(10);
-    headerLay->addWidget(m_headerAvatar);
-    headerLay->addLayout(titleCol, 1);
+    headerLay->addWidget(clickable, 1);
     headerLay->addWidget(m_audioCallBtn);
     headerLay->addWidget(m_videoCallBtn);
     headerLay->addWidget(m_searchBtn);
