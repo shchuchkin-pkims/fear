@@ -194,7 +194,7 @@ void ConnectionDialog::loadFromSettings() {
     s.beginGroup("connect");
     m_host->setCurrentText(s.value("host", "fear-project.ru").toString());
     m_port->setText(s.value("port", 8888).toString());
-    m_room->setText(s.value("room").toString());
+    m_room->setText(s.value("room", "general").toString());
     m_name->setText(s.value("name").toString());
     int storedMode = s.value("mode", int(Backend::CREATE_ROOM)).toInt();
     if (storedMode < 0 || storedMode > Backend::JOIN_ROOM) storedMode = Backend::CREATE_ROOM;
