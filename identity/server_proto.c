@@ -11,8 +11,8 @@
 #ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <sys/types.h>     /* ssize_t (MinGW) */
 typedef int sock_t;
-typedef int ssize_t;
 #define close_socket(s) closesocket(s)
 #else
 #include <netdb.h>
