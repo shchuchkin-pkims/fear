@@ -1,6 +1,11 @@
 #include "connectiondialog.h"
 #include "profilesettings.h"
+#include "profiledialog.h"
 #include "registerhandledialog.h"
+#include "widgets/avatar.h"
+
+#include <QEvent>
+#include <QMouseEvent>
 
 #include <QComboBox>
 #include <QFormLayout>
@@ -60,6 +65,44 @@ ConnectionDialog::ConnectionDialog(ProfileSettings *profile,
     subtitle->setObjectName("DialogSubtitle");
     subtitle->setWordWrap(true);
     root->addWidget(subtitle);
+
+    /* ── Identity-карточка ───────────────────────────────────────
+     * Показывает имя пользователя и подсказку «Click to edit profile».
+     * Тап открывает ProfileDialog для редактирования display name и
+     * управления зарегистрированными handle-ами. */
+    m_identityCard = new QWidget(this);
+    m_identityCard->setCursor(Qt::PointingHandCursor);
+    m_identityCard->setObjectName("IdentityCard");
+    m_identityCard->setStyleSheet(QStringLiteral(
+        "QWidget#IdentityCard { background: rgba(255,255,255,0.05);"
+        "                        border-radius: 8px; padding: 8px; }"
+        "QWidget#IdentityCard:hover { background: rgba(255,255,255,0.08); }"));
+    auto *cardLay = new QHBoxLayout(m_identityCard);
+    cardLay->setContentsMargins(10, 8, 10, 8);
+    cardLay->setSpacing(12);
+
+    m_identityAvatar = new Avatar(m_identityCard);
+    m_identityAvatar->setDiameter(40);
+    cardLay->addWidget(m_identityAvatar);
+
+    auto *idTextCol = new QVBoxLayout();
+    idTextCol->setContentsMargins(0, 0, 0, 0);
+    idTextCol->setSpacing(2);
+    m_identityNameLbl = new QLabel(m_identityCard);
+    QFont nf = m_identityNameLbl->font();
+    nf.setPixelSize(15);
+    nf.setWeight(QFont::DemiBold);
+    m_identityNameLbl->setFont(nf);
+    m_identityHintLbl = new QLabel(tr("Click to edit profile"), m_identityCard);
+    m_identityHintLbl->setStyleSheet(QStringLiteral("color: gray; font-size: 11px;"));
+    idTextCol->addWidget(m_identityNameLbl);
+    idTextCol->addWidget(m_identityHintLbl);
+    cardLay->addLayout(idTextCol, 1);
+
+    /* Делаем сам контейнер кликабельным через event-filter обёртку. */
+    m_identityCard->installEventFilter(this);
+    root->addWidget(m_identityCard);
+    refreshIdentityCard();
 
     /* Mode toggle row */
     auto *modeRow = new QHBoxLayout();
@@ -316,6 +359,38 @@ void ConnectionDialog::refreshButtons() {
     const bool canRegister = (m_regStatus == RegNo);
     m_connectBtn->setEnabled(canConnect);
     m_registerBtn->setEnabled(canRegister);
+}
+
+bool ConnectionDialog::eventFilter(QObject *obj, QEvent *ev) {
+    if (obj == m_identityCard && ev->type() == QEvent::MouseButtonRelease) {
+        onIdentityCardClicked();
+        return true;
+    }
+    return QDialog::eventFilter(obj, ev);
+}
+
+void ConnectionDialog::refreshIdentityCard() {
+    if (!m_identityCard) return;
+    const QString name = m_profile ? m_profile->displayName() : QString();
+    const QString shown = name.isEmpty() ? tr("Set your name") : name;
+    m_identityAvatar->setSeed(shown);
+    m_identityNameLbl->setText(shown);
+}
+
+void ConnectionDialog::onIdentityCardClicked() {
+    if (!m_profile) return;
+    /* Backup-flow доступен из главного меню чата; здесь оставляем
+     * пустые callback-и — пользователь редактирует только имя и
+     * управляет списком зарегистрированных handle-ов. */
+    ProfileDialog dlg(m_profile, m_identityPath,
+                      /*onExport=*/ [](){},
+                      /*onShowQr=*/ [](){},
+                      this);
+    dlg.exec();
+    refreshIdentityCard();
+    /* Если пользователь сменил handle (зарегистрировал новый из
+     * ProfileDialog), статус-строка должна это сразу подхватить. */
+    onHostChanged();
 }
 
 void ConnectionDialog::onRegisterClicked() {

@@ -37,9 +37,13 @@ public:
     void loadFromSettings();
     void saveToSettings() const;
 
+protected:
+    bool eventFilter(QObject *obj, QEvent *ev) override;
+
 private slots:
     void onRegisterClicked();
     void onHostChanged();
+    void onIdentityCardClicked();
 
 private:
     enum RegStatus { RegUnknown, RegYes, RegNo, RegProbing, RegError };
@@ -72,6 +76,15 @@ private:
     QLineEdit *m_name;
     QPlainTextEdit *m_key;
     QLabel    *m_keyLabel;
+
+    /* Identity-карточка сверху диалога — аватар + display name. Кликается
+     * для открытия ProfileDialog. Аналог identity-карточки на Android
+     * ConnectScreen. */
+    QWidget     *m_identityCard;
+    class Avatar *m_identityAvatar;
+    QLabel      *m_identityNameLbl;
+    QLabel      *m_identityHintLbl;
+    void refreshIdentityCard();
 
     QLabel      *m_statusLabel;
     QPushButton *m_connectBtn;
