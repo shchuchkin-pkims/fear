@@ -1,0 +1,108 @@
+name: Build Linux release
+
+# Linux x86_64 build of the desktop client (fear_gui + console fear). The
+# resulting tarball/zip is portable in the same sense as the Windows one:
+# bin/ + libs in the same directory, run ./fear_gui to start. Triggers
+# match the Windows workflow.
+#
+# Triggers:
+#   - push to main or dev — builds and uploads the zip as a build artifact
+#     (kept for 90 days, link in the run page);
+#   - tag v* — additionally attaches the zip to the matching GitHub Release;
+#   - workflow_dispatch — "Run workflow" button in Actions.
+
+on:
+  push:
+    branches: [main, dev]
+    tags: ['v*']
+    paths:
+      - 'CMakeLists.txt'
+      - 'client-console/**'
+      - 'gui/**'
+      - 'identity/**'
+      - '.github/workflows/linux.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    name: Linux x86_64 (Qt6 / GCC)
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build pkg-config \
+            libsodium-dev libsqlite3-dev libqrencode-dev libzbar-dev \
+            qt6-base-dev qt6-base-dev-tools \
+            libgl1-mesa-dev libxkbcommon-dev
+
+      - name: Configure root project (console client + server)
+        run: |
+          cmake -S . -B build \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DFEAR_GUI_ONLY=ON
+
+      - name: Build console client (fear)
+        run: cmake --build build --target fear -j
+
+      - name: Configure GUI project
+        run: |
+          cmake -S gui/src -B build/gui \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLIBSODIUM_PATH=/nonexistent
+
+      - name: Build GUI client (fear_gui)
+        run: cmake --build build/gui --target fear_gui -j
+
+      - name: Stage release directory
+        run: |
+          set -e
+          mkdir -p release/fear
+          cp build/bin/fear        release/fear/fear
+          cp build/fear_gui        release/fear/fear_gui
+          chmod +x release/fear/fear release/fear/fear_gui
+
+          cat > release/fear/README.txt <<'EOF'
+          F.E.A.R. Messenger — Linux portable build
+          ==========================================
+          Run ./fear_gui to start the graphical client.
+          The console client (./fear) is included for advanced use.
+
+          Requires Qt 6, libsodium, libsqlite3, libqrencode, libzbar at runtime
+          (any recent glibc-based distribution: Ubuntu 22.04+, Fedora 38+, etc.).
+
+          See https://fear-project.ru and the project Wiki for documentation.
+          EOF
+          ls -la release/fear/
+
+      - name: Make zip
+        run: |
+          tag="${{ github.ref_name }}"
+          sha=$(echo "${{ github.sha }}" | cut -c1-7)
+          name="fear-linux-x86_64-${tag//\//_}-${sha}.zip"
+          (cd release && zip -r "${name}" fear)
+          echo "ZIP_NAME=${name}" >> "$GITHUB_ENV"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ZIP_NAME }}
+          path: release/${{ env.ZIP_NAME }}
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Attach to GitHub Release (only on tag push)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/${{ env.ZIP_NAME }}
