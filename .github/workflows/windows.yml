@@ -66,7 +66,7 @@ jobs:
           pkg-config --modversion libsodium libqrencode zbar sqlite3 || true
           ls -1 /mingw64/bin/windeployqt*.exe 2>/dev/null || echo "windeployqt not found in /mingw64/bin"
 
-      - name: Configure (FEAR_GUI_ONLY=ON, Release, Ninja)
+      - name: Configure root project (console client + server)
         run: |
           cmake -S . -B build \
             -G Ninja \
@@ -76,8 +76,18 @@ jobs:
       - name: Build console client (fear.exe)
         run: cmake --build build --target fear -j
 
+      # gui/src/ — отдельный CMake-проект (не add_subdirectory из корневого).
+      # Конфигурируем его второй раз. LIBSODIUM_PATH не указывает на
+      # реальный prebuilt → CMakeLists возьмёт libsodium через pkg-config.
+      - name: Configure GUI project
+        run: |
+          cmake -S gui/src -B build/gui \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLIBSODIUM_PATH=/nonexistent
+
       - name: Build GUI client (fear_gui.exe)
-        run: cmake --build build --target fear_gui -j
+        run: cmake --build build/gui --target fear_gui -j
 
       - name: Stage release directory
         run: |
