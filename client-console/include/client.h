@@ -34,4 +34,14 @@ void run_client(const char *host, uint16_t port, const char *room, const char *n
                 int join_mode);
 void print_local_message(const char *name, const char *msg);
 
+/**
+ * AUTO probe: open a short-lived TCP connection to host:port, send a
+ * MSG_TYPE_ROOM_INFO_REQUEST for `room`, read the ROOM_INFO_RESULT, and
+ * close. Returns the room's non-media member count, or -1 on any error
+ * (caller should treat -1 as "assume empty → CREATE" so a flaky network
+ * never blocks AUTO).
+ */
+int probe_room_info(const char *host, uint16_t port, const char *room,
+                    int timeout_ms);
+
 #endif

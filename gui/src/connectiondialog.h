@@ -66,6 +66,7 @@ private:
      *  user has typed further into the host field. */
     quint64          m_probeSeq = 0;
 
+    QPushButton *m_autoBtn;
     QPushButton *m_createBtn;
     QPushButton *m_joinBtn;
     QPushButton *m_manualBtn;

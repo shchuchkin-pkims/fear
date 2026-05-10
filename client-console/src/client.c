@@ -1411,6 +1411,82 @@ DWORD WINAPI input_thread(LPVOID param) {
 }
 #endif
 
+/**
+ * AUTO probe: open a short-lived TCP connection and ask the server how many
+ * non-media members are in `room`. See client.h for caller contract.
+ *
+ * The probe runs against a freshly-opened socket because we want to know
+ * the room state *before* dial_tcp() inside run_client() commits us to a
+ * specific JOIN/CREATE flow.
+ */
+int probe_room_info(const char *host, uint16_t port, const char *room,
+                    int timeout_ms) {
+    sock_t s = dial_tcp(host, port);
+    if (s < 0) return -1;
+
+#ifdef _WIN32
+    DWORD tv = (DWORD)timeout_ms;
+#else
+    struct timeval tv;
+    tv.tv_sec = timeout_ms / 1000;
+    tv.tv_usec = (timeout_ms % 1000) * 1000;
+#endif
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tv, sizeof tv);
+
+    if (send_service_frame(s, room, "probe",
+                           MSG_TYPE_ROOM_INFO_REQUEST, NULL, 0) < 0) {
+        close_socket(s);
+        return -1;
+    }
+
+    int result = -1;
+    /* Read up to 8 frames; skip anything that isn't ROOM_INFO_RESULT. */
+    for (int i = 0; i < 8; i++) {
+        uint8_t hdr[2];
+        if (recv_all(s, hdr, 2) < 0) break;
+        uint16_t room_len = rd_u16(hdr);
+        if (room_len > MAX_ROOM) break;
+        char rbuf[MAX_ROOM];
+        if (recv_all(s, rbuf, room_len) < 0) break;
+
+        uint8_t nlb[2];
+        if (recv_all(s, nlb, 2) < 0) break;
+        uint16_t name_len = rd_u16(nlb);
+        if (name_len > MAX_NAME) break;
+        char nbuf[MAX_NAME];
+        if (recv_all(s, nbuf, name_len) < 0) break;
+
+        uint8_t nplb[2];
+        if (recv_all(s, nplb, 2) < 0) break;
+        uint16_t nonce_len = rd_u16(nplb);
+        if (nonce_len != CRYPTO_NPUBBYTES) break;
+        uint8_t nonce[CRYPTO_NPUBBYTES];
+        if (recv_all(s, nonce, nonce_len) < 0) break;
+
+        uint8_t tb;
+        if (recv_all(s, &tb, 1) < 0) break;
+        uint8_t clenbuf[4];
+        if (recv_all(s, clenbuf, 4) < 0) break;
+        uint32_t clen = rd_u32(clenbuf);
+        if (clen > MAX_FRAME) break;
+
+        uint8_t *payload = (uint8_t *)malloc(clen ? clen : 1);
+        if (!payload) break;
+        if (clen > 0 && recv_all(s, payload, clen) < 0) {
+            free(payload); break;
+        }
+        if (tb == MSG_TYPE_ROOM_INFO_RESULT && clen >= 5) {
+            result = (int)rd_u32(payload + 1);
+            free(payload);
+            break;
+        }
+        free(payload);
+    }
+
+    close_socket(s);
+    return result;
+}
+
 /* Background heartbeat: send MSG_TYPE_PING every PING_INTERVAL_SEC while
  * g_sock matches the socket the thread was started with. Exits as soon as
  * the socket is replaced (reconnect) or closed. */

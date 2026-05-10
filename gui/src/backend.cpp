@@ -107,6 +107,8 @@ bool Backend::connectToServer(const QString &host, int port, const QString &room
         args << "--create";
     } else if (mode == JOIN_ROOM) {
         args << "--join";
+    } else if (mode == AUTO) {
+        args << "--auto";
     }
     // NOTE: NO --key argument here for security (MANUAL_KEY passes key via stdin)
 

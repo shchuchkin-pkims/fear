@@ -107,10 +107,14 @@ ConnectionDialog::ConnectionDialog(ProfileSettings *profile,
     /* Mode toggle row */
     auto *modeRow = new QHBoxLayout();
     modeRow->setSpacing(8);
+    m_autoBtn   = new QPushButton(tr("Auto"),   this);
     m_createBtn = new QPushButton(tr("Create"), this);
     m_joinBtn   = new QPushButton(tr("Join"),   this);
     m_manualBtn = new QPushButton(tr("Use key"), this);
-    for (QPushButton *b : {m_createBtn, m_joinBtn, m_manualBtn}) {
+    m_autoBtn->setToolTip(tr(
+        "Probe the server: empty room → Create, otherwise → Join. No more "
+        "5-second blind wait when starting a fresh chat."));
+    for (QPushButton *b : {m_autoBtn, m_createBtn, m_joinBtn, m_manualBtn}) {
         b->setObjectName("ModeButton");
         b->setCheckable(true);
         b->setCursor(Qt::PointingHandCursor);
@@ -182,6 +186,7 @@ ConnectionDialog::ConnectionDialog(ProfileSettings *profile,
     btnRow->addWidget(m_connectBtn);
     root->addLayout(btnRow);
 
+    connect(m_autoBtn,   &QPushButton::clicked, this, [this]{ setMode(Backend::AUTO);        });
     connect(m_createBtn, &QPushButton::clicked, this, [this]{ setMode(Backend::CREATE_ROOM); });
     connect(m_joinBtn,   &QPushButton::clicked, this, [this]{ setMode(Backend::JOIN_ROOM);   });
     connect(m_manualBtn, &QPushButton::clicked, this, [this]{ setMode(Backend::MANUAL_KEY);  });
@@ -222,6 +227,7 @@ void ConnectionDialog::setMode(Backend::ConnectMode m) {
 }
 
 void ConnectionDialog::updateModeUi() {
+    m_autoBtn->setChecked  (m_mode == Backend::AUTO);
     m_createBtn->setChecked(m_mode == Backend::CREATE_ROOM);
     m_joinBtn->setChecked  (m_mode == Backend::JOIN_ROOM);
     m_manualBtn->setChecked(m_mode == Backend::MANUAL_KEY);
@@ -239,8 +245,8 @@ void ConnectionDialog::loadFromSettings() {
     m_port->setText(s.value("port", 8888).toString());
     m_room->setText(s.value("room", "general").toString());
     m_name->setText(s.value("name").toString());
-    int storedMode = s.value("mode", int(Backend::CREATE_ROOM)).toInt();
-    if (storedMode < 0 || storedMode > Backend::JOIN_ROOM) storedMode = Backend::CREATE_ROOM;
+    int storedMode = s.value("mode", int(Backend::AUTO)).toInt();
+    if (storedMode < 0 || storedMode > Backend::AUTO) storedMode = Backend::AUTO;
     m_mode = Backend::ConnectMode(storedMode);
     s.endGroup();
 }

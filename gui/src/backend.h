@@ -37,8 +37,10 @@ class Backend : public QObject {
     Q_OBJECT
 
 public:
-    /** Connection mode for key exchange. */
-    enum ConnectMode { MANUAL_KEY, CREATE_ROOM, JOIN_ROOM };
+    /** Connection mode for key exchange. AUTO probes the server first
+     *  (MSG_TYPE_ROOM_INFO_REQUEST) and resolves to CREATE_ROOM for an
+     *  empty room or JOIN_ROOM for a populated one — no blind 5s wait. */
+    enum ConnectMode { MANUAL_KEY, CREATE_ROOM, JOIN_ROOM, AUTO };
 
     /**
      * @brief Constructs a new backend

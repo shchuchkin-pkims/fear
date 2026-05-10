@@ -50,11 +50,12 @@ static void print_usage(const char *prog) {
         "  %s gen-identity\n"
         "  %s server [--port N]\n"
         "  %s client --host HOST --port N --room ROOM [--key-file FILE] [--name NAME]\n"
-        "           [--identity-file FILE] [--no-sign] [--create] [--join]\n"
+        "           [--identity-file FILE] [--no-sign] [--create] [--join] [--auto]\n"
 
         "\nKey input methods (in order of priority):\n"
         "  1. --create           Auto-generate room key (first person in room)\n"
         "  2. --join             Request room key via ECDH exchange (join existing room)\n"
+        "  3. --auto             Probe the server: empty room → CREATE, otherwise → JOIN\n"
         "  3. --key-file FILE    Read key from file (recommended for scripts)\n"
         "  4. stdin              Read key from standard input (interactive or piped)\n"
         "  5. --key BASE64       Direct key argument (DEPRECATED - insecure, visible in process list)\n"
@@ -219,6 +220,7 @@ int main(int argc, char **argv) {
         int no_sign = 0;
         int create_mode = 0;
         int join_mode = 0;
+        int auto_mode = 0;
         uint16_t port = 0;
         int using_deprecated_key_arg = 0;
 
@@ -237,12 +239,30 @@ int main(int argc, char **argv) {
             else if (strcmp(argv[i], "--no-sign") == 0) no_sign = 1;
             else if (strcmp(argv[i], "--create") == 0) create_mode = 1;
             else if (strcmp(argv[i], "--join") == 0) join_mode = 1;
+            else if (strcmp(argv[i], "--auto") == 0) auto_mode = 1;
         }
 
         if (!host || !port || !room) { print_usage(argv[0]); return 1; }
         if (!name) name = "anon";
         if (strlen(room) > MAX_ROOM - 1) { fprintf(stderr, "room too long (max %d)\n", MAX_ROOM - 1); return 1; }
         if (strlen(name) > MAX_NAME - 1) { fprintf(stderr, "name too long (max %d)\n", MAX_NAME - 1); return 1; }
+
+        /* AUTO: ask the server up front whether the room already has members.
+         * Empty → CREATE (fresh key); populated → JOIN (ECDH for the existing
+         * key). One short-lived TCP probe (~30-100 ms) instead of the old
+         * blind 5s JOIN→timeout→CREATE fallback. */
+        if (auto_mode) {
+            int members = probe_room_info(host, port, room, /*timeout_ms=*/3000);
+            if (members > 0) {
+                fprintf(stderr, "[auto] room '%s' has %d member(s) → JOIN\n",
+                        room, members);
+                join_mode = 1;
+            } else {
+                fprintf(stderr, "[auto] room '%s' empty (probe=%d) → CREATE\n",
+                        room, members);
+                create_mode = 1;
+            }
+        }
 
         uint8_t key[CRYPTO_KEYBYTES];
         memset(key, 0, sizeof(key));
