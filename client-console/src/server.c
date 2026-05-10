@@ -741,6 +741,11 @@ void run_server(uint16_t port) {
     // Set locale to UTF-8 for Linux/Android
     setlocale(LC_ALL, "");
 #endif
+    /* When stdout is redirected to a file or systemd journal it switches to
+     * block buffering by default — operational logs ([server] new connection,
+     * [server] idle kick, etc.) then sit in a 4KB buffer for hours. Force
+     * line buffering so each printf shows up immediately. */
+    setvbuf(stdout, NULL, _IOLBF, 0);
     sock_t listener = server_listen(port);
     printf("[server] listening on 0.0.0.0:%u (TCP)\n", port);
 
