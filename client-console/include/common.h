@@ -107,6 +107,23 @@ typedef enum {
                                           Used by clients to detect a pre-existing registration after
                                           identity import (.fbk / QR) without forcing the user to guess
                                           their handle. */
+    /* ===== Phase B-8: room probe + heartbeat ===== */
+    MSG_TYPE_ROOM_INFO_REQUEST = 27, /**< Client → Server: how many members are in this room?
+                                          Zero-nonce service msg. Room name is taken from the
+                                          frame header (room_len/room fields). Payload empty.
+                                          Server replies with ROOM_INFO_RESULT.
+                                          Used by AUTO connect to skip the JOIN→timeout→CREATE
+                                          dance when the room is empty. */
+    MSG_TYPE_ROOM_INFO_RESULT  = 28, /**< Server → Client.
+                                          Payload: [exists(1)][member_count(4 LE)].
+                                          exists=1 if at least one non-media client is in the
+                                          room; member_count is the same number (kept for future
+                                          UI use). */
+    MSG_TYPE_PING              = 29, /**< Client → Server: I'm alive.
+                                          Zero-nonce service msg, empty payload. Server bumps
+                                          last_seen and does not reply. Sent ~every 60s when
+                                          the client is otherwise silent so the server's idle
+                                          scan doesn't kick the connection. */
 } message_type_t;
 
 /* ===== Cryptographic Constants ===== */

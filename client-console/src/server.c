@@ -47,7 +47,19 @@ typedef struct {
     struct sockaddr_in udp_addr; /**< UDP address for relay */
     int udp_registered;     /**< Whether UDP relay address is set */
     int is_media_relay;     /**< Whether this is a media relay connection (allows duplicate name) */
+    time_t last_seen;       /**< Wall-clock time of the last frame received from this client.
+                                  Updated on accept and on every successful read_frame. The
+                                  idle scan in the main loop closes connections with
+                                  now - last_seen > IDLE_TIMEOUT_SEC. */
 } client_t;
+
+/**
+ * How long a client may be silent before the server kicks it.
+ * Clients send MSG_TYPE_PING at most every PING_INTERVAL_SEC (60s on both
+ * Android and CLI), so 240s = four missed pings comfortably covers a brief
+ * packet loss while still releasing the slot quickly after a real crash.
+ */
+#define IDLE_TIMEOUT_SEC 240
 
 /**
  * @brief Read a complete protocol frame from client socket
@@ -584,6 +596,81 @@ static int try_handle_command(sock_t fd, const uint8_t *frame, size_t flen) {
     return 0;  /* not a handle / blob command */
 }
 
+/**
+ * Server-side handler for room-scoped service commands that need access
+ * to the client roster: ROOM_INFO_REQUEST and PING. Kept separate from
+ * try_handle_command because that one only sees the single client's fd
+ * and has no way to count peers in the room.
+ *
+ * Returns 1 if the frame was handled (caller must skip broadcast/registration),
+ *         0 otherwise.
+ */
+static int try_room_command(sock_t fd,
+                            const uint8_t *frame, size_t flen,
+                            const client_t *clients, int nclients) {
+    if (flen < 2) return 0;
+    uint16_t room_len = rd_u16(frame);
+    if (flen < (size_t)2 + room_len + 2) return 0;
+    uint16_t name_len = rd_u16(frame + 2 + room_len);
+    size_t off = 2 + room_len + 2 + name_len;
+    if (flen < off + 2) return 0;
+    uint16_t nonce_len = rd_u16(frame + off);
+    off += 2 + nonce_len;
+    if (flen < off + 1 + 4) return 0;
+    uint8_t  type = frame[off];
+    /* clen unused but parsed for consistency with try_handle_command */
+    (void)rd_u32(frame + off + 1);
+    const char *room = (const char *)(frame + 2);
+
+    if (type == MSG_TYPE_PING) {
+        /* No reply needed — caller already bumped last_seen on read_frame. */
+        return 1;
+    }
+
+    if (type == MSG_TYPE_ROOM_INFO_REQUEST) {
+        /* Count non-media members already attached to the room. */
+        uint32_t count = 0;
+        for (int i = 0; i < nclients; i++) {
+            if (clients[i].is_media_relay) continue;
+            if (clients[i].room[0] == '\0') continue;
+            if (strncmp(clients[i].room, room, room_len) == 0
+                && clients[i].room[room_len] == '\0') {
+                count++;
+            }
+        }
+
+        /* Reply: zero-nonce service msg with payload [exists(1)][count(4 LE)]. */
+        static const char *kSrvName = "server";
+        uint16_t  srv_name_len = (uint16_t)strlen(kSrvName);
+        uint8_t   nonce[CRYPTO_NPUBBYTES];
+        memset(nonce, 0, sizeof(nonce));
+
+        uint8_t payload[1 + 4];
+        payload[0] = (count > 0) ? 1 : 0;
+        wr_u32(payload + 1, count);
+
+        size_t frame_len = 2 + room_len + 2 + srv_name_len + 2
+                         + CRYPTO_NPUBBYTES + 1 + 4 + sizeof(payload);
+        uint8_t *out = (uint8_t *)malloc(frame_len);
+        if (!out) return 1;
+        uint8_t *w = out;
+        wr_u16(w, room_len);                 w += 2;
+        memcpy(w, room, room_len);           w += room_len;
+        wr_u16(w, srv_name_len);             w += 2;
+        memcpy(w, kSrvName, srv_name_len);   w += srv_name_len;
+        wr_u16(w, CRYPTO_NPUBBYTES);         w += 2;
+        memcpy(w, nonce, CRYPTO_NPUBBYTES);  w += CRYPTO_NPUBBYTES;
+        *w++ = (uint8_t)MSG_TYPE_ROOM_INFO_RESULT;
+        wr_u32(w, (uint32_t)sizeof(payload)); w += 4;
+        memcpy(w, payload, sizeof(payload));
+        send_all(fd, out, frame_len);
+        free(out);
+        return 1;
+    }
+
+    return 0;
+}
+
 static void set_tcp_keepalive(sock_t fd) {
 #ifdef _WIN32
     DWORD yes = 1;
@@ -699,8 +786,42 @@ void run_server(uint16_t port) {
             FD_SET(clients[i].fd, &rfds);
             if (clients[i].fd > maxfd) maxfd = clients[i].fd;
         }
-        int r = select((int)(maxfd + 1), &rfds, NULL, NULL, NULL);
+        /* Wake up at least once per minute so the idle scan below runs even
+         * when nobody is sending traffic. */
+        struct timeval tv;
+        tv.tv_sec = 60;
+        tv.tv_usec = 0;
+        int r = select((int)(maxfd + 1), &rfds, NULL, NULL, &tv);
         if (r < 0) { perror("select"); break; }
+
+        /* Idle scan: kick anyone we haven't heard from in IDLE_TIMEOUT_SEC
+         * seconds. Application-level heartbeat via MSG_TYPE_PING (sent every
+         * 60s by clients) keeps an active connection alive; if a client
+         * crashes, gets killed, or its NAT silently drops the flow we
+         * release the slot here without waiting for TCP keepalive. */
+        time_t now = time(NULL);
+        for (int i = 0; i < nclients; i++) {
+            if (now - clients[i].last_seen <= IDLE_TIMEOUT_SEC) continue;
+            printf("[server] idle kick: %s@%s silent for %lds\n",
+                   clients[i].name[0] ? clients[i].name : "?",
+                   clients[i].room[0] ? clients[i].room : "?",
+                   (long)(now - clients[i].last_seen));
+            char dropped_room[MAX_ROOM];
+            if (clients[i].room[0] != '\0') {
+                strncpy(dropped_room, clients[i].room, MAX_ROOM - 1);
+                dropped_room[MAX_ROOM - 1] = '\0';
+            } else {
+                dropped_room[0] = '\0';
+            }
+            close_socket(clients[i].fd);
+            clients[i] = clients[nclients - 1];
+            nclients--;
+            i--;
+            if (dropped_room[0] != '\0') {
+                send_user_list(clients, nclients, dropped_room);
+            }
+        }
+        if (r == 0) continue;  /* select timeout, no fds ready */
 
         /* Handle UDP relay */
         if (FD_ISSET(udp_sock, &rfds)) {
@@ -802,6 +923,7 @@ void run_server(uint16_t port) {
                     clients[nclients].name[0] = '\0';
                     clients[nclients].udp_registered = 0;
                     clients[nclients].is_media_relay = 0;
+                    clients[nclients].last_seen = time(NULL);
                     nclients++;
                     printf("[server] new connection (%d total)\n", nclients);
                 } else {
@@ -837,10 +959,19 @@ void run_server(uint16_t port) {
 
                 continue;
             }
+            clients[i].last_seen = time(NULL);
+
             /* Phase B-2: handle-registry commands are out-of-band — they
              * don't belong to any chat room. Process and reply right away
              * without registering this client into a room or broadcasting. */
             if (try_handle_command(clients[i].fd, frame, flen)) {
+                free(frame);
+                continue;
+            }
+            /* Phase B-8: ROOM_INFO probe (AUTO connect) and PING (heartbeat)
+             * also bypass registration and broadcast. Must run AFTER
+             * last_seen update so the PING actually counts as activity. */
+            if (try_room_command(clients[i].fd, frame, flen, clients, nclients)) {
                 free(frame);
                 continue;
             }

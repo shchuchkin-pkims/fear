@@ -30,6 +30,7 @@
 #else
 #include <sys/select.h>
 #include <errno.h>
+#include <pthread.h>
 #endif
 
 #ifdef _WIN32
@@ -103,6 +104,13 @@ static const uint8_t *g_room_key = NULL;
 static sock_t g_sock = -1;
 static const char *g_room = NULL;
 static const char *g_name = NULL;
+
+/* Phase B-8: heartbeat. The CLI runs an extra thread that sends a
+ * MSG_TYPE_PING zero-nonce service frame every PING_INTERVAL_SEC. The
+ * server bumps last_seen on every recv and kicks anyone silent for
+ * IDLE_TIMEOUT_SEC (240s on the server), so 60s gives ~4 missed pings
+ * of slack before a real network problem turns into a kick. */
+#define PING_INTERVAL_SEC 60
 
 /**
  * @brief Send a zero-nonce service frame (unencrypted payload)
@@ -1403,6 +1411,31 @@ DWORD WINAPI input_thread(LPVOID param) {
 }
 #endif
 
+/* Background heartbeat: send MSG_TYPE_PING every PING_INTERVAL_SEC while
+ * g_sock matches the socket the thread was started with. Exits as soon as
+ * the socket is replaced (reconnect) or closed. */
+#ifdef _WIN32
+static DWORD WINAPI ping_thread_fn(LPVOID arg) {
+    sock_t my_sock = (sock_t)(intptr_t)arg;
+    while (g_sock == my_sock) {
+        Sleep(PING_INTERVAL_SEC * 1000);
+        if (g_sock != my_sock) break;
+        send_service_frame(my_sock, g_room, g_name, MSG_TYPE_PING, NULL, 0);
+    }
+    return 0;
+}
+#else
+static void *ping_thread_fn(void *arg) {
+    sock_t my_sock = (sock_t)(intptr_t)arg;
+    while (g_sock == my_sock) {
+        sleep(PING_INTERVAL_SEC);
+        if (g_sock != my_sock) break;
+        send_service_frame(my_sock, g_room, g_name, MSG_TYPE_PING, NULL, 0);
+    }
+    return NULL;
+}
+#endif
+
 void run_client(const char *host, uint16_t port, const char *room, const char *name,
                 const uint8_t key[32], const uint8_t *id_pk, const uint8_t *id_sk,
                 int join_mode) {
@@ -1463,6 +1496,23 @@ void run_client(const char *host, uint16_t port, const char *room, const char *n
     if (g_has_identity) {
         send_identity_announce(s, room, name, active_key, g_identity_sk, g_identity_pk);
     }
+
+    /* Phase B-8: start the heartbeat thread now that g_sock/g_room/g_name
+     * are set. The thread polls g_sock against its captured socket so it
+     * exits cleanly when run_client returns and the caller closes s. */
+#ifdef _WIN32
+    HANDLE hPing = CreateThread(NULL, 0, ping_thread_fn,
+                                (LPVOID)(intptr_t)s, 0, NULL);
+    if (!hPing) fprintf(stderr, "[client] warning: could not start heartbeat thread\n");
+#else
+    pthread_t ping_tid;
+    if (pthread_create(&ping_tid, NULL, ping_thread_fn,
+                       (void *)(intptr_t)s) != 0) {
+        fprintf(stderr, "[client] warning: could not start heartbeat thread\n");
+    } else {
+        pthread_detach(ping_tid);
+    }
+#endif
 
     printf("Commands: /sendfile <path>, /accept [save_path], /reject. Ctrl+C to exit.\n");
 
