@@ -270,7 +270,12 @@ void ChatWindow::handleNewMessages(const QStringList &lines) {
 
 void ChatWindow::handleContactsUpdated(const QStringList &users) {
     m_reportedCount = users.size();
-    // Also seed the peer set so it stays consistent if [USERS] arrived first.
+    // [USERS] is the server's authoritative live participant snapshot
+    // pushed every time someone joins or leaves. Replace the cached set
+    // wholesale instead of merging — otherwise a peer who left the room
+    // would stay in m_seenPeers forever and show up in the
+    // GroupParticipantsDialog as a phantom "online" user.
+    m_seenPeers.clear();
     for (const QString &u : users) {
         if (u != m_backend->currentName) m_seenPeers.insert(u);
     }
@@ -344,12 +349,11 @@ void ChatWindow::appendParsedLine(const QString &line) {
                           msg.fromSelf, /*isSystem=*/false);
     }
 
-    // Heard from a real peer — count them as online even if [USERS] never came.
-    if (!msg.fromSelf) {
-        const int before = m_seenPeers.size();
-        m_seenPeers.insert(msg.sender);
-        if (m_seenPeers.size() != before) updateOnlineStatus();
-    }
+    // Don't seed m_seenPeers from message senders any more — that turned
+    // it into "anyone who has ever spoken in this room", which leaks past
+    // peers into the GroupParticipantsDialog. The server's [USERS]
+    // broadcast (handleContactsUpdated) is now the single source of truth
+    // for who is currently in the room.
 }
 
 // ───────── Hamburger menu ─────────
