@@ -199,9 +199,37 @@ int server_db_lookup_handle_by_pk(const uint8_t pk[32],
     return out;
 }
 
+/* Storage quotas (roadmap section 7: 100 KB of blob per user).
+ * Ed25519 keypairs cost nothing to generate offline, so BLOB_PUT's signature
+ * proves ownership of a key but is not a scarcity barrier: without a quota
+ * anyone can mint unlimited identities and fill the server's disk. */
+#define BLOB_MAX_BYTES_PER_PK (100 * 1024)
+#define BLOB_MAX_TYPES_PER_PK 8
+
 int server_db_put_blob(const uint8_t pk[32], const char *blob_type,
                        const uint8_t *cipher, size_t cipher_len) {
     if (!g_db) return -1;
+    if (cipher_len > BLOB_MAX_BYTES_PER_PK) return -2;
+
+    /* Usage already stored for this identity, ignoring the row this call is
+     * about to replace (INSERT OR REPLACE overwrites the same pk+blob_type). */
+    sqlite3_stmt *cq = NULL;
+    sqlite3_int64 used = 0, ntypes = 0;
+    if (sqlite3_prepare_v2(g_db,
+            "SELECT COALESCE(SUM(LENGTH(ciphertext)),0), COUNT(*) "
+            "FROM user_blobs WHERE identity_pk = ? AND blob_type <> ?",
+            -1, &cq, NULL) == SQLITE_OK) {
+        sqlite3_bind_blob(cq, 1, pk, 32, SQLITE_STATIC);
+        sqlite3_bind_text(cq, 2, blob_type, -1, SQLITE_STATIC);
+        if (sqlite3_step(cq) == SQLITE_ROW) {
+            used   = sqlite3_column_int64(cq, 0);
+            ntypes = sqlite3_column_int64(cq, 1);
+        }
+    }
+    sqlite3_finalize(cq);
+    if (used + (sqlite3_int64)cipher_len > BLOB_MAX_BYTES_PER_PK) return -2;
+    if (ntypes >= BLOB_MAX_TYPES_PER_PK) return -2;
+
     sqlite3_stmt *q = NULL;
     int rc = sqlite3_prepare_v2(g_db,
         "INSERT OR REPLACE INTO user_blobs(identity_pk, blob_type, ciphertext, updated_at) "

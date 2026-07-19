@@ -79,7 +79,8 @@ int  server_db_lookup_handle_by_pk(const uint8_t pk[32],
 /**
  * Store / replace an encrypted blob for `pk` of kind `blob_type`.
  * Used for the contacts blob (Phase B-3) and any future per-user state.
- * @return 0 on success.
+ * @return 0 on success, -2 if the identity's storage quota is exceeded,
+ *         -1 on any other error.
  */
 int  server_db_put_blob(const uint8_t pk[32], const char *blob_type,
                         const uint8_t *cipher, size_t cipher_len);

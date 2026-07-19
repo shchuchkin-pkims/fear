@@ -47,7 +47,7 @@ const ALLOWED_ORIGINS = (process.env.FEAR_ALLOWED_ORIGINS || '')
 const MAX_WS_PAYLOAD  = 1 * 1024 * 1024;   /* bytes per browser->bridge message */
 const MAX_TCP_BUFFER  = 2 * 1024 * 1024;   /* pending unparsed upstream bytes    */
 const MAX_FRAME_CLEN  = 1 * 1024 * 1024;   /* ciphertext length inside one frame */
-const MAX_CONN_PER_IP = 8;
+const MAX_CONN_PER_IP = 16;   /* several users often share one NAT address */
 const TCP_CONNECT_MS  = 10000;
 
 /** Live WebSocket connections per client IP, for the per-IP cap. */

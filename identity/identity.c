@@ -18,6 +18,8 @@
 #else
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <fcntl.h>
+#include <unistd.h>
 #define mkdir_p(p) mkdir(p, 0700)
 #endif
 
@@ -101,17 +103,38 @@ int identity_generate(const char *path) {
         return -1;
     }
 
+#ifndef _WIN32
+    /* Create the file with 0600 from the outset. fopen(path, "w") would create
+     * it with 0666 & ~umask - typically 0644 - leaving the Ed25519 secret key
+     * world-readable during the window between creation and the chmod below. */
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0) {
+        sodium_memzero(sk, sizeof(sk));
+        sodium_memzero(sk_b64, sizeof(sk_b64));
+        return -1;
+    }
+    FILE *f = fdopen(fd, "w");
+    if (!f) {
+        close(fd);
+        sodium_memzero(sk, sizeof(sk));
+        sodium_memzero(sk_b64, sizeof(sk_b64));
+        return -1;
+    }
+#else
+    /* Windows: no POSIX modes here. DPAPI / ACLs are the proper fix (M2). */
     FILE *f = fopen(path, "w");
     if (!f) {
         sodium_memzero(sk, sizeof(sk));
         sodium_memzero(sk_b64, sizeof(sk_b64));
         return -1;
     }
+#endif
 
     fprintf(f, "PK:%s\nSK:%s\n", pk_b64, sk_b64);
     fclose(f);
 
-    /* Set file permissions to 0600 on POSIX */
+    /* The mode above only applies when the file is created, so still tighten
+     * permissions on a pre-existing (possibly world-readable) file. */
 #ifndef _WIN32
     chmod(path, 0600);
 #endif

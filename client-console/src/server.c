@@ -42,6 +42,7 @@
  */
 typedef struct {
     sock_t fd;              /**< Socket descriptor for this client */
+    uint32_t ip;            /**< Source IPv4 address, for the per-IP connection cap */
     char room[MAX_ROOM];    /**< Room name (empty until first message) */
     char name[MAX_NAME];    /**< User name (empty until first message) */
     struct sockaddr_in udp_addr; /**< UDP address for relay */
@@ -78,14 +79,57 @@ typedef struct {
  * @note Caller must free(*out) after use
  * @note Returns -1 if frame is malformed or exceeds limits
  */
+/** Max simultaneous connections from one source address.
+ * Deliberately generous: several users commonly share one NAT address, and a
+ * single participant in a video call holds three connections (chat plus the
+ * audio and video TCP media relays). This only has to stop one source from
+ * eating all MAX_CLIENTS slots. */
+#define MAX_CONN_PER_IP 16
+
+/** Wall-clock budget for receiving one complete frame. */
+#define FRAME_READ_TIMEOUT_SEC 20
+
+/** Per-recv / per-send socket timeout, in seconds. */
+#define SOCKET_IO_TIMEOUT_SEC 10
+
+/**
+ * @brief Bound how long a single recv/send on this socket may block.
+ *
+ * The server is single-threaded and does blocking I/O once select() reports a
+ * socket readable, so without this one peer could freeze every other client
+ * indefinitely - by dribbling a frame a byte at a time, or by refusing to read
+ * and stalling a broadcast in send_all(). This caps the damage; a full
+ * non-blocking rewrite of the loop is the proper long-term fix.
+ */
+static void set_socket_timeouts(sock_t fd) {
+#ifdef _WIN32
+    DWORD tv = SOCKET_IO_TIMEOUT_SEC * 1000;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, (const char *)&tv, sizeof(tv));
+#else
+    struct timeval tv;
+    tv.tv_sec = SOCKET_IO_TIMEOUT_SEC;
+    tv.tv_usec = 0;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+#endif
+}
+
 static int read_frame(sock_t fd, uint8_t **out, size_t *outlen) {
+    /* Deadline for the whole frame. SO_RCVTIMEO alone is not enough: a client
+     * that sends one byte just before every timeout would keep the server
+     * blocked here forever. */
+    const time_t frame_deadline = time(NULL) + FRAME_READ_TIMEOUT_SEC;
+
     uint8_t hdr[2];
     if (recv_all(fd, hdr, 2) < 0) {
         return -1;
     }
 
     uint16_t room_len = rd_u16(hdr);
-    if (room_len > MAX_ROOM) {
+    /* >= : room_len == MAX_ROOM would later index clients[].room[MAX_ROOM],
+     * one past the end of a char[MAX_ROOM] buffer. */
+    if (room_len >= MAX_ROOM) {
         return -1;
     }
 
@@ -98,7 +142,9 @@ static int read_frame(sock_t fd, uint8_t **out, size_t *outlen) {
     // read room + name_len
     if (recv_all(fd, buf + 2, room_len + 2) < 0) { free(buf); return -1; }
     uint16_t name_len = rd_u16(buf + 2 + room_len);
-    if (name_len > MAX_NAME) { free(buf); return -1; }
+    /* >= : see room_len above - clients[].name is char[MAX_NAME]. */
+    if (name_len >= MAX_NAME) { free(buf); return -1; }
+    if (time(NULL) > frame_deadline) { free(buf); return -1; }
 
     // read name
     if (recv_all(fd, buf + 2 + room_len + 2, name_len) < 0) { free(buf); return -1; }
@@ -122,9 +168,10 @@ static int read_frame(sock_t fd, uint8_t **out, size_t *outlen) {
     if (recv_all(fd, clenbuf, 4) < 0) { free(buf); return -1; }
     uint32_t clen = rd_u32(clenbuf);
     if (clen > MAX_FRAME) { free(buf); return -1; }
+    if (time(NULL) > frame_deadline) { free(buf); return -1; }
 
     // read cipher
-    uint8_t *cipher = (uint8_t*)malloc(clen);
+    uint8_t *cipher = (uint8_t*)malloc(clen ? clen : 1);
     if (!cipher) { free(buf); return -1; }
     if (recv_all(fd, cipher, clen) < 0) { free(buf); free(cipher); return -1; }
 
@@ -527,9 +574,13 @@ static int try_handle_command(sock_t fd, const uint8_t *frame, size_t flen) {
         memcpy(type_str, type_buf, type_len);
         type_str[type_len] = '\0';
 
-        if (server_db_put_blob(pk, type_str, cipher_data, cipher_len) == 0) {
+        int put_rc = server_db_put_blob(pk, type_str, cipher_data, cipher_len);
+        if (put_rc == 0) {
             send_handle_result(fd, room, room_len, 0, "ok", NULL);
             printf("[server] blob '%s' stored (%u bytes)\n", type_str, cipher_len);
+        } else if (put_rc == -2) {
+            send_handle_result(fd, room, room_len, 2, "blob quota exceeded", NULL);
+            printf("[server] blob '%s' rejected: quota exceeded\n", type_str);
         } else {
             send_handle_result(fd, room, room_len, 3, "db error", NULL);
         }
@@ -927,9 +978,21 @@ void run_server(uint16_t port) {
             socklen_t cl = sizeof(cli);
             sock_t c = accept(listener, (struct sockaddr*)&cli, &cl);
             if (c >= 0) {
-                if (nclients < MAX_CLIENTS) {
+                /* Per-IP cap: without it one source can occupy every MAX_CLIENTS
+                 * slot and lock all other users out of the server. */
+                int same_ip = 0;
+                for (int j = 0; j < nclients; j++) {
+                    if (clients[j].ip == (uint32_t)cli.sin_addr.s_addr) same_ip++;
+                }
+                if (same_ip >= MAX_CONN_PER_IP) {
+                    printf("[server] connection refused: %s already has %d connections\n",
+                           inet_ntoa(cli.sin_addr), same_ip);
+                    close_socket(c);
+                } else if (nclients < MAX_CLIENTS) {
                     set_tcp_keepalive(c);
+                    set_socket_timeouts(c);
                     clients[nclients].fd = c;
+                    clients[nclients].ip = (uint32_t)cli.sin_addr.s_addr;
                     clients[nclients].room[0] = '\0';
                     clients[nclients].name[0] = '\0';
                     clients[nclients].udp_registered = 0;
@@ -1047,6 +1110,22 @@ void run_server(uint16_t port) {
                     send_user_list(clients, nclients, clients[i].room);
                 }
             }
+            /* Anti-spoofing: room and display name are pinned to this connection
+             * at registration, but the frame carries its own copies and those are
+             * what receivers render. Without this check a client registered as
+             * "alice" could relay frames claiming to be "bob" and impersonate him
+             * for every unsigned message in the room. Drop mismatches rather than
+             * forwarding them. */
+            if (strlen(clients[i].room) != room_len ||
+                memcmp(clients[i].room, room, room_len) != 0 ||
+                strlen(clients[i].name) != name_len ||
+                memcmp(clients[i].name, name, name_len) != 0) {
+                printf("[server] dropped frame with mismatched identity from '%s'\n",
+                       clients[i].name);
+                free(frame);
+                continue;
+            }
+
             broadcast(clients, &nclients, clients[i].room, frame, flen, clients[i].fd);
             free(frame);
         }
