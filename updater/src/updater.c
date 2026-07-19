@@ -572,6 +572,65 @@ static bool json_find_asset_url_by_name(const char *json, const char *asset_name
     return true;
 }
 
+/**
+ * @brief Find a release asset whose name starts with `prefix` and ends in ".zip".
+ *
+ * The old exact-name lookup demanded "<prefix>-<os>-<arch>.zip", but the release
+ * workflow puts the version in the file name ("fear-linux-x86_64-v0.5.0.zip"),
+ * so the updater could never find its asset and every run died with "Suitable
+ * asset not found". Matching on the prefix keeps the human-readable versioned
+ * names and returns the real name so the ".sig" asset can be located too.
+ */
+static bool json_find_asset_by_prefix(const char *json, const char *prefix,
+                                      char *out_name, size_t name_sz,
+                                      char *out_url, size_t url_sz) {
+    const char *p = json;
+    const size_t plen = strlen(prefix);
+
+    while ((p = strstr(p, "\"name\"")) != NULL) {
+        const char *v = strchr(p, ':');
+        if (!v) return false;
+        v++;
+        while (*v && isspace((unsigned char)*v)) v++;
+        if (*v != '"') { p += 6; continue; }
+        v++;
+
+        char name[512];
+        size_t i = 0;
+        while (*v && *v != '"') {
+            if (*v == '\\' && v[1]) v++;
+            if (i < sizeof(name) - 1) name[i++] = *v;
+            v++;
+        }
+        name[i] = '\0';
+
+        size_t nlen = strlen(name);
+        if (nlen > 4 && strncmp(name, prefix, plen) == 0 &&
+            strcmp(name + nlen - 4, ".zip") == 0) {
+            const char *q = strstr(v, "\"browser_download_url\"");
+            if (!q) return false;
+            q = strchr(q, ':');
+            if (!q) return false;
+            q++;
+            while (*q && isspace((unsigned char)*q)) q++;
+            if (*q != '"') return false;
+            q++;
+            size_t j = 0;
+            while (*q && *q != '"') {
+                if (*q == '\\' && q[1]) q++;
+                if (j + 1 < url_sz) out_url[j++] = *q;
+                q++;
+            }
+            out_url[j] = '\0';
+            strncpy(out_name, name, name_sz - 1);
+            out_name[name_sz - 1] = '\0';
+            return true;
+        }
+        p = v;
+    }
+    return false;
+}
+
 /* ---------- Update authenticity ---------- */
 
 /**
@@ -814,16 +873,21 @@ int main(int argc, char **argv) {
     char osarch[64];
     detect_os_arch(osarch, sizeof(osarch));
 
-    // Compose expected asset name - always use .zip for both platforms
-    char asset_name[256];
-    snprintf(asset_name, sizeof(asset_name), "%s-%s.zip", cfg.asset_prefix, osarch);
-    printf("Looking for asset: %s\n", asset_name);
+    /* Match by prefix: the release workflow appends the version to the file
+     * name, so "<prefix>-<os>-<arch>" is all we can rely on. */
+    char asset_prefix_full[256];
+    snprintf(asset_prefix_full, sizeof(asset_prefix_full), "%s-%s", cfg.asset_prefix, osarch);
+    printf("Looking for asset starting with: %s\n", asset_prefix_full);
 
+    char asset_name[256] = "";
     char dl_url[MAX_URL]="";
-    if(!json_find_asset_url_by_name(mb.data, asset_name, dl_url, sizeof(dl_url))) {
+    if(!json_find_asset_by_prefix(mb.data, asset_prefix_full,
+                                   asset_name, sizeof(asset_name),
+                                   dl_url, sizeof(dl_url))) {
         free(mb.data);
         die("Suitable asset not found in release. Check asset_prefix/os-arch/filename in releases.");
     }
+    printf("Found asset: %s\n", asset_name);
 
     /* Detached signature, published next to the archive as <asset>.sig */
     char sig_asset[320];
