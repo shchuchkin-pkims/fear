@@ -329,6 +329,17 @@ int main(int argc, char **argv) {
             } else {
                 identity_default_path(id_path, sizeof(id_path));
             }
+            /* Create an identity on first run. The ECDH exchange now requires a
+             * signed key response, so a client without an identity could neither
+             * host a joinable room nor be trusted by joiners. Roadmap §10 wants
+             * the identity created automatically on first launch anyway. */
+            if (identity_load(id_path, id_pk, id_sk) != 0) {
+                if (identity_generate(id_path) == 0) {
+                    fprintf(stderr, "No identity found - generated a new one: %s\n", id_path);
+                } else {
+                    fprintf(stderr, "WARNING: could not create an identity at %s\n", id_path);
+                }
+            }
             if (identity_load(id_path, id_pk, id_sk) == 0) {
                 has_identity = 1;
                 char fp[IDENTITY_FINGERPRINT_LEN];

@@ -250,17 +250,33 @@ static int ecdh_join_room(sock_t s, const char *room, const char *name, uint8_t 
                     const uint8_t *box_cipher = p; p += (32 + crypto_box_MACBYTES);
                     size_t box_cipher_len = 32 + crypto_box_MACBYTES;
 
-                    /* Check for identity signature (anti-MITM) */
+                    /* Identity signature (anti-MITM) - MANDATORY.
+                     * The responder must prove ownership of an Ed25519 identity
+                     * over its ephemeral X25519 key. Without this, a hostile relay
+                     * - or any room member that answers KEY_REQUEST first - can
+                     * hand us a room key it already knows and transparently MITM
+                     * the whole conversation. This check previously "failed open":
+                     * a missing or invalid signature only printed a warning and
+                     * the key was accepted anyway. Anything short of a verified
+                     * signature now aborts the join. */
                     size_t consumed = 2 + target_len + base_len;
                     size_t remaining = clen - consumed;
                     int sig_verified = 0;
 
-                    if (remaining >= IDENTITY_PK_BYTES + IDENTITY_SIG_BYTES) {
+                    if (remaining < IDENTITY_PK_BYTES + IDENTITY_SIG_BYTES) {
+                        fprintf(stderr,
+                                "[join] REJECTED: '%s' sent an unsigned key response.\n"
+                                "[join] The room owner needs an identity key (do not use --no-sign).\n",
+                                sender);
+                    } else {
                         const uint8_t *id_pk = p;
                         const uint8_t *sig = p + IDENTITY_PK_BYTES;
                         if (identity_verify(responder_pk, crypto_box_PUBLICKEYBYTES,
-                                            sig, id_pk) == 0) {
-                            sig_verified = 1;
+                                            sig, id_pk) != 0) {
+                            fprintf(stderr,
+                                    "[join] REJECTED: signature verification FAILED for '%s'"
+                                    " - possible MITM attack.\n", sender);
+                        } else {
                             /* TOFU check the responder's identity */
                             tofu_result_t tofu = identity_tofu_check(
                                 g_known_keys_path, sender, id_pk);
@@ -269,24 +285,40 @@ static int ecdh_join_room(sock_t s, const char *room, const char *name, uint8_t 
                             if (tofu == TOFU_KEY_MATCH || tofu == TOFU_KEY_MATCH_VERIFIED) {
                                 printf("[join] Key exchange verified: %s [%s]\n",
                                        sender, fp_buf);
+                                sig_verified = 1;
                             } else if (tofu == TOFU_NEW_KEY) {
                                 printf("[join] New identity for '%s': %s (trusted on first use)\n",
                                        sender, fp_buf);
+                                sig_verified = 1;
                             } else if (tofu == TOFU_KEY_CONFLICT) {
-                                printf("\n*** WARNING: Identity key for '%s' has CHANGED! ***\n", sender);
-                                printf("*** This could indicate a MITM attack! ***\n");
-                                printf("*** Fingerprint: %s ***\n\n", fp_buf);
+                                /* Blocking: a changed identity key is exactly what an
+                                 * active MITM looks like, so we must not proceed. */
+                                fprintf(stderr,
+                                    "\n*** REJECTED: identity key for '%s' has CHANGED! ***\n"
+                                    "*** This could indicate a MITM attack. Fingerprint: %s ***\n"
+                                    "*** Verify out of band, then remove the stale entry from\n"
+                                    "*** %s if the change is expected. ***\n\n",
+                                    sender, fp_buf, g_known_keys_path);
+                            } else {
+                                fprintf(stderr,
+                                        "[join] REJECTED: could not check identity of '%s'.\n",
+                                        sender);
                             }
-                        } else {
-                            fprintf(stderr, "[join] WARNING: Signature verification FAILED for '%s'!\n", sender);
                         }
+                    }
+
+                    if (!sig_verified) {
+                        fprintf(stderr, "[join] Aborting key exchange - room key not accepted.\n");
+                        fflush(stderr);
+                        free(room_in); free(sender); free(payload);
+                        break;
                     }
 
                     if (crypto_box_open_easy(key_out, box_cipher, box_cipher_len,
                                               box_nonce, responder_pk, my_sk) == 0) {
                         char *b64_key = b64_encode(key_out, 32);
-                        printf("[join] Room key received from '%s'%s\n", sender,
-                               sig_verified ? " (identity verified)" : " (unsigned)");
+                        printf("[join] Room key received from '%s' (identity verified)\n",
+                               sender);
                         if (b64_key) {
                             printf("[join] Room key: %s\n", b64_key);
                             free(b64_key);
@@ -362,7 +394,18 @@ static void handle_key_request(sock_t s, const char *room, const char *myname,
     if (g_has_identity) {
         memcpy(w, g_identity_pk, IDENTITY_PK_BYTES); w += IDENTITY_PK_BYTES;
         /* Sign the ephemeral public key with our Ed25519 identity key */
-        identity_sign(my_pk, crypto_box_PUBLICKEYBYTES, g_identity_sk, w);
+        if (identity_sign(my_pk, crypto_box_PUBLICKEYBYTES, g_identity_sk, w) != 0) {
+            fprintf(stderr, "[key-exchange] Failed to sign ephemeral key - aborting.\n");
+            sodium_memzero(my_sk, sizeof my_sk);
+            free(payload);
+            return;
+        }
+    } else {
+        /* Joiners now reject unsigned responses (anti-MITM), so warn loudly
+         * instead of silently producing a room nobody can join. */
+        fprintf(stderr,
+                "[key-exchange] WARNING: no identity key available - this response is\n"
+                "[key-exchange] unsigned and joining clients will REJECT it.\n");
     }
 
     send_service_frame(s, room, myname, MSG_TYPE_KEY_RESPONSE, payload, payload_len);
@@ -370,7 +413,7 @@ static void handle_key_request(sock_t s, const char *room, const char *myname,
     sodium_memzero(my_sk, sizeof my_sk);
     free(payload);
     printf("[key-exchange] Sent room key to '%s'%s\n", joiner_name,
-           g_has_identity ? " (signed)" : "");
+           g_has_identity ? " (signed)" : " (UNSIGNED - will be rejected)");
     fflush(stdout);
 }
 
@@ -732,6 +775,26 @@ static void handle_reject_command(void) {
 }
 
 
+/**
+ * @brief Replace C0 control bytes (and DEL) in a display string, in place.
+ *
+ * Everything this CLI prints is parsed line by line by the Qt GUI, which trusts
+ * the leading markers ([V]/[T]/[?]/[!], [TOFU], [FILE_OFFER]) as a control
+ * channel. A peer that embeds a raw newline in its display name, message body
+ * or file name could therefore forge an entire line and fake a "verified"
+ * badge or impersonate another participant. Neutralising control bytes keeps
+ * one message on exactly one line, defuses terminal escape sequences, and also
+ * stops newlines from being written into the line-based known_keys store.
+ * UTF-8 (>= 0x80) is preserved untouched.
+ */
+static void sanitize_display_inplace(char *s, size_t len) {
+    if (!s) return;
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (c < 0x20 || c == 0x7F) s[i] = '?';
+    }
+}
+
 void handle_file_message(const uint8_t *plain, size_t plen, message_type_t type,
                         const char *room_in, const char *sender_name,
                         const uint8_t *key, const char *my_name) {
@@ -751,10 +814,20 @@ void handle_file_message(const uint8_t *plain, size_t plen, message_type_t type,
     switch (type) {
         case MSG_TYPE_FILE_START: {
             const uint8_t *p = plain;
+            /* Bounds-check every field against plen before reading it. fn_len is
+             * attacker-controlled (up to 65535) and used to be memcpy'd straight
+             * into this 1024-byte stack buffer by any room participant, which
+             * smashed the stack. The trailing check also covers the file_size
+             * and crc reads below. */
+            if (plen < 2) return;
             uint16_t fn_len = rd_u16(p); p += 2;
+            if (fn_len >= MAX_FILENAME) return;
+            if (plen < (size_t)2 + fn_len + 4 + 4) return;
             char orig_filename[MAX_FILENAME];
             memcpy(orig_filename, p, fn_len); p += fn_len;
             orig_filename[fn_len] = '\0';
+            /* Printed in the [FILE_OFFER] line the GUI parses - see above. */
+            sanitize_display_inplace(orig_filename, fn_len);
 
             const char *basename = strrchr(orig_filename, '\\');
             if (!basename) basename = strrchr(orig_filename, '/');
@@ -1188,6 +1261,11 @@ int recv_and_decrypt(sock_t s, const char *room, const uint8_t *key, const char 
         return 0;
     }
 
+    /* The sender name is attacker-controlled and is echoed into stdout, into the
+     * known_keys store and into GUI labels. Neutralise control bytes now that the
+     * AEAD check (which authenticates the raw name) is already done. */
+    sanitize_display_inplace(name, strlen(name));
+
     if (msg_type == MSG_TYPE_TEXT) {
         // Пропускаем пустые сообщения (регистрационные)
         if (plen > 0) {
@@ -1195,6 +1273,7 @@ int recv_and_decrypt(sock_t s, const char *room, const uint8_t *key, const char 
             struct tm *tm = localtime(&now);
             char tbuf[32];
             strftime(tbuf, sizeof tbuf, "%H:%M:%S", tm);
+            sanitize_display_inplace((char*)plain, (size_t)plen);
             printf("[%s] [?] %s: %.*s\n", tbuf, name, (int)plen, (char*)plain);
             fflush(stdout);
         }
@@ -1234,6 +1313,10 @@ int recv_and_decrypt(sock_t s, const char *room, const uint8_t *key, const char 
             struct tm *tm = localtime(&now);
             char tbuf[32];
             strftime(tbuf, sizeof tbuf, "%H:%M:%S", tm);
+            /* Signature already verified over the raw bytes above, so it is safe
+             * to neutralise control bytes before display. */
+            sanitize_display_inplace((char*)plain + IDENTITY_PK_BYTES + IDENTITY_SIG_BYTES,
+                                     actual_len);
             printf("[%s] %s %s: %.*s\n", tbuf, prefix, name,
                    (int)actual_len, (char*)actual_msg);
             fflush(stdout);
