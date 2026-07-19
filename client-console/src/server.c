@@ -492,7 +492,13 @@ static int try_handle_command(sock_t fd, const uint8_t *frame, size_t flen) {
         }
         const uint8_t *type_buf  = cipher + 32 + 64 + 1;
         uint32_t       cipher_len = rd_u32(cipher + 32 + 64 + 1 + type_len);
-        if (clen < (uint32_t)32 + 64 + 1 + type_len + 4 + cipher_len) {
+        /* Overflow-free bound check. The previous form evaluated the right-hand
+         * side in uint32_t, so a cipher_len near UINT32_MAX wrapped it to a tiny
+         * value, passed this check and then over-read ~4 GB in the memcpy below -
+         * a remote unauthenticated crash of the whole relay. clen >= hdr_len is
+         * guaranteed by the "truncated type" check above. */
+        uint32_t hdr_len = (uint32_t)32 + 64 + 1 + type_len + 4;
+        if (cipher_len > clen - hdr_len) {
             send_handle_result(fd, room, room_len, 2, "truncated cipher", NULL);
             return 1;
         }

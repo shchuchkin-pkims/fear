@@ -377,7 +377,11 @@ static int tcp_relay_recv_media(VideoCall *vc, uint8_t *out, int out_size) {
         uint32_t clen = (uint32_t)(clenbuf[0] | (clenbuf[1] << 8) |
                                     (clenbuf[2] << 16) | (clenbuf[3] << 24));
 
-        if (type == MSG_TYPE_MEDIA_RELAY && (int)clen <= out_size && clen > 0) {
+        /* Unsigned comparison. A signed cast here let clen >= 0x80000000 read as
+         * negative, pass the bound check and overflow `out` with data from an
+         * untrusted relay server (no room key required). */
+        if (type == MSG_TYPE_MEDIA_RELAY && clen > 0 &&
+            out_size > 0 && clen <= (uint32_t)out_size) {
             if (tcp_recv_all(vc->tcp_sock, out, clen) < 0) return -1;
             return (int)clen;
         }
@@ -706,6 +710,11 @@ static int decrypt_stats(VideoCall *vc, const uint8_t *pkt, size_t pkt_len,
 
     unsigned long long mlen = 0;
     uint8_t plain[64];
+    /* Bound the AEAD output BEFORE decrypting: libsodium writes (clen - ABYTES)
+     * bytes into `plain` and touches that buffer even when the tag is invalid,
+     * so an oversized STATS packet would overflow this stack buffer without a
+     * room key. The length check below runs too late to prevent that. */
+    if (pkt_len - (1 + 8) - AES_GCM_ABYTES > sizeof plain) return -1;
     if (crypto_aead_aes256gcm_decrypt(
             plain, &mlen, NULL,
             pkt + 1 + 8, pkt_len - (1 + 8),
@@ -1020,7 +1029,7 @@ static THREAD_RET th_recv_func(void *arg) {
             size_t opus_len = 0;
             if (audio_decrypt_packet(rbuf, (size_t)n, vc->audio_key,
                                       vc->remote_nonce_prefix,
-                                      opus_buf, &opus_len) != 0) {
+                                      opus_buf, VC_MAX_OPUS_BYTES, &opus_len) != 0) {
                 continue;
             }
 
