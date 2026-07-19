@@ -24,7 +24,10 @@ COPY identity       ./identity
 # client-console/CMakeLists.txt does, minus Windows branches.
 # Phase B-2 added server_db.c (SQLite-backed handle registry + opaque
 # user-blob store), so we link against -lsqlite3.
-RUN mkdir -p /out && gcc -O2 -Wall -Wextra -pthread -o /out/fear \
+RUN mkdir -p /out && gcc -O2 -Wall -Wextra -pthread \
+        -fstack-protector-strong -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=2 \
+        -fPIE -pie -Wl,-z,relro,-z,now -Wl,-z,noexecstack \
+        -o /out/fear \
         client-console/src/main.c \
         client-console/src/common.c \
         client-console/src/network.c \

@@ -8,6 +8,19 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 # Общие флаги компиляции
 add_compile_options(-O2 -Wall -Wextra -pedantic)
 
+# Флаги защиты (hardening). Клиент и сервер разбирают недоверенный сетевой ввод,
+# поэтому stack-protector / FORTIFY_SOURCE / RELRO / PIE обязательны: они
+# превращают остаточные ошибки памяти из потенциального RCE в аварийный выход.
+if(NOT MSVC)
+    add_compile_options(-fstack-protector-strong -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=2)
+    if(NOT WIN32)
+        add_compile_options(-fPIE)
+        # add_link_options требует CMake 3.13, а минимум проекта - 3.12
+        set(CMAKE_EXE_LINKER_FLAGS
+            "${CMAKE_EXE_LINKER_FLAGS} -pie -Wl,-z,relro,-z,now -Wl,-z,noexecstack")
+    endif()
+endif()
+
 # Определение платформы
 if(WIN32)
     add_compile_definitions(_WIN32_WINNT=0x0600)
