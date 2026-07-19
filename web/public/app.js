@@ -623,9 +623,21 @@
         }
 
         if (result.crcMatch) {
-            addFileMessage(`File received: "${result.filename}" (${FearFileTransfer.formatSize(result.size)}) — CRC OK`);
-            // Auto-download
-            FearFileTransfer.triggerDownload(result.filename, result.data);
+            // Strip C0 controls and bidi overrides before showing or saving
+            // the name. A right-to-left override lets an attacker disguise an
+            // executable as an image (the classic "photo\u202Egpj.exe" trick).
+            const safeName = String(result.filename)
+                .replace(/[\u0000-\u001F\u007F\u200E\u200F\u202A-\u202E\u2066-\u2069]/g, '');
+            addFileMessage(`File received: "${safeName}" (${FearFileTransfer.formatSize(result.size)}) — CRC OK`);
+            // Ask first. Any room participant can push a file, and silently
+            // dropping an attacker-named file into Downloads is a malware
+            // delivery path, not a convenience feature.
+            if (confirm(`Save "${safeName}" (${FearFileTransfer.formatSize(result.size)}) to your Downloads folder?\n\n` +
+                        `Only accept files from people you trust.`)) {
+                FearFileTransfer.triggerDownload(safeName, result.data);
+            } else {
+                addSystemMessage(`Download of "${safeName}" declined.`);
+            }
         } else {
             addFileMessage(`File received: "${result.filename}" — CRC MISMATCH (corrupted)`);
         }
