@@ -173,8 +173,27 @@ jobs:
           if-no-files-found: error
           retention-days: 90
 
+      # The updater refuses to install an archive without a valid Ed25519
+      # signature, so a release must ship <archive>.sig next to the archive.
+      # Uses the same key as the Linux workflow (doc/RELEASE_SIGNING.md).
+      - name: Sign release archive (only on tag push)
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          FEAR_SIGN_KEY: ${{ secrets.FEAR_SIGN_KEY }}
+        run: |
+          set -e
+          if [ -z "${FEAR_SIGN_KEY}" ]; then
+            echo "::error::FEAR_SIGN_KEY secret is not set - refusing to publish an unsigned release."
+            exit 1
+          fi
+          gcc -O2 -o fear-sign.exe updater/tools/fear-sign.c $(pkg-config --cflags --libs libsodium)
+          ./fear-sign.exe sign "release/${ZIP_NAME}" > "release/${ZIP_NAME}.sig"
+          echo "Signature: $(cat "release/${ZIP_NAME}.sig")"
+
       - name: Attach to GitHub Release (only on tag push)
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: release/${{ env.ZIP_NAME }}
+          files: |
+            release/${{ env.ZIP_NAME }}
+            release/${{ env.ZIP_NAME }}.sig
