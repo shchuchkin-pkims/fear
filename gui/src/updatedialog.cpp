@@ -171,10 +171,14 @@ void UpdateDialog::checkVersion() {
 }
 
 void UpdateDialog::runUpdater() {
+    /* Anchored to the application directory. This launches a binary that then
+     * overwrites the installation, so resolving it against the working
+     * directory would be an easy privilege-free code execution path. */
+    const QString appDir = QApplication::applicationDirPath();
 #ifdef Q_OS_WIN
-    QString updaterPath = "./bin/updater.exe";
+    QString updaterPath = appDir + "/bin/updater.exe";
 #else
-    QString updaterPath = "./bin/updater";
+    QString updaterPath = appDir + "/bin/updater";
 #endif
     QFileInfo updaterInfo(updaterPath);
 

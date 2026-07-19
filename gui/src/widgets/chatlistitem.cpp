@@ -73,6 +73,10 @@ ChatListItem::ChatListItem(QWidget *parent) : QWidget(parent) {
 
 void ChatListItem::setEntry(const ChatListEntry &e) {
     m_avatar->setSeed(e.title);
+    /* Title and preview both carry network-controlled text (peer name, last
+     * message), so they must not be interpreted as rich text. */
+    m_title->setTextFormat(Qt::PlainText);
+    m_preview->setTextFormat(Qt::PlainText);
     m_title->setText(e.title);
     m_preview->setText(e.preview);
 

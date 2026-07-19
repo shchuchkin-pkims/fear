@@ -310,9 +310,10 @@ QString VideoCallManager::findVideoCallApp() {
     QStringList possiblePaths = {
         QApplication::applicationDirPath() + "/video_call",
         QApplication::applicationDirPath() + "/bin/video_call",
-        QApplication::applicationDirPath() + "/../bin/video_call",
-        "video_call",
-        "./video_call"
+        QApplication::applicationDirPath() + "/../bin/video_call"
+        /* No bare name and no "./" fallback - see AudioCallManager: those resolve
+         * through PATH or the working directory and would run an attacker's
+         * binary if the GUI is started from a writable directory. */
     };
 
 #ifdef Q_OS_WIN

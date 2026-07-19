@@ -318,9 +318,11 @@ QString AudioCallManager::findAudioCallApp() {
     QStringList possiblePaths = {
         QApplication::applicationDirPath() + "/audio_call",
         QApplication::applicationDirPath() + "/bin/audio_call",
-        QApplication::applicationDirPath() + "/../bin/audio_call",
-        "audio_call",
-        "./audio_call"
+        QApplication::applicationDirPath() + "/../bin/audio_call"
+        /* No bare name and no "./" fallback: those resolve through PATH or the
+         * current working directory, so launching the GUI from a directory an
+         * attacker can write to (a downloads folder, say) would run their
+         * binary with the user's privileges. */
     };
 
 #ifdef Q_OS_WIN

@@ -197,6 +197,11 @@ public:
             nameLay->setContentsMargins(0, 0, 0, 0);
             nameLay->setSpacing(0);
             auto *senderLbl = new QLabel(m.sender, nameHolder);
+            /* Qt::AutoText renders anything that looks like HTML as rich text, and
+             * the sender name comes from the network. A peer named
+             * "<img src=http://attacker/x>" would make us fetch that URL on
+             * render, leaking the user's IP and online status. */
+            senderLbl->setTextFormat(Qt::PlainText);
             QFont sf = senderLbl->font();
             sf.setWeight(QFont::DemiBold);
             sf.setPixelSize(12);
@@ -481,6 +486,9 @@ ChatArea::ChatArea(QWidget *parent) : QWidget(parent) {
 
 void ChatArea::setChat(const QString &id, const QString &title, const QString &status) {
     m_chatId = id;
+    /* Room/peer titles are network-controlled - keep them out of rich text. */
+    m_titleLbl->setTextFormat(Qt::PlainText);
+    m_statusLbl->setTextFormat(Qt::PlainText);
     m_titleLbl->setText(title);
     m_statusLbl->setText(status);
     m_headerAvatar->setSeed(title);

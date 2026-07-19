@@ -86,6 +86,8 @@ PeerProfileDialog::PeerProfileDialog(const QString &displayName,
     nameBox->setContentsMargins(0, 0, 0, 0);
     nameBox->setSpacing(2);
     auto *nameLbl = new QLabel(displayName, hdr);
+    /* Peer-supplied name: never let it be interpreted as rich text. */
+    nameLbl->setTextFormat(Qt::PlainText);
     QFont nf = nameLbl->font();
     nf.setBold(true);
     nf.setPixelSize(18);

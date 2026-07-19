@@ -73,14 +73,18 @@ bool Backend::connectToServer(const QString &host, int port, const QString &room
 
     // Check if executable exists
     if (cliPath.isEmpty() || !QFile::exists(cliPath)) {
+        /* Anchored to the application directory, never to the working directory:
+         * "./bin/fear" would run whatever binary happens to sit under the
+         * directory the GUI was started from. */
+        const QString appDir = QGuiApplication::applicationDirPath();
 #ifdef Q_OS_WIN
-        QString defaultPath = "./bin/fear.exe";
+        QString defaultPath = appDir + "/bin/fear.exe";
         if (!QFile::exists(defaultPath)) {
             emit error("CLI executable not found. Please set the correct path to fear.exe");
             return false;
         }
 #else
-        QString defaultPath = "./bin/fear";
+        QString defaultPath = appDir + "/bin/fear";
         if (!QFile::exists(defaultPath)) {
             emit error("CLI executable not found. Please set the correct path to fear");
             return false;
