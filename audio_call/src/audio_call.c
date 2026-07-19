@@ -78,6 +78,44 @@ typedef int socket_t;
 #define AC_OPUS_BITRATE      128000  /* 128 kbps for high quality */
 #define AC_OPUS_COMPLEXITY   5
 #define AC_UDP_RECV_BUFSZ    1500
+
+/* ---- Replay protection: sliding window over authenticated sequence numbers ---- */
+
+typedef struct {
+    uint64_t max_seq;   /**< highest sequence number accepted so far */
+    uint64_t bitmap;    /**< bit i set => (max_seq - i) has been accepted */
+    int      started;   /**< 0 until the first packet is accepted */
+} replay_window_t;
+
+/**
+ * @brief Accept a sequence number once; reject duplicates and stale packets.
+ *
+ * Call this only for packets whose AEAD tag has already verified. Feeding it
+ * unauthenticated sequence numbers would let an off-path attacker poison the
+ * window and lock the real peer out.
+ *
+ * @return 0 if the packet is fresh, -1 if it is a replay or older than the window.
+ */
+static int replay_accept(replay_window_t *w, uint64_t seq) {
+    if (!w->started) {
+        w->started = 1;
+        w->max_seq = seq;
+        w->bitmap = 1;
+        return 0;
+    }
+    if (seq > w->max_seq) {
+        uint64_t shift = seq - w->max_seq;
+        w->bitmap = (shift >= 64) ? 0 : (w->bitmap << shift);
+        w->bitmap |= 1;
+        w->max_seq = seq;
+        return 0;
+    }
+    uint64_t diff = w->max_seq - seq;
+    if (diff >= 64) return -1;                  /* older than the window */
+    if (w->bitmap & (1ULL << diff)) return -1;  /* already seen */
+    w->bitmap |= (1ULL << diff);
+    return 0;
+}
 #define AC_MAX_OPUS_BYTES    1275
 #define AC_PCM_BYTES_PER_FR  (AC_FRAME_SAMPLES * sizeof(int16_t) * AC_CHANNELS)
 
@@ -151,6 +189,8 @@ typedef struct AudioCall {
     uint8_t local_nonce_prefix[NONCE_PREFIX_LEN];
     uint8_t remote_nonce_prefix[NONCE_PREFIX_LEN];
     atomic_int remote_prefix_ready;
+    replay_window_t rx_audio;   /**< replay window for audio packets */
+    replay_window_t rx_stats;   /**< replay window for stats packets */
 
     atomic_uint_fast64_t seq_tx;
 
@@ -216,8 +256,18 @@ static int send_hello(AudioCall *c) {
 }
 static int handle_hello(AudioCall *c, const uint8_t *buf, size_t len) {
     if (len < 1 + NONCE_PREFIX_LEN) return -1;
+    /* A new prefix means the peer restarted its session and its sequence
+     * numbers begin at 0 again, so the replay windows must start over too.
+     * An unchanged prefix keeps the window intact - otherwise a replayed
+     * HELLO would reopen the whole history for replay. */
+    int prefix_changed = (atomic_load(&c->remote_prefix_ready) &&
+                          memcmp(c->remote_nonce_prefix, buf + 1, NONCE_PREFIX_LEN) != 0);
     memcpy(c->remote_nonce_prefix, buf + 1, NONCE_PREFIX_LEN);
     atomic_store(&c->remote_prefix_ready, 1);
+    if (prefix_changed) {
+        memset(&c->rx_audio, 0, sizeof c->rx_audio);
+        memset(&c->rx_stats, 0, sizeof c->rx_stats);
+    }
 
     /* Check for identity extension (only on first HELLO) */
     if (len >= HELLO_SIZE_SIGNED && c->peer_verified == 0) {
@@ -696,6 +746,12 @@ static THREAD_RET th_recv_func(void *arg) {
         if (rbuf[0] == PKT_VER_STATS) {
             AudioStatsPayload sp;
             if (decrypt_stats(c, rbuf, (size_t)n, &sp) == 0) {
+                /* Authenticated: now reject replays. Stale RTT/loss figures
+                 * would otherwise let an on-path attacker steer the quality
+                 * controller by re-sending old measurements. */
+                uint64_t be_seq_s;
+                memcpy(&be_seq_s, rbuf + 1, 8);
+                if (replay_accept(&c->rx_stats, ntohll_u64(be_seq_s)) != 0) continue;
                 if (sp.pong_ts != 0) {
                     uint32_t now32 = (uint32_t)(audio_time_ms() & 0xFFFFFFFF);
                     c->measured_rtt_ms = now32 - sp.pong_ts;
@@ -709,6 +765,13 @@ static THREAD_RET th_recv_func(void *arg) {
         size_t opus_len = 0;
         if (decrypt_opus(c, rbuf, (size_t)n, opus, sizeof opus, &opus_len) != 0) {
             continue;
+        }
+
+        /* Authenticated: drop replayed or stale audio frames. */
+        {
+            uint64_t be_seq_a;
+            memcpy(&be_seq_a, rbuf + 1, 8);
+            if (replay_accept(&c->rx_audio, ntohll_u64(be_seq_a)) != 0) continue;
         }
 
         int dec_samples = opus_decode(c->dec, opus, (opus_int32)opus_len,

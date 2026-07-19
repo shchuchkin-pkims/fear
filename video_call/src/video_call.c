@@ -96,6 +96,44 @@ static int resolve_host_v4(const char *host, struct in_addr *out) {
 #define AES_GCM_NONCE_LEN crypto_aead_aes256gcm_NPUBBYTES
 #define AES_GCM_ABYTES    crypto_aead_aes256gcm_ABYTES
 
+/* ---- Replay protection: sliding window over authenticated sequence numbers ---- */
+
+typedef struct {
+    uint64_t max_seq;   /**< highest sequence number accepted so far */
+    uint64_t bitmap;    /**< bit i set => (max_seq - i) has been accepted */
+    int      started;   /**< 0 until the first packet is accepted */
+} replay_window_t;
+
+/**
+ * @brief Accept a sequence number once; reject duplicates and stale packets.
+ *
+ * Call this only for packets whose AEAD tag has already verified. Feeding it
+ * unauthenticated sequence numbers would let an off-path attacker poison the
+ * window and lock the real peer out.
+ *
+ * @return 0 if the packet is fresh, -1 if it is a replay or older than the window.
+ */
+static int replay_accept(replay_window_t *w, uint64_t seq) {
+    if (!w->started) {
+        w->started = 1;
+        w->max_seq = seq;
+        w->bitmap = 1;
+        return 0;
+    }
+    if (seq > w->max_seq) {
+        uint64_t shift = seq - w->max_seq;
+        w->bitmap = (shift >= 64) ? 0 : (w->bitmap << shift);
+        w->bitmap |= 1;
+        w->max_seq = seq;
+        return 0;
+    }
+    uint64_t diff = w->max_seq - seq;
+    if (diff >= 64) return -1;                  /* older than the window */
+    if (w->bitmap & (1ULL << diff)) return -1;  /* already seen */
+    w->bitmap |= (1ULL << diff);
+    return 0;
+}
+
 /* ===== VideoCall state ===== */
 
 typedef struct VideoCall {
@@ -111,6 +149,10 @@ typedef struct VideoCall {
     uint8_t local_nonce_prefix[NONCE_PREFIX_LEN];
     uint8_t remote_nonce_prefix[NONCE_PREFIX_LEN];
     atomic_int remote_prefix_ready;
+
+    replay_window_t rx_video;   /**< replay window for video fragments */
+    replay_window_t rx_audio;   /**< replay window for audio packets */
+    replay_window_t rx_stats;   /**< replay window for stats packets */
 
     atomic_uint_fast64_t audio_seq_tx;
     atomic_uint_fast64_t video_seq_tx;
@@ -490,6 +532,15 @@ static int handle_hello(VideoCall *vc, const uint8_t *buf, size_t len) {
 
     memcpy(vc->remote_nonce_prefix, buf + 1, NONCE_PREFIX_LEN);
     atomic_store(&vc->remote_prefix_ready, 1);
+
+    /* A new prefix means the peer restarted and its sequence numbers begin at 0
+     * again, so the replay windows have to start over. An unchanged prefix must
+     * keep them, or a replayed HELLO would reopen the history for replay. */
+    if (prefix_changed) {
+        memset(&vc->rx_video, 0, sizeof vc->rx_video);
+        memset(&vc->rx_audio, 0, sizeof vc->rx_audio);
+        memset(&vc->rx_stats, 0, sizeof vc->rx_stats);
+    }
     atomic_store(&vc->last_recv_time, video_time_ms());
     atomic_store(&vc->peer_connected, 1);
 
@@ -1033,6 +1084,13 @@ static THREAD_RET th_recv_func(void *arg) {
                 continue;
             }
 
+            /* Authenticated: drop replayed or stale audio frames. */
+            {
+                uint64_t be_seq_a;
+                memcpy(&be_seq_a, rbuf + 1, 8);
+                if (replay_accept(&vc->rx_audio, ntohll_u64(be_seq_a)) != 0) continue;
+            }
+
             int dec_samples = opus_decode(vc->dec, opus_buf, (opus_int32)opus_len,
                                            pcm, VC_FRAME_SAMPLES, 0);
             if (dec_samples <= 0) continue;
@@ -1065,6 +1123,14 @@ static THREAD_RET th_recv_func(void *arg) {
             size_t frag_len = 0;
             if (decrypt_video_frag(vc, rbuf, (size_t)n, dec_buf, &frag_len) != 0) {
                 continue;
+            }
+
+            /* Authenticated: drop replayed fragments before they reach the
+             * reassembler, where a repeated fragment would corrupt a frame. */
+            {
+                uint64_t be_seq_v;
+                memcpy(&be_seq_v, rbuf + 1, 8);
+                if (replay_accept(&vc->rx_video, ntohll_u64(be_seq_v)) != 0) continue;
             }
 
             /* Expire old incomplete frames */
@@ -1116,6 +1182,11 @@ static THREAD_RET th_recv_func(void *arg) {
         if (pkt_type == PKT_TYPE_STATS) {
             StatsPayload sp;
             if (decrypt_stats(vc, rbuf, (size_t)n, &sp) == 0) {
+                /* Authenticated: reject replays. Re-sent old measurements would
+                 * otherwise let an on-path attacker steer the quality controller. */
+                uint64_t be_seq_s;
+                memcpy(&be_seq_s, rbuf + 1, 8);
+                if (replay_accept(&vc->rx_stats, ntohll_u64(be_seq_s)) != 0) continue;
                 quality_record_peer_stats(&vc->quality, sp.packets_received, sp.packets_lost);
 
                 /* RTT: sp.rtt_ms = echo of our ping + hold time
