@@ -6,6 +6,14 @@
  * TCP connection. The bridge sees only ciphertext.
  *
  * Usage: PORT=3000 node server.js
+ *
+ * Security configuration (environment):
+ *   FEAR_ALLOWED_TARGETS   comma-separated "host:port" the bridge may dial.
+ *                          Default: 127.0.0.1:8888
+ *   FEAR_ALLOW_ANY_TARGET  set to "1" to disable the allowlist. LOCAL DEV ONLY -
+ *                          this re-enables the SSRF / open-proxy behaviour.
+ *   FEAR_ALLOWED_ORIGINS   comma-separated browser origins (host[:port]).
+ *                          Default: same-origin only.
  */
 
 const express = require('express');
@@ -16,9 +24,89 @@ const path = require('path');
 
 const app = express();
 const server = http.createServer(app);
-const wss = new WebSocketServer({ server });
+
+/* ---------------------------------------------------------------------------
+ * Security configuration
+ *
+ * The bridge used to open a TCP connection to any host:port a browser asked
+ * for, which turned a public deployment into an unauthenticated SSRF / open
+ * proxy: internal port scanning (distinguishable via `connected` vs `error`),
+ * cloud metadata at 169.254.169.254, and attacks sourced from this server's IP.
+ * Targets are now strictly allowlisted and upstream errors are not echoed back.
+ * ------------------------------------------------------------------------- */
+
+const ALLOWED_TARGETS = new Set(
+    (process.env.FEAR_ALLOWED_TARGETS || '127.0.0.1:8888')
+        .split(',').map(s => s.trim().toLowerCase()).filter(Boolean)
+);
+const ALLOW_ANY_TARGET = process.env.FEAR_ALLOW_ANY_TARGET === '1';
+
+const ALLOWED_ORIGINS = (process.env.FEAR_ALLOWED_ORIGINS || '')
+    .split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+
+const MAX_WS_PAYLOAD  = 1 * 1024 * 1024;   /* bytes per browser->bridge message */
+const MAX_TCP_BUFFER  = 2 * 1024 * 1024;   /* pending unparsed upstream bytes    */
+const MAX_FRAME_CLEN  = 1 * 1024 * 1024;   /* ciphertext length inside one frame */
+const MAX_CONN_PER_IP = 8;
+const TCP_CONNECT_MS  = 10000;
+
+/** Live WebSocket connections per client IP, for the per-IP cap. */
+const connectionsByIp = new Map();
+
+function targetAllowed(host, port) {
+    if (ALLOW_ANY_TARGET) return true;
+    return ALLOWED_TARGETS.has(`${String(host).trim().toLowerCase()}:${port}`);
+}
+
+/**
+ * WebSocket handshakes are not subject to the same-origin policy, so without
+ * this check any third-party site could drive the bridge from a visitor's
+ * browser. Non-browser clients send no Origin and are allowed through - this
+ * complements, and does not replace, the target allowlist above.
+ */
+function originAllowed(req) {
+    const origin = req.headers.origin;
+    if (!origin) return true;
+    let originHost;
+    try {
+        originHost = new URL(origin).host.toLowerCase();
+    } catch (e) {
+        return false;
+    }
+    if (ALLOWED_ORIGINS.length > 0) return ALLOWED_ORIGINS.includes(originHost);
+    return originHost === String(req.headers.host || '').toLowerCase();
+}
+
+/* Security headers. All crypto runs in this origin, so without a CSP a single
+ * XSS would exfiltrate the identity key and every room key. */
+app.use((req, res, next) => {
+    res.setHeader('Content-Security-Policy',
+        "default-src 'self'; script-src 'self'; style-src 'self'; " +
+        "img-src 'self' data:; connect-src 'self'; object-src 'none'; " +
+        "base-uri 'none'; frame-ancestors 'none'; form-action 'none'");
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('X-Frame-Options', 'DENY');
+    res.setHeader('Referrer-Policy', 'no-referrer');
+    res.setHeader('Permissions-Policy', 'geolocation=(), microphone=(), camera=()');
+    if (req.secure || req.headers['x-forwarded-proto'] === 'https') {
+        res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+    }
+    next();
+});
 
 app.use(express.static(path.join(__dirname, 'public')));
+
+const wss = new WebSocketServer({
+    server,
+    maxPayload: MAX_WS_PAYLOAD,
+    verifyClient: (info, cb) => {
+        if (!originAllowed(info.req)) {
+            console.warn(`[bridge] Rejected WS handshake from origin ${info.req.headers.origin}`);
+            return cb(false, 403, 'Forbidden origin');
+        }
+        cb(true);
+    },
+});
 
 /**
  * Parse one complete F.E.A.R. frame from a buffer.
@@ -61,7 +149,7 @@ function tryParseFrame(buf, offset, length) {
     const clen = buf[pos] | (buf[pos + 1] << 8) | (buf[pos + 2] << 16) | ((buf[pos + 3] << 24) >>> 0);
     pos += 4;
 
-    if (clen > 10 * 1024 * 1024) return { error: 'frame too large' };
+    if (clen > MAX_FRAME_CLEN) return { error: 'frame too large' };
     if (pos + clen > end) return null;
     pos += clen;
 
@@ -73,11 +161,30 @@ function tryParseFrame(buf, offset, length) {
 
 wss.on('connection', (ws, req) => {
     const clientIP = req.socket.remoteAddress;
-    console.log(`[bridge] WS client connected from ${clientIP}`);
+
+    const ipCount = (connectionsByIp.get(clientIP) || 0) + 1;
+    if (ipCount > MAX_CONN_PER_IP) {
+        console.warn(`[bridge] Connection cap reached for ${clientIP}`);
+        ws.close(1013, 'Too many connections');
+        return;
+    }
+    connectionsByIp.set(clientIP, ipCount);
+
+    console.log(`[bridge] WS client connected from ${clientIP} (${ipCount} open)`);
 
     let tcpSocket = null;
     let tcpBuffer = Buffer.alloc(0);
     let connected = false;
+
+    /* 'error' is normally followed by 'close', so guard against double-release. */
+    let ipReleased = false;
+    const releaseIp = () => {
+        if (ipReleased) return;
+        ipReleased = true;
+        const n = (connectionsByIp.get(clientIP) || 1) - 1;
+        if (n > 0) connectionsByIp.set(clientIP, n);
+        else connectionsByIp.delete(clientIP);
+    };
 
     ws.on('message', (data, isBinary) => {
         // First message must be JSON connect command
@@ -96,11 +203,27 @@ wss.on('connection', (ws, req) => {
                     return;
                 }
 
+                if (!targetAllowed(host, port)) {
+                    console.warn(`[bridge] BLOCKED target ${host}:${port} requested by ${clientIP}`);
+                    ws.send(JSON.stringify({ type: 'error', message: 'Target not allowed' }));
+                    ws.close();
+                    return;
+                }
+
                 console.log(`[bridge] Connecting TCP to ${host}:${port} for ${clientIP}`);
 
                 tcpSocket = new net.Socket();
+                tcpSocket.setTimeout(TCP_CONNECT_MS);
+                tcpSocket.on('timeout', () => {
+                    if (!connected) {
+                        console.warn(`[bridge] TCP connect timed out for ${clientIP}`);
+                        tcpSocket.destroy();
+                    }
+                });
+
                 tcpSocket.connect(port, host, () => {
                     connected = true;
+                    tcpSocket.setTimeout(0);   /* only bound the connect phase */
                     console.log(`[bridge] TCP connected to ${host}:${port}`);
                     ws.send(JSON.stringify({ type: 'connected' }));
                 });
@@ -108,6 +231,13 @@ wss.on('connection', (ws, req) => {
                 tcpSocket.on('data', (chunk) => {
                     // Buffer TCP data and extract complete frames
                     tcpBuffer = Buffer.concat([tcpBuffer, chunk]);
+
+                    if (tcpBuffer.length > MAX_TCP_BUFFER) {
+                        console.error(`[bridge] Upstream buffer limit exceeded for ${clientIP}`);
+                        tcpSocket.destroy();
+                        if (ws.readyState === 1) ws.close();
+                        return;
+                    }
 
                     while (tcpBuffer.length > 0) {
                         const result = tryParseFrame(tcpBuffer, 0, tcpBuffer.length);
@@ -126,9 +256,12 @@ wss.on('connection', (ws, req) => {
                 });
 
                 tcpSocket.on('error', (err) => {
+                    /* Logged locally only: echoing err.message back to the browser
+                     * turned the bridge into a precise open/closed/filtered oracle
+                     * for internal hosts. */
                     console.error(`[bridge] TCP error: ${err.message}`);
                     if (ws.readyState === 1) {
-                        ws.send(JSON.stringify({ type: 'error', message: `TCP error: ${err.message}` }));
+                        ws.send(JSON.stringify({ type: 'error', message: 'Upstream connection failed' }));
                     }
                 });
 
@@ -156,6 +289,7 @@ wss.on('connection', (ws, req) => {
 
     ws.on('close', () => {
         console.log(`[bridge] WS closed for ${clientIP}`);
+        releaseIp();
         if (tcpSocket && !tcpSocket.destroyed) {
             tcpSocket.destroy();
         }
@@ -163,6 +297,7 @@ wss.on('connection', (ws, req) => {
 
     ws.on('error', (err) => {
         console.error(`[bridge] WS error: ${err.message}`);
+        releaseIp();
         if (tcpSocket && !tcpSocket.destroyed) {
             tcpSocket.destroy();
         }
@@ -173,4 +308,10 @@ const PORT = process.env.PORT || 3000;
 server.listen(PORT, '0.0.0.0', () => {
     console.log(`[bridge] F.E.A.R. Web Bridge listening on port ${PORT}`);
     console.log(`[bridge] Open http://localhost:${PORT} in your browser`);
+    if (ALLOW_ANY_TARGET) {
+        console.warn('[bridge] WARNING: FEAR_ALLOW_ANY_TARGET=1 - target allowlist disabled (SSRF risk).');
+    } else {
+        console.log(`[bridge] Allowed targets: ${[...ALLOWED_TARGETS].join(', ')}`);
+    }
+    console.log(`[bridge] Allowed origins: ${ALLOWED_ORIGINS.length ? ALLOWED_ORIGINS.join(', ') : 'same-origin only'}`);
 });
