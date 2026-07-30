@@ -72,25 +72,9 @@ bool Backend::connectToServer(const QString &host, int port, const QString &room
     }
 
     // Check if executable exists
-    if (cliPath.isEmpty() || !QFile::exists(cliPath)) {
-        /* Anchored to the application directory, never to the working directory:
-         * "./bin/fear" would run whatever binary happens to sit under the
-         * directory the GUI was started from. */
-        const QString appDir = QGuiApplication::applicationDirPath();
-#ifdef Q_OS_WIN
-        QString defaultPath = appDir + "/bin/fear.exe";
-        if (!QFile::exists(defaultPath)) {
-            emit error("CLI executable not found. Please set the correct path to fear.exe");
-            return false;
-        }
-#else
-        QString defaultPath = appDir + "/bin/fear";
-        if (!QFile::exists(defaultPath)) {
-            emit error("CLI executable not found. Please set the correct path to fear");
-            return false;
-        }
-#endif
-        cliPath = defaultPath;
+    if (!resolveCliPath()) {
+        emit error("CLI executable not found. Please set the correct path in Settings.");
+        return false;
     }
 
     clientProc = new QProcess(this);
@@ -456,8 +440,24 @@ void Backend::onServerFinished(int exitCode, QProcess::ExitStatus status) {
     emit newMessages(QStringList() << "[server] stopped");
 }
 
-bool Backend::generateIdentity() {
-    if (cliPath.isEmpty() || !QFile::exists(cliPath)) {
+bool Backend::resolveCliPath() {
+    if (!cliPath.isEmpty() && QFile::exists(cliPath)) return true;
+    /* Anchored to the application directory, never to the working directory:
+     * "./bin/fear" would run whatever binary happens to sit under the
+     * directory the GUI was started from. */
+    const QString appDir = QGuiApplication::applicationDirPath();
+#ifdef Q_OS_WIN
+    const QString defaultPath = appDir + "/bin/fear.exe";
+#else
+    const QString defaultPath = appDir + "/bin/fear";
+#endif
+    if (!QFile::exists(defaultPath)) return false;
+    cliPath = defaultPath;
+    return true;
+}
+
+bool Backend::generateIdentity(bool copyToClipboard) {
+    if (!resolveCliPath()) {
         emit error("CLI executable not found");
         return false;
     }
@@ -488,7 +488,7 @@ bool Backend::generateIdentity() {
 
     // Read public key from stdout
     QString pubKey = QString::fromUtf8(p.readAllStandardOutput()).trimmed();
-    if (!pubKey.isEmpty()) {
+    if (!pubKey.isEmpty() && copyToClipboard) {
         QGuiApplication::clipboard()->setText(pubKey);
     }
 

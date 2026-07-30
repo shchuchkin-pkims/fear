@@ -95,6 +95,13 @@ ChatWindow::ChatWindow(QWidget *parent) : QMainWindow(parent) {
     m_history = new History(this);
     m_profile = new ProfileSettings(this);
 
+    /* Onboarding (audit 2026-07, UX-High): every server flow - registration,
+     * ECDH, contacts sync - needs an identity, but a fresh install has none
+     * and this window only offered Import. Create one silently on first run;
+     * the key can be backed up later via "Export identity". */
+    if (!m_backend->hasIdentity())
+        m_backend->generateIdentity(/*copyToClipboard=*/false);
+
     // Backend → UI
     connect(m_backend, &Backend::connected,         this, &ChatWindow::handleConnected);
     connect(m_backend, &Backend::disconnected,      this, &ChatWindow::handleDisconnected);
@@ -373,6 +380,11 @@ void ChatWindow::onSidebarMenu(const QPoint &globalPos) {
     menu.addSeparator();
     QAction *exportIdAct   = menu.addAction(tr("Export identity…"));
     QAction *importIdAct   = menu.addAction(tr("Import identity…"));
+    /* Normally the identity is auto-created on first run; this entry only
+     * appears if the key file went missing (deleted or moved by hand). */
+    QAction *createIdAct   = nullptr;
+    if (!m_backend->hasIdentity())
+        createIdAct = menu.addAction(tr("Create identity"));
     menu.addSeparator();
     /* Search messages / clear chat history относятся к текущему чату и
      * вызываются из меню «⋮» в шапке ChatArea — здесь больше не дублируются. */
@@ -394,6 +406,11 @@ void ChatWindow::onSidebarMenu(const QPoint &globalPos) {
     else if (picked == trustedAct)    openTrustedKeys();
     else if (picked == exportIdAct)   openIdentityBackup(/*export=*/true);
     else if (picked == importIdAct)   openIdentityBackup(/*export=*/false);
+    else if (createIdAct && picked == createIdAct) {
+        if (m_backend->generateIdentity())
+            QMessageBox::information(this, tr("Identity"),
+                tr("New identity created. Its public key was copied to the clipboard."));
+    }
     else if (picked == updateAct)     checkForUpdates(/*silent=*/false);
     else if (picked == aboutAct)      showAbout();
     else if (picked == quitAct)       close();

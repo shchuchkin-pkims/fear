@@ -348,7 +348,7 @@ void ConnectionDialog::setRegistrationStatus(RegStatus st, const QString &handle
             break;
         case RegError:
             m_statusLabel->setText(tr("Cannot reach the server to verify registration. "
-                                      "Connect button stays disabled until we know."));
+                                      "You can still try to connect."));
             m_statusLabel->setStyleSheet(QStringLiteral("color: #ef6c00;"));
             break;
         case RegUnknown:
@@ -361,7 +361,10 @@ void ConnectionDialog::setRegistrationStatus(RegStatus st, const QString &handle
 }
 
 void ConnectionDialog::refreshButtons() {
-    const bool canConnect  = (m_regStatus == RegYes);
+    /* Audit 2026-07 (UX-High): Connect must not hard-lock on an inconclusive
+     * probe. Only a definite "not registered" keeps it disabled - in every
+     * other state the server itself is the authority and will answer. */
+    const bool canConnect  = (m_regStatus != RegNo);
     const bool canRegister = (m_regStatus == RegNo);
     m_connectBtn->setEnabled(canConnect);
     m_registerBtn->setEnabled(canRegister);

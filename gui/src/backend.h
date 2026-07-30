@@ -146,7 +146,7 @@ public:
      * @brief Generates a new Ed25519 identity keypair
      * @return true if identity generated successfully
      */
-    bool generateIdentity();
+    bool generateIdentity(bool copyToClipboard = true);
 
     /**
      * @brief Check if identity key is available
@@ -236,6 +236,15 @@ private slots:
     void onServerFinished(int exitCode, QProcess::ExitStatus status);
 
 private:
+    /**
+     * @brief Ensure cliPath points at an existing binary.
+     *
+     * Falls back to <applicationDirPath>/bin/fear(.exe) when the configured
+     * path is empty or stale. Never resolves against the working directory.
+     * @return true if cliPath is usable after the call
+     */
+    bool resolveCliPath();
+
     /**
      * @brief Parses client output for messages and status updates
      * @param s Output string from client
