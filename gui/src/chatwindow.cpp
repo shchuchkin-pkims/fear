@@ -174,20 +174,24 @@ void ChatWindow::requestConnect() {
         m_backend->disconnect();
     }
 
+    /* Validation loop on one dialog instance: re-exec keeps whatever the
+     * user already typed. The old flow re-created the dialog via a queued
+     * requestConnect(), wiping the fields on every mistake (audit UX). */
     ConnectionDialog dlg(m_profile, m_backend->identityFilePath, this);
-    if (dlg.exec() != QDialog::Accepted) return;
+    for (;;) {
+        if (dlg.exec() != QDialog::Accepted) return;
 
-    if (dlg.host().isEmpty() || dlg.room().isEmpty() || dlg.name().isEmpty()) {
-        QMessageBox::warning(this, tr("Connect"),
-            tr("Server, room and name are required."));
-        QTimer::singleShot(0, this, &ChatWindow::requestConnect);
-        return;
-    }
-    if (dlg.mode() == Backend::MANUAL_KEY && dlg.key().isEmpty()) {
-        QMessageBox::warning(this, tr("Connect"),
-            tr("Room key is required for the “Use key” mode."));
-        QTimer::singleShot(0, this, &ChatWindow::requestConnect);
-        return;
+        if (dlg.host().isEmpty() || dlg.room().isEmpty() || dlg.name().isEmpty()) {
+            QMessageBox::warning(this, tr("Connect"),
+                tr("Server, room and name are required."));
+            continue;
+        }
+        if (dlg.mode() == Backend::MANUAL_KEY && dlg.key().isEmpty()) {
+            QMessageBox::warning(this, tr("Connect"),
+                tr("Room key is required for the “Use key” mode."));
+            continue;
+        }
+        break;
     }
 
     dlg.saveToSettings();

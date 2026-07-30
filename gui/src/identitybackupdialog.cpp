@@ -171,8 +171,10 @@ void IdentityBackupDialog::onAccept()
         m_status->setText(tr("Passwords do not match."));
         return;
     }
-    if (m_password->text().size() < 6) {
-        m_status->setText(tr("Password is too short (minimum 6 characters)."));
+    /* The backup file protects the long-term identity key; Argon2id slows
+     * brute force but cannot save a 6-character password (audit UX). */
+    if (m_password->text().size() < 12) {
+        m_status->setText(tr("Password is too short (minimum 12 characters)."));
         return;
     }
 
