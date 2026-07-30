@@ -135,6 +135,25 @@ For detailed usage see [Quick Start Guide](doc/QUICKSTART.md) and [User Manual](
 4. Room key is transported via `crypto_box` (X25519 + XSalsa20-Poly1305)
 5. Both parties derive the same room key without pre-shared secrets
 
+### Data Storage
+
+Where your data lives - the server knows as little as possible:
+
+| Data | Where | Details |
+|------|-------|---------|
+| Message history | **Client only** | Desktop: SQLite, Android: Room. 10 MB FIFO per chat, "Clear history" button in every chat |
+| Contact list | Client + server (encrypted blob) | Encrypted locally with a key derived from your identity key (HKDF). The server stores only ciphertext, its size and update time |
+| Identity keys | **Client only** | Desktop: encrypted at rest in `.fear/identity/`. Android: Keystore-backed EncryptedFile |
+| Identity backup | Manual, user-initiated | Encrypted `.fbk` file (Argon2id + AES-256-GCM) or QR code. No server-side backup by design |
+| Room keys, trusted peers (TOFU) | **Client only** | Never sent to the server |
+| Server database | Server (SQLite in a Docker volume) | Handles (`@username` - public key), encrypted user blobs, room routing state. No plaintext, ever |
+
+Notes:
+
+- The server does **not** store message content: messages are relayed to currently online participants only. Offline delivery (an encrypted server-side inbox, deleted after ACK) is planned for a later phase - see the [roadmap](doc/TODO.md).
+- New room members cannot read messages sent before they joined (Signal-style model). If needed, history can be shared explicitly via export/import.
+- Losing your device without a backup means losing your identity and history - export an encrypted backup from Settings.
+
 ## Project Structure
 
 ```
@@ -206,7 +225,7 @@ build/
 - [Code Structure](doc/CODE_STRUCTURE.md)
 - [User Manual](doc/manual.md)
 - [Roadmap](doc/TODO.md)
-- [Security Audit](SECURITY_AUDIT.md)
+- [Security Audit](doc/SECURITY_AUDIT_2026-07.md)
 
 ## Mobile App
 
