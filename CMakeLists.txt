@@ -99,6 +99,13 @@ if(NOT FEAR_GUI_ONLY)
     add_subdirectory(video_call)
 endif()
 
+# Юнит-тесты (ctest). Отключаются -DFEAR_BUILD_TESTS=OFF.
+option(FEAR_BUILD_TESTS "Build unit tests" ON)
+if(FEAR_BUILD_TESTS)
+    enable_testing()
+    add_subdirectory(tests)
+endif()
+
 # Создание пользовательских целей для удобства
 if(NOT FEAR_GUI_ONLY)
     add_custom_target(build-all

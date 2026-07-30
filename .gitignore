@@ -46,3 +46,4 @@ updater/cmake_install.cmake
 web/node_modules/
 fear-server.sqlite*
 .claude/
+build-tests/
