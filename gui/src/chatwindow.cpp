@@ -316,6 +316,54 @@ void ChatWindow::handleError(const QString &err) {
     m_chatArea->appendMessage(m);
 }
 
+void ChatWindow::promptKeyChanged(const QString &peer, const QString &fp) {
+    // Always leave a visible trace in the chat view.
+    Message note;
+    note.text      = tr("⚠ Identity key for %1 has CHANGED (fingerprint %2). "
+                        "Messages from this peer are marked [!] until you decide.")
+                         .arg(peer, fp);
+    note.timestamp = QDateTime::currentDateTime();
+    note.isSystem  = true;
+    m_chatArea->appendMessage(note);
+
+    // But interrupt the user only once per (peer, fingerprint) per session.
+    const QString sig = peer + QLatin1Char('/') + fp;
+    if (m_keyChangePrompted.contains(sig)) return;
+    m_keyChangePrompted.insert(sig);
+
+    QMessageBox box(this);
+    box.setIcon(QMessageBox::Warning);
+    box.setWindowTitle(tr("Key changed - possible MITM"));
+    box.setText(tr("The identity key of \"%1\" differs from the one you trusted before.")
+                    .arg(peer));
+    box.setInformativeText(tr(
+        "New fingerprint: %1\n\n"
+        "A legitimate reinstall or identity restore looks like this - but so does "
+        "an attacker in the middle. Verify the fingerprint with %2 over another "
+        "channel (call, in person) before trusting the new key.")
+        .arg(fp, peer));
+    QPushButton *trustBtn = box.addButton(tr("Trust new key"), QMessageBox::DestructiveRole);
+    box.addButton(tr("Keep distrusting"), QMessageBox::RejectRole);
+    box.setDefaultButton(QMessageBox::NoButton);
+    box.exec();
+
+    if (box.clickedButton() == trustBtn) {
+        char kkpath[512];
+        if (identity_default_known_keys_path(kkpath, sizeof kkpath) == 0 &&
+            identity_remove_key(kkpath, peer.toUtf8().constData()) == 0) {
+            Message ok;
+            ok.text      = tr("Old key for %1 removed. The next signed message "
+                              "will pin the new key (TOFU).").arg(peer);
+            ok.timestamp = QDateTime::currentDateTime();
+            ok.isSystem  = true;
+            m_chatArea->appendMessage(ok);
+        } else {
+            QMessageBox::warning(this, tr("Trusted keys"),
+                tr("Could not update the trusted keys database."));
+        }
+    }
+}
+
 void ChatWindow::appendParsedLine(const QString &line) {
     // File-transfer progress from the CLI ("Progress: 123/4567 bytes (2.7%)").
     // Shown transiently in the status bar: as chat messages it would flood
@@ -324,6 +372,16 @@ void ChatWindow::appendParsedLine(const QString &line) {
         R"(^\s*Progress:\s*\d+/\d+ bytes \(([\d.]+)%\))");
     if (auto pm = progressRe.match(line); pm.hasMatch()) {
         statusBar()->showMessage(tr("File transfer: %1%").arg(pm.captured(1)), 3000);
+        return;
+    }
+
+    // MITM guard: '[WARNING] KEY CHANGED for "alice"! Fingerprint: ab12…'
+    // The CLI keeps delivering such messages tagged [!]; the modal prompt is
+    // the blocking action the plain chat line never provided (audit UX).
+    static const QRegularExpression keyChangedRe(
+        R"(^\s*\[WARNING\] KEY CHANGED for \"(.+?)\"! Fingerprint:\s*(\S+))");
+    if (auto km = keyChangedRe.match(line); km.hasMatch()) {
+        promptKeyChanged(km.captured(1), km.captured(2));
         return;
     }
 

@@ -83,6 +83,10 @@ private:
     QDateTime  m_connectStarted;
     QSet<QString> m_seenPeers;        // unique non-self senders heard from
     int           m_reportedCount = 0; // last count from server [USERS] broadcast
+    QSet<QString> m_keyChangePrompted; // "(peer)/(fp)" pairs already raised modally
+
+    /** Modal MITM prompt for a changed peer identity key (audit UX). */
+    void promptKeyChanged(const QString &peer, const QString &fp);
 };
 
 }
