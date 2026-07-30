@@ -27,11 +27,31 @@
 #include <sodium.h>
 #ifdef _WIN32
 #include <windows.h>
+#include <io.h>          /* _isatty, _fileno */
 #else
 #include <sys/select.h>
 #include <errno.h>
 #include <pthread.h>
+#include <unistd.h>      /* isatty */
 #endif
+
+/**
+ * Line ending for file-transfer progress output.
+ *
+ * '\r' keeps the classic single-line live progress in a terminal. When
+ * stdout is a pipe (the GUI wraps this CLI and reads line by line), every
+ * update must be a complete '\n'-terminated line or the reader never sees
+ * the progress at all and the transfer looks hung.
+ */
+static char progress_eol(void) {
+    static int tty = -1;
+#ifdef _WIN32
+    if (tty < 0) tty = _isatty(_fileno(stdout));
+#else
+    if (tty < 0) tty = isatty(fileno(stdout));
+#endif
+    return tty ? '\r' : '\n';
+}
 
 #ifdef _WIN32
 #include <direct.h>
@@ -614,8 +634,8 @@ void handle_file_transfer(const char *filename, const uint8_t key[32],
         }
 
         offset += chunk_size;
-        printf("Progress: %zu/%zu bytes (%.1f%%)\r", offset, file_size,
-               (float)offset/file_size*100);
+        printf("Progress: %zu/%zu bytes (%.1f%%)%c", offset, file_size,
+               (float)offset/file_size*100, progress_eol());
         fflush(stdout);
     }
 
@@ -661,9 +681,10 @@ void receive_file(const char *temp_path, size_t total_size,
             }
         }
 
-        printf("Progress: %zu/%zu bytes (%.1f%%)\r",
+        printf("Progress: %zu/%zu bytes (%.1f%%)%c",
                current_transfer.received, current_transfer.total_size,
-               (float)current_transfer.received/current_transfer.total_size*100);
+               (float)current_transfer.received/current_transfer.total_size*100,
+               progress_eol());
         fflush(stdout);
 
         if (current_transfer.received >= current_transfer.total_size) {

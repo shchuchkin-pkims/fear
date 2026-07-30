@@ -154,9 +154,10 @@ bool Backend::connectToServer(const QString &host, int port, const QString &room
     currentRoom = room;
     currentName = name;
 
-    // Consider connection successful after process starts
-    isConnected = true;
-    emit connected();
+    /* Audit 2026-07 (UX): "connected" used to fire here, right after the
+     * process started and before any TCP handshake, so failures looked like
+     * successful connects. parseClientOutput() now flips the state when the
+     * CLI prints its definite "[client] connected to ..." line. */
     return true;
 }
 
@@ -167,22 +168,11 @@ bool Backend::createServer(int port, const QString &name) {
         return false;
     }
 
-    // Check if executable exists
-    if (cliPath.isEmpty() || !QFile::exists(cliPath)) {
-#ifdef Q_OS_WIN
-        QString defaultPath = "fear.exe";
-        if (!QFile::exists(defaultPath)) {
-            emit error("CLI executable not found. Please set the correct path to fear.exe");
-            return false;
-        }
-#else
-        QString defaultPath = "fear";
-        if (!QFile::exists(defaultPath)) {
-            emit error("CLI executable not found. Please set the correct path to fear");
-            return false;
-        }
-#endif
-        cliPath = defaultPath;
+    /* Same anchored lookup as connectToServer - the old fallback here
+     * resolved a bare "fear" against the working directory (M23-style). */
+    if (!resolveCliPath()) {
+        emit error("CLI executable not found. Please set the correct path in Settings.");
+        return false;
     }
 
     serverProc = new QProcess(this);
@@ -521,6 +511,13 @@ void Backend::parseClientOutput(const QString &s) {
     for (const QString &l : lines) {
         QString t = l.trimmed();
         if (t.isEmpty()) continue;
+
+        // The real connection status comes from the CLI, not from the mere
+        // start of its process.
+        if (!isConnected && t.startsWith("[client] connected to")) {
+            isConnected = true;
+            emit connected();
+        }
 
         // Capture room key from CLI output (CREATE or JOIN mode)
         // [create] Room key generated: <b64>

@@ -38,6 +38,7 @@ extern "C" {
 #include <QTimer>
 #include <QRegularExpression>
 #include <QMessageBox>
+#include <QStatusBar>
 #include <QMenu>
 #include <QInputDialog>
 #include <QFileDialog>
@@ -316,6 +317,16 @@ void ChatWindow::handleError(const QString &err) {
 }
 
 void ChatWindow::appendParsedLine(const QString &line) {
+    // File-transfer progress from the CLI ("Progress: 123/4567 bytes (2.7%)").
+    // Shown transiently in the status bar: as chat messages it would flood
+    // the view, and dropping it entirely made transfers look hung (audit UX).
+    static const QRegularExpression progressRe(
+        R"(^\s*Progress:\s*\d+/\d+ bytes \(([\d.]+)%\))");
+    if (auto pm = progressRe.match(line); pm.hasMatch()) {
+        statusBar()->showMessage(tr("File transfer: %1%").arg(pm.captured(1)), 3000);
+        return;
+    }
+
     // Inbound file offer: "[FILE_OFFER] sender wants to send "name" (size). Type /accept [path] or /reject"
     // The CLI appends usage hint after `(size)`, so we don't anchor to end-of-line.
     static const QRegularExpression fileOfferRe(
