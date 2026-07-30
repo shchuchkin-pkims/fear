@@ -143,7 +143,7 @@ Where your data lives - the server knows as little as possible:
 |------|-------|---------|
 | Message history | **Client only** | Desktop: SQLite, Android: Room. 10 MB FIFO per chat, "Clear history" button in every chat |
 | Contact list | Client + server (encrypted blob) | Encrypted locally with a key derived from your identity key (HKDF). The server stores only ciphertext, its size and update time |
-| Identity keys | **Client only** | Desktop: encrypted at rest in `.fear/identity/`. Android: Keystore-backed EncryptedFile |
+| Identity keys | **Client only** | Desktop: `~/.fear/identity`, file permissions 0600 (OS keychain / DPAPI integration planned). Android: Keystore-backed EncryptedFile |
 | Identity backup | Manual, user-initiated | Encrypted `.fbk` file (Argon2id + AES-256-GCM) or QR code. No server-side backup by design |
 | Room keys, trusted peers (TOFU) | **Client only** | Never sent to the server |
 | Server database | Server (SQLite in a Docker volume) | Handles (`@username` - public key), encrypted user blobs, room routing state. No plaintext, ever |
