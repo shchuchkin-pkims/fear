@@ -47,6 +47,8 @@ typedef int sock_t;
 #define MT_BLOB_GET              24
 #define MT_BLOB_RESULT           25
 #define MT_LOOKUP_HANDLE_BY_PK   26
+#define MT_BLOB_GET_CHALLENGE    30
+#define MT_BLOB_CHALLENGE_RESULT 31
 
 /* ===== little-endian primitives ===== */
 static void wr_u16(uint8_t *p, uint16_t v) { p[0]=(uint8_t)v; p[1]=(uint8_t)(v>>8); }
@@ -343,22 +345,48 @@ sp_status_t sp_blob_put(const char *host, uint16_t port,
 }
 
 sp_status_t sp_blob_get(const char *host, uint16_t port,
-                        const uint8_t pk[32], const char *type,
+                        const uint8_t pk[32], const uint8_t sk[64],
+                        const char *type,
                         uint8_t **out, size_t *out_len) {
-    if (!host || !pk || !type || !out || !out_len) return SP_INVALID;
+    if (!host || !pk || !sk || !type || !out || !out_len) return SP_INVALID;
     *out = NULL; *out_len = 0;
     size_t tlen = strlen(type);
     if (tlen < 1 || tlen > 255) return SP_INVALID;
 
-    /* payload: [pk(32)][type_len(1)][type] */
-    uint8_t payload[32 + 1 + 256];
-    memcpy(payload, pk, 32);
-    payload[32] = (uint8_t)tlen;
-    memcpy(payload + 33, type, tlen);
-
     sock_t s = connect_tcp(host, port);
     if (s < 0) return SP_NETWORK_ERROR;
-    if (send_frame(s, MT_BLOB_GET, payload, (uint32_t)(33 + tlen)) < 0) {
+
+    /* Round 1: fetch the one-shot challenge bound to this connection (M10). */
+    if (send_frame(s, MT_BLOB_GET_CHALLENGE, NULL, 0) < 0) {
+        close_socket(s); return SP_NETWORK_ERROR;
+    }
+    uint8_t ch_type;
+    uint8_t *ch = NULL; uint32_t ch_len = 0;
+    if (recv_frame(s, &ch_type, &ch, &ch_len) < 0) {
+        close_socket(s); return SP_NETWORK_ERROR;
+    }
+    if (ch_type != MT_BLOB_CHALLENGE_RESULT || ch_len != 32) {
+        free(ch); close_socket(s); return SP_BAD_REPLY;
+    }
+
+    /* Round 2: sig over (challenge || type) proves we own pk's secret key. */
+    uint8_t signed_buf[32 + 256];
+    memcpy(signed_buf, ch, 32);
+    memcpy(signed_buf + 32, type, tlen);
+    free(ch);
+    uint8_t sig[64];
+    if (identity_sign(signed_buf, 32 + tlen, sk, sig) != 0) {
+        close_socket(s); return SP_SERVER_ERROR;
+    }
+
+    /* payload: [pk(32)][sig(64)][type_len(1)][type] */
+    uint8_t payload[32 + 64 + 1 + 256];
+    memcpy(payload, pk, 32);
+    memcpy(payload + 32, sig, 64);
+    payload[96] = (uint8_t)tlen;
+    memcpy(payload + 97, type, tlen);
+
+    if (send_frame(s, MT_BLOB_GET, payload, (uint32_t)(97 + tlen)) < 0) {
         close_socket(s); return SP_NETWORK_ERROR;
     }
     uint8_t reply_type;

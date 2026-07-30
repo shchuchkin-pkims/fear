@@ -90,7 +90,7 @@ void ContactsDialog::refreshFromServer() {
     uint8_t *blob = nullptr;
     size_t   blob_len = 0;
     sp_status_t st = sp_blob_get(m_serverHost.toUtf8().constData(),
-                                 m_serverPort, pk,
+                                 m_serverPort, pk, sk,
                                  CONTACTS_CIPHER_BLOB_TYPE, &blob, &blob_len);
     m_refreshBtn->setEnabled(true);
     if (st == SP_NOT_FOUND) {
@@ -172,7 +172,7 @@ void ContactsDialog::addContact() {
 
     uint8_t *blob = nullptr; size_t blob_len = 0;
     sp_status_t gst = sp_blob_get(m_serverHost.toUtf8().constData(),
-                                  m_serverPort, pk,
+                                  m_serverPort, pk, sk,
                                   CONTACTS_CIPHER_BLOB_TYPE, &blob, &blob_len);
 
     QJsonArray arr;

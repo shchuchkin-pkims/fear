@@ -73,9 +73,14 @@ sp_status_t sp_blob_put(const char *host, uint16_t port,
 /**
  * Read the blob at slot `(pk, type)`. On SP_OK, `*out` is malloc'd and
  * the caller must free it. Sets `*out_len` accordingly.
+ *
+ * Reads are owner-only (M10): the server hands out a one-shot challenge
+ * on the connection and expects Ed25519(challenge || type) under `sk`,
+ * so `sk` must be the secret key matching `pk`.
  */
 sp_status_t sp_blob_get(const char *host, uint16_t port,
-                        const uint8_t pk[32], const char *type,
+                        const uint8_t pk[32], const uint8_t sk[64],
+                        const char *type,
                         uint8_t **out, size_t *out_len);
 
 #ifdef __cplusplus

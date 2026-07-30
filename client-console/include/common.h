@@ -90,9 +90,13 @@ typedef enum {
                                           sig is Ed25519(type || cipher) — proves owner of pk.
                                           Server replies with BLOB_RESULT (no payload-cipher field). */
     MSG_TYPE_BLOB_GET         = 24, /**< Client → Server: read a blob.
-                                          Payload: [pk(32)][type_len(1)][type].
-                                          No signature — blobs are encrypted client-side, server
-                                          can't decrypt anyway. Server replies with BLOB_RESULT
+                                          Payload: [pk(32)][sig(64)][type_len(1)][type].
+                                          sig is Ed25519(challenge || type) under pk's secret
+                                          key, where challenge was obtained on this connection
+                                          via BLOB_GET_CHALLENGE. Only the blob owner can read
+                                          it (M10): even though blobs are encrypted client-side,
+                                          unauthorized reads leak ciphertext and act as a
+                                          presence oracle. Server replies with BLOB_RESULT
                                           (with payload-cipher when found). */
     MSG_TYPE_BLOB_RESULT      = 25, /**< Server → Client.
                                           Payload: [status(1)][reason_len(1)][reason][cipher_len(4)][cipher].
@@ -124,6 +128,15 @@ typedef enum {
                                           last_seen and does not reply. Sent ~every 60s when
                                           the client is otherwise silent so the server's idle
                                           scan doesn't kick the connection. */
+    /* ===== M10 (audit 2026-07): authorized blob reads ===== */
+    MSG_TYPE_BLOB_GET_CHALLENGE = 30, /**< Client → Server: request a one-shot nonce that
+                                          authorizes a single BLOB_GET on this connection.
+                                          Empty payload. Server replies with
+                                          BLOB_CHALLENGE_RESULT. */
+    MSG_TYPE_BLOB_CHALLENGE_RESULT = 31, /**< Server → Client: [challenge(32)]. The nonce is
+                                          random, bound to the connection and consumed by the
+                                          next BLOB_GET (whether the signature verifies or
+                                          not). */
 } message_type_t;
 
 /* ===== Cryptographic Constants ===== */

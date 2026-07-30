@@ -41,3 +41,19 @@ add_fear_test(test_contacts test_contacts.c ${IDENTITY_DIR}/contacts_cipher.c)
 add_test(NAME integration_smoke
          COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/smoke_chat.sh $<TARGET_FILE:fear>)
 set_tests_properties(integration_smoke PROPERTIES TIMEOUT 60)
+
+# Протокольный тест M10: BLOB_GET доступен только владельцу pk (подписанный
+# challenge). Бинарь ходит на живой сервер через реальные sp_*-функции;
+# сервер поднимает обёртка blob_auth.sh.
+add_executable(test_blob_auth test_blob_auth.c
+    ${IDENTITY_DIR}/identity.c
+    ${IDENTITY_DIR}/server_proto.c)
+target_include_directories(test_blob_auth PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${IDENTITY_DIR}
+    ${TEST_SODIUM_INCLUDE})
+target_link_libraries(test_blob_auth PRIVATE ${TEST_SODIUM_LIBS})
+add_test(NAME blob_auth
+         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/blob_auth.sh
+                 $<TARGET_FILE:fear> $<TARGET_FILE:test_blob_auth>)
+set_tests_properties(blob_auth PROPERTIES TIMEOUT 60)

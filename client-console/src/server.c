@@ -48,6 +48,8 @@ typedef struct {
     struct sockaddr_in udp_addr; /**< UDP address for relay */
     int udp_registered;     /**< Whether UDP relay address is set */
     int is_media_relay;     /**< Whether this is a media relay connection (allows duplicate name) */
+    uint8_t blob_challenge[32]; /**< One-shot nonce for BLOB_GET authorization (M10) */
+    int blob_challenge_set; /**< Whether blob_challenge holds a fresh unconsumed nonce */
     time_t last_seen;       /**< Wall-clock time of the last frame received from this client.
                                   Updated on accept and on every successful read_frame. The
                                   idle scan in the main loop closes connections with
@@ -330,9 +332,10 @@ static void send_user_list(client_t *clients, int nclients, const char *room) {
  *
  * Payload layout: [status(1)][reason_len(1)][reason][optional pk(0 or 32)]
  */
-static void send_handle_result(sock_t fd, const char *room, uint16_t room_len,
-                               uint8_t status, const char *reason,
-                               const uint8_t *pk_or_null) {
+static void send_result_frame(sock_t fd, const char *room, uint16_t room_len,
+                              uint8_t msg_type,
+                              uint8_t status, const char *reason,
+                              const uint8_t *pk_or_null) {
     uint8_t  payload[256];
     size_t   payload_len = 0;
     payload[payload_len++] = status;
@@ -365,12 +368,29 @@ static void send_handle_result(sock_t fd, const char *room, uint16_t room_len,
     memcpy(w, kSrvName, name_len);  w += name_len;
     wr_u16(w, CRYPTO_NPUBBYTES);    w += 2;
     memcpy(w, nonce, CRYPTO_NPUBBYTES); w += CRYPTO_NPUBBYTES;
-    *w++ = (uint8_t)MSG_TYPE_HANDLE_RESULT;
+    *w++ = msg_type;
     wr_u32(w, (uint32_t)payload_len); w += 4;
     memcpy(w, payload, payload_len);
 
     send_all(fd, frame, frame_len);
     free(frame);
+}
+
+static void send_handle_result(sock_t fd, const char *room, uint16_t room_len,
+                               uint8_t status, const char *reason,
+                               const uint8_t *pk_or_null) {
+    send_result_frame(fd, room, room_len, (uint8_t)MSG_TYPE_HANDLE_RESULT,
+                      status, reason, pk_or_null);
+}
+
+/* BLOB_PUT / BLOB_GET replies must carry MSG_TYPE_BLOB_RESULT: the sp_*
+ * client helpers (and the Android BlobProtocol) match on that type. Until
+ * now error/PUT replies went out as HANDLE_RESULT, which clients reported
+ * as a bad reply. */
+static void send_blob_result(sock_t fd, const char *room, uint16_t room_len,
+                             uint8_t status, const char *reason) {
+    send_result_frame(fd, room, room_len, (uint8_t)MSG_TYPE_BLOB_RESULT,
+                      status, reason, NULL);
 }
 
 /**
@@ -381,7 +401,8 @@ static void send_handle_result(sock_t fd, const char *room, uint16_t room_len,
  * Returns 1 if the frame was a handle command (caller should NOT broadcast),
  *         0 if it's a regular text/file/etc frame to be broadcast as usual.
  */
-static int try_handle_command(sock_t fd, const uint8_t *frame, size_t flen) {
+static int try_handle_command(client_t *cl, const uint8_t *frame, size_t flen) {
+    sock_t fd = cl->fd;
     if (flen < 2) return 0;
     uint16_t room_len = rd_u16(frame);
     if (flen < (size_t)2 + room_len + 2) return 0;
@@ -527,14 +548,14 @@ static int try_handle_command(sock_t fd, const uint8_t *frame, size_t flen) {
     if (type == MSG_TYPE_BLOB_PUT) {
         /* payload: [pk(32)][sig(64)][type_len(1)][type][cipher_len(4)][cipher] */
         if (clen < 32 + 64 + 1 + 4) {
-            send_handle_result(fd, room, room_len, 2, "blob put too short", NULL);
+            send_blob_result(fd, room, room_len, 2, "blob put too short");
             return 1;
         }
         const uint8_t *pk        = cipher;
         const uint8_t *sig       = cipher + 32;
         uint8_t        type_len  = cipher[32 + 64];
         if (clen < (uint32_t)32 + 64 + 1 + type_len + 4) {
-            send_handle_result(fd, room, room_len, 2, "truncated type", NULL);
+            send_blob_result(fd, room, room_len, 2, "truncated type");
             return 1;
         }
         const uint8_t *type_buf  = cipher + 32 + 64 + 1;
@@ -546,7 +567,7 @@ static int try_handle_command(sock_t fd, const uint8_t *frame, size_t flen) {
          * guaranteed by the "truncated type" check above. */
         uint32_t hdr_len = (uint32_t)32 + 64 + 1 + type_len + 4;
         if (cipher_len > clen - hdr_len) {
-            send_handle_result(fd, room, room_len, 2, "truncated cipher", NULL);
+            send_blob_result(fd, room, room_len, 2, "truncated cipher");
             return 1;
         }
         const uint8_t *cipher_data = cipher + 32 + 64 + 1 + type_len + 4;
@@ -556,7 +577,7 @@ static int try_handle_command(sock_t fd, const uint8_t *frame, size_t flen) {
         size_t signed_len = (size_t)type_len + cipher_len;
         uint8_t *signed_buf = (uint8_t *)malloc(signed_len);
         if (!signed_buf) {
-            send_handle_result(fd, room, room_len, 3, "oom", NULL);
+            send_blob_result(fd, room, room_len, 3, "oom");
             return 1;
         }
         memcpy(signed_buf, type_buf, type_len);
@@ -564,7 +585,7 @@ static int try_handle_command(sock_t fd, const uint8_t *frame, size_t flen) {
         int sig_ok = crypto_sign_verify_detached(sig, signed_buf, signed_len, pk);
         free(signed_buf);
         if (sig_ok != 0) {
-            send_handle_result(fd, room, room_len, 2, "bad signature", NULL);
+            send_blob_result(fd, room, room_len, 2, "bad signature");
             return 1;
         }
 
@@ -576,40 +597,88 @@ static int try_handle_command(sock_t fd, const uint8_t *frame, size_t flen) {
 
         int put_rc = server_db_put_blob(pk, type_str, cipher_data, cipher_len);
         if (put_rc == 0) {
-            send_handle_result(fd, room, room_len, 0, "ok", NULL);
+            send_blob_result(fd, room, room_len, 0, "ok");
             printf("[server] blob '%s' stored (%u bytes)\n", type_str, cipher_len);
         } else if (put_rc == -2) {
-            send_handle_result(fd, room, room_len, 2, "blob quota exceeded", NULL);
+            send_blob_result(fd, room, room_len, 2, "blob quota exceeded");
             printf("[server] blob '%s' rejected: quota exceeded\n", type_str);
         } else {
-            send_handle_result(fd, room, room_len, 3, "db error", NULL);
+            send_blob_result(fd, room, room_len, 3, "db error");
         }
         return 1;
     }
 
+    if (type == MSG_TYPE_BLOB_GET_CHALLENGE) {
+        /* Hand out a one-shot nonce that the next BLOB_GET on this
+         * connection must sign (M10). Reply: [challenge(32)]. */
+        randombytes_buf(cl->blob_challenge, sizeof(cl->blob_challenge));
+        cl->blob_challenge_set = 1;
+
+        static const char *kSrvName = "server";
+        uint16_t name_len = (uint16_t)strlen(kSrvName);
+        uint8_t  nonce[CRYPTO_NPUBBYTES];
+        memset(nonce, 0, sizeof(nonce));
+        size_t frame_len = 2 + room_len + 2 + name_len + 2 + CRYPTO_NPUBBYTES + 1 + 4 + 32;
+        uint8_t *out = (uint8_t *)malloc(frame_len);
+        if (!out) return 1;
+        uint8_t *w = out;
+        wr_u16(w, room_len);                w += 2;
+        memcpy(w, room, room_len);          w += room_len;
+        wr_u16(w, name_len);                w += 2;
+        memcpy(w, kSrvName, name_len);      w += name_len;
+        wr_u16(w, CRYPTO_NPUBBYTES);        w += 2;
+        memcpy(w, nonce, CRYPTO_NPUBBYTES); w += CRYPTO_NPUBBYTES;
+        *w++ = (uint8_t)MSG_TYPE_BLOB_CHALLENGE_RESULT;
+        wr_u32(w, 32);                      w += 4;
+        memcpy(w, cl->blob_challenge, 32);
+        send_all(fd, out, frame_len);
+        free(out);
+        return 1;
+    }
+
     if (type == MSG_TYPE_BLOB_GET) {
-        /* payload: [pk(32)][type_len(1)][type] */
-        if (clen < 32 + 1) {
-            send_handle_result(fd, room, room_len, 2, "blob get too short", NULL);
+        /* payload: [pk(32)][sig(64)][type_len(1)][type]
+         * sig = Ed25519(challenge || type) under pk's secret key. Without
+         * this only-owner check anyone could download any pk's (encrypted)
+         * blob and use the reply as a presence oracle (M10). */
+        if (clen < 32 + 64 + 1) {
+            send_blob_result(fd, room, room_len, 2, "blob get too short");
             return 1;
         }
         const uint8_t *pk       = cipher;
-        uint8_t        type_len = cipher[32];
-        if (clen < (uint32_t)32 + 1 + type_len) {
-            send_handle_result(fd, room, room_len, 2, "truncated type", NULL);
+        const uint8_t *sig      = cipher + 32;
+        uint8_t        type_len = cipher[32 + 64];
+        if (clen < (uint32_t)32 + 64 + 1 + type_len) {
+            send_blob_result(fd, room, room_len, 2, "truncated type");
             return 1;
         }
+
+        if (!cl->blob_challenge_set) {
+            send_blob_result(fd, room, room_len, 2, "challenge required");
+            return 1;
+        }
+        /* Consume the nonce before verifying: pass or fail, it's one-shot. */
+        cl->blob_challenge_set = 0;
+
+        uint8_t signed_buf[32 + 255];
+        memcpy(signed_buf, cl->blob_challenge, 32);
+        memcpy(signed_buf + 32, cipher + 32 + 64 + 1, type_len);
+        if (crypto_sign_verify_detached(sig, signed_buf, (size_t)32 + type_len, pk) != 0) {
+            send_blob_result(fd, room, room_len, 2, "bad signature");
+            return 1;
+        }
+
         char type_str[64];
         if (type_len >= sizeof(type_str)) type_len = sizeof(type_str) - 1;
-        memcpy(type_str, cipher + 33, type_len);
+        memcpy(type_str, cipher + 32 + 64 + 1, type_len);
         type_str[type_len] = '\0';
 
         uint8_t *blob = NULL; size_t blob_len = 0;
         int rc = server_db_get_blob(pk, type_str, &blob, &blob_len);
         if (rc != 0) {
-            send_handle_result(fd, room, room_len,
+            send_blob_result(fd, room, room_len,
                                rc == 1 ? 1 : 3,
-                               rc == 1 ? "not found" : "db error", NULL);
+                               rc == 1 ? "not found" : "db error");
             return 1;
         }
 
@@ -997,6 +1066,7 @@ void run_server(uint16_t port) {
                     clients[nclients].name[0] = '\0';
                     clients[nclients].udp_registered = 0;
                     clients[nclients].is_media_relay = 0;
+                    clients[nclients].blob_challenge_set = 0;
                     clients[nclients].last_seen = time(NULL);
                     nclients++;
                     printf("[server] new connection (%d total)\n", nclients);
@@ -1038,7 +1108,7 @@ void run_server(uint16_t port) {
             /* Phase B-2: handle-registry commands are out-of-band — they
              * don't belong to any chat room. Process and reply right away
              * without registering this client into a room or broadcasting. */
-            if (try_handle_command(clients[i].fd, frame, flen)) {
+            if (try_handle_command(&clients[i], frame, flen)) {
                 free(frame);
                 continue;
             }
