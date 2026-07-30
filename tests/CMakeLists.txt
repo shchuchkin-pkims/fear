@@ -35,3 +35,9 @@ endfunction()
 add_fear_test(test_identity test_identity.c ${IDENTITY_DIR}/identity.c)
 add_fear_test(test_backup   test_backup.c   ${IDENTITY_DIR}/identity_backup.c ${IDENTITY_DIR}/identity.c)
 add_fear_test(test_contacts test_contacts.c ${IDENTITY_DIR}/contacts_cipher.c)
+
+# Интеграционный smoke-тест: сервер + два консольных клиента (ECDH create/join,
+# доставка сообщений в обе стороны). Требует собранного таргета fear.
+add_test(NAME integration_smoke
+         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/smoke_chat.sh $<TARGET_FILE:fear>)
+set_tests_properties(integration_smoke PROPERTIES TIMEOUT 60)
