@@ -478,13 +478,34 @@ static int resolve_host_v4(const char *host, struct in_addr *out) {
     return 0;
 }
 
-static int tcp_recv_all(socket_t fd, void *buf, size_t len) {
+/**
+ * Read exactly `len` bytes, treating a receive timeout as "not yet" rather
+ * than as a failure.
+ *
+ * The socket carries a 200 ms timeout so the thread can notice the call
+ * ending. Without this distinction every quiet moment would look like a
+ * dropped connection and tear the call down.
+ */
+static int tcp_recv_all(AudioCall *c, void *buf, size_t len) {
     uint8_t *p = (uint8_t *)buf;
     size_t got = 0;
     while (got < len) {
-        int n = recv(fd, (char *)(p + got), (int)(len - got), 0);
-        if (n <= 0) return -1;
-        got += (size_t)n;
+        int n = recv(c->tcp_sock, (char *)(p + got), (int)(len - got), 0);
+        if (n > 0) { got += (size_t)n; continue; }
+        if (n == 0) return -1;   /* peer closed */
+#ifdef _WIN32
+        int err = WSAGetLastError();
+        if (err == WSAETIMEDOUT || err == WSAEWOULDBLOCK) {
+#else
+        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+#endif
+            /* Nothing arrived within the window. Keep waiting unless the
+             * call is shutting down, in which case unwind so the thread can
+             * exit and teardown can run. */
+            if (!atomic_load(&c->running)) return -1;
+            continue;
+        }
+        return -1;
     }
     return 0;
 }
@@ -504,6 +525,28 @@ static int tcp_relay_connect(AudioCall *c, const char *ip, uint16_t port) {
         CLOSESOCK(c->tcp_sock); c->tcp_sock = 0;
         return -1;
     }
+    /* Same reason as the UDP socket: without a timeout the receive thread
+     * sits in recv() until a packet arrives, audio_call_stop blocks in
+     * pthread_join, and Ctrl+C never finishes - so the teardown, including
+     * the key wiping, never runs. The UDP path was fixed earlier; a relay
+     * call goes through this socket instead, and phones use relay, so this
+     * is the path that matters most in practice.
+     *
+     * tcp_recv_all below tells a timeout apart from a broken connection, so
+     * a quiet call is not mistaken for a dropped one. */
+    {
+#ifdef _WIN32
+        DWORD rcv_to = 200;
+        setsockopt(c->tcp_sock, SOL_SOCKET, SO_RCVTIMEO,
+                   (const char *)&rcv_to, sizeof rcv_to);
+#else
+        struct timeval rcv_to;
+        rcv_to.tv_sec = 0;
+        rcv_to.tv_usec = 200000;
+        setsockopt(c->tcp_sock, SOL_SOCKET, SO_RCVTIMEO, &rcv_to, sizeof rcv_to);
+#endif
+    }
+
     if (connect(c->tcp_sock, (struct sockaddr *)&srv, sizeof(srv)) < 0) {
         fprintf(stderr, "TCP connect failed to %s:%u\n", ip, port);
         CLOSESOCK(c->tcp_sock); c->tcp_sock = 0;
@@ -583,26 +626,26 @@ static int tcp_relay_recv_media(AudioCall *c, uint8_t *out, int out_size) {
         uint8_t hdr2[2];
         uint8_t skip[512];
 
-        if (tcp_recv_all(c->tcp_sock, hdr2, 2) < 0) return -1;
+        if (tcp_recv_all(c, hdr2, 2) < 0) return -1;
         uint16_t room_len = (uint16_t)(hdr2[0] | (hdr2[1] << 8));
         if (room_len > 255) return -1;
-        if (tcp_recv_all(c->tcp_sock, skip, room_len) < 0) return -1;
+        if (tcp_recv_all(c, skip, room_len) < 0) return -1;
 
-        if (tcp_recv_all(c->tcp_sock, hdr2, 2) < 0) return -1;
+        if (tcp_recv_all(c, hdr2, 2) < 0) return -1;
         uint16_t name_len = (uint16_t)(hdr2[0] | (hdr2[1] << 8));
         if (name_len > 255) return -1;
-        if (tcp_recv_all(c->tcp_sock, skip, name_len) < 0) return -1;
+        if (tcp_recv_all(c, skip, name_len) < 0) return -1;
 
-        if (tcp_recv_all(c->tcp_sock, hdr2, 2) < 0) return -1;
+        if (tcp_recv_all(c, hdr2, 2) < 0) return -1;
         uint16_t nonce_len = (uint16_t)(hdr2[0] | (hdr2[1] << 8));
         if (nonce_len > sizeof(skip)) return -1;
-        if (nonce_len > 0 && tcp_recv_all(c->tcp_sock, skip, nonce_len) < 0) return -1;
+        if (nonce_len > 0 && tcp_recv_all(c, skip, nonce_len) < 0) return -1;
 
         uint8_t type;
-        if (tcp_recv_all(c->tcp_sock, &type, 1) < 0) return -1;
+        if (tcp_recv_all(c, &type, 1) < 0) return -1;
 
         uint8_t clenbuf[4];
-        if (tcp_recv_all(c->tcp_sock, clenbuf, 4) < 0) return -1;
+        if (tcp_recv_all(c, clenbuf, 4) < 0) return -1;
         uint32_t clen = (uint32_t)(clenbuf[0] | (clenbuf[1] << 8) |
                                     (clenbuf[2] << 16) | (clenbuf[3] << 24));
 
@@ -611,14 +654,14 @@ static int tcp_relay_recv_media(AudioCall *c, uint8_t *out, int out_size) {
          * untrusted relay server (no room key required). */
         if (type == MSG_TYPE_MEDIA_RELAY && clen > 0 &&
             out_size > 0 && clen <= (uint32_t)out_size) {
-            if (tcp_recv_all(c->tcp_sock, out, clen) < 0) return -1;
+            if (tcp_recv_all(c, out, clen) < 0) return -1;
             return (int)clen;
         }
 
         uint32_t remaining = clen;
         while (remaining > 0) {
             uint32_t chunk = remaining > sizeof(skip) ? sizeof(skip) : remaining;
-            if (tcp_recv_all(c->tcp_sock, skip, chunk) < 0) return -1;
+            if (tcp_recv_all(c, skip, chunk) < 0) return -1;
             remaining -= chunk;
         }
     }
