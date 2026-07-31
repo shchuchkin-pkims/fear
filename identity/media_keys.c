@@ -18,6 +18,33 @@ static int callid_is_zero(const uint8_t call_id[MK_CALLID_BYTES]) {
     return sodium_is_zero(call_id, MK_CALLID_BYTES);
 }
 
+static int hex_nibble(char ch) {
+    if (ch >= '0' && ch <= '9') return ch - '0';
+    if (ch >= 'a' && ch <= 'f') return ch - 'a' + 10;
+    if (ch >= 'A' && ch <= 'F') return ch - 'A' + 10;
+    return -1;
+}
+
+int mk_call_id_parse(const char *hex, uint8_t out[MK_CALLID_BYTES]) {
+    if (!hex || !out) return -1;
+    if (strlen(hex) != MK_CALLID_BYTES * 2) return -1;
+
+    for (size_t i = 0; i < MK_CALLID_BYTES; i++) {
+        int hi = hex_nibble(hex[2 * i]);
+        int lo = hex_nibble(hex[2 * i + 1]);
+        if (hi < 0 || lo < 0) {
+            sodium_memzero(out, MK_CALLID_BYTES);
+            return -1;
+        }
+        out[i] = (uint8_t)((hi << 4) | lo);
+    }
+    if (callid_is_zero(out)) {
+        sodium_memzero(out, MK_CALLID_BYTES);
+        return -1;
+    }
+    return 0;
+}
+
 int mk_hello_key(const uint8_t k_call[MK_KEY_BYTES],
                  const uint8_t call_id[MK_CALLID_BYTES],
                  uint8_t out_key[MK_KEY_BYTES]) {

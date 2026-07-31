@@ -66,6 +66,7 @@ typedef int socket_t;
 #include "audio_codec.h"
 #include "audio_crypto.h"
 #include "audio_hub.h"
+#include "media_keys.h"
 #include "identity.h"
 
 /* -------------------------- Конфигурация --------------------------------- */
@@ -96,6 +97,12 @@ typedef struct {
  *
  * @return 0 if the packet is fresh, -1 if it is a replay or older than the window.
  */
+/* Per-call identifier from --call-id. Step 5 of the group-call migration
+ * makes it mandatory and binds it into every media key; today it is parsed
+ * and validated only, so this changes nothing on the wire. */
+static uint8_t g_call_id[MK_CALLID_BYTES];
+static int g_have_call_id = 0;
+
 static int replay_accept(replay_window_t *w, uint64_t seq) {
     if (!w->started) {
         w->started = 1;
@@ -1344,6 +1351,7 @@ int main(int argc, char **argv) {
                 "\n"
                 "Key input methods (in order of priority):\n"
                 "  1. --key-file FILE    Read key from file (recommended for scripts)\n"
+                "  --call-id HEX         32 hex chars identifying this call (from the invite)\n"
                 "  2. stdin              Read key from standard input (interactive or piped)\n"
                 "  3. <hexkey32>         Direct key argument (DEPRECATED - insecure, visible in process list)\n",
                 argv[0], argv[0], argv[0], argv[0], argv[0]);
@@ -1442,6 +1450,14 @@ int main(int argc, char **argv) {
                 arg_idx += 2;
             } else if (strcmp(argv[arg_idx], "--identity-file") == 0 && arg_idx + 1 < argc) {
                 identity_file = argv[arg_idx + 1];
+                arg_idx += 2;
+            } else if (strcmp(argv[arg_idx], "--call-id") == 0 && arg_idx + 1 < argc) {
+                if (mk_call_id_parse(argv[arg_idx + 1], g_call_id) != 0) {
+                    fprintf(stderr, "Error: --call-id must be %d hex characters and not all zero\n",
+                            MK_CALLID_BYTES * 2);
+                    return 1;
+                }
+                g_have_call_id = 1;
                 arg_idx += 2;
             } else if (strcmp(argv[arg_idx], "--no-sign") == 0) {
                 no_sign = 1;
@@ -1567,6 +1583,14 @@ int main(int argc, char **argv) {
             } else if (strcmp(argv[arg_idx], "--identity-file") == 0 && arg_idx + 1 < argc) {
                 identity_file = argv[arg_idx + 1];
                 arg_idx += 2;
+            } else if (strcmp(argv[arg_idx], "--call-id") == 0 && arg_idx + 1 < argc) {
+                if (mk_call_id_parse(argv[arg_idx + 1], g_call_id) != 0) {
+                    fprintf(stderr, "Error: --call-id must be %d hex characters and not all zero\n",
+                            MK_CALLID_BYTES * 2);
+                    return 1;
+                }
+                g_have_call_id = 1;
+                arg_idx += 2;
             } else if (strcmp(argv[arg_idx], "--no-sign") == 0) {
                 no_sign = 1;
                 arg_idx++;
@@ -1686,6 +1710,14 @@ int main(int argc, char **argv) {
                 keyfile = argv[arg_idx + 1]; arg_idx += 2;
             } else if (strcmp(argv[arg_idx], "--identity-file") == 0 && arg_idx + 1 < argc) {
                 identity_file = argv[arg_idx + 1]; arg_idx += 2;
+            } else if (strcmp(argv[arg_idx], "--call-id") == 0 && arg_idx + 1 < argc) {
+                if (mk_call_id_parse(argv[arg_idx + 1], g_call_id) != 0) {
+                    fprintf(stderr, "Error: --call-id must be %d hex characters and not all zero\n",
+                            MK_CALLID_BYTES * 2);
+                    return 1;
+                }
+                g_have_call_id = 1;
+                arg_idx += 2;
             } else if (strcmp(argv[arg_idx], "--no-sign") == 0) {
                 no_sign = 1; arg_idx++;
             } else if (strcmp(argv[arg_idx], "--room") == 0 && arg_idx + 1 < argc) {

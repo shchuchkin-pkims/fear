@@ -99,6 +99,17 @@ typedef enum {
 } mk_stream_t;
 
 /**
+ * Parse a call_id from 32 hex characters.
+ *
+ * Rejects an all-zero value for the same reason the derivations do: it is
+ * what a path that forgot to plumb the field through would produce, and
+ * accepting it would silently drop the cross-call replay barrier.
+ *
+ * @return 0 on success, -1 on a malformed or all-zero value
+ */
+int mk_call_id_parse(const char *hex, uint8_t out[MK_CALLID_BYTES]);
+
+/**
  * Derive the HELLO authentication key for a call. Computable before any
  * packet is parsed, so an off-path attacker cannot inject a handshake.
  *

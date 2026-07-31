@@ -170,6 +170,22 @@ int main(void) {
     CHECK(mk_derive_sender(k_call, MK_STREAM_AUDIO, 0, zero_call, salt_a, pk, key) != 0);
     CHECK(mk_sender_id(k_call, zero_call, salt_a, pk, sid) != 0);
 
+    /* --- call_id parsing --------------------------------------------------------- */
+    uint8_t parsed[MK_CALLID_BYTES];
+    CHECK(mk_call_id_parse("101112131415161718191a1b1c1d1e1f", parsed) == 0);
+    CHECK(memcmp(parsed, call_id, MK_CALLID_BYTES) == 0);
+    CHECK(mk_call_id_parse("101112131415161718191A1B1C1D1E1F", parsed) == 0);
+    CHECK(memcmp(parsed, call_id, MK_CALLID_BYTES) == 0);
+
+    /* All zero is what a path that forgot to plumb the field would produce. */
+    CHECK(mk_call_id_parse("00000000000000000000000000000000", parsed) != 0);
+    /* Wrong length, in both directions, and non-hex. */
+    CHECK(mk_call_id_parse("1011121314151617", parsed) != 0);
+    CHECK(mk_call_id_parse("101112131415161718191a1b1c1d1e1f00", parsed) != 0);
+    CHECK(mk_call_id_parse("101112131415161718191a1b1c1d1e1g", parsed) != 0);
+    CHECK(mk_call_id_parse("", parsed) != 0);
+    CHECK(mk_call_id_parse(NULL, parsed) != 0);
+
     /* --- argument checks --------------------------------------------------------- */
     CHECK(mk_derive_sender(NULL, MK_STREAM_AUDIO, 0, call_id, salt_a, pk, key) != 0);
     CHECK(mk_derive_sender(k_call, (mk_stream_t)7, 0, call_id, salt_a, pk, key) != 0);

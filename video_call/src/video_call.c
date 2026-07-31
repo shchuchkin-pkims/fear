@@ -69,6 +69,13 @@ static int resolve_host_v4(const char *host, struct in_addr *out) {
 #include "audio_codec.h"
 #include "audio_crypto.h"
 #include "audio_hub.h"
+#include "media_keys.h"
+
+/* Per-call identifier from --call-id. Step 5 of the group-call migration
+ * makes it mandatory and binds it into every media key; today it is parsed
+ * and validated only, so nothing on the wire changes. */
+static uint8_t g_call_id[MK_CALLID_BYTES];
+static int g_have_call_id = 0;
 
 /* Video modules */
 #include "video_types.h"
@@ -1578,7 +1585,18 @@ static void options_init(CallOptions *opts) {
 
 static int parse_options(int argc, char **argv, int start_idx, CallOptions *opts) {
     for (int i = start_idx; i < argc; i++) {
-        if (strcmp(argv[i], "--key-file") == 0 && i + 1 < argc) {
+        if (strcmp(argv[i], "--call-id") == 0 && i + 1 < argc) {
+            /* Parsed and validated only for now. Step 5 of the group-call
+             * migration makes it mandatory and binds it into every media
+             * key, so nothing on the wire changes here. */
+            if (mk_call_id_parse(argv[i + 1], g_call_id) != 0) {
+                fprintf(stderr, "Error: --call-id must be %d hex characters and not all zero\n",
+                        MK_CALLID_BYTES * 2);
+                return 1;
+            }
+            g_have_call_id = 1;
+            i += 2;
+        } else if (strcmp(argv[i], "--key-file") == 0 && i + 1 < argc) {
             opts->keyfile = argv[++i];
         } else if (strcmp(argv[i], "--quality") == 0 && i + 1 < argc) {
             i++;
