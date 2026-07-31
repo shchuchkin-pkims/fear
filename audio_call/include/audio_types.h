@@ -44,12 +44,6 @@ typedef int socket_t;
 /** Maximum UDP packet size for audio data */
 #define MAX_PACKET_SIZE 4096
 
-/** Hello packet magic bytes for handshake */
-#define HELLO_MAGIC 0xFEARAUDIO
-
-/** Protocol version number */
-#define PROTOCOL_VERSION 1
-
 /* ===== Buffer Sizes ===== */
 
 /** PCM ring buffer capacity in frames */

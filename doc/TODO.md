@@ -95,12 +95,12 @@
 
 ## In Progress
 
-- [ ] **Phase C - crypto evolution.** The primitives have landed with frozen
-      test vectors (`identity/key_schedule.c`, `identity/rotation.c`,
-      `identity/media_keys.c`, plus the Kotlin ports in `com.fear.crypto`).
-      Nothing calls them yet: wiring them into the live chat and media paths
-      is the remaining work, and the media switchover breaks the call wire
-      format, so desktop and Android have to land together
+- [ ] **Phase C - crypto evolution.** Landed: the key schedule, rotation
+      bundles, sender-rooted media keys, HELLO2, the sender table with replay
+      windows, call invites carrying the call_id, and the switchover of the
+      live media path on both platforms, with group audio mixing. Remaining:
+      group video rendering, an incoming-call screen on Android, and wiring
+      the key schedule and rotation bundles into the chat path.
 - [ ] Documentation updates and localization
 
 ## Planned
