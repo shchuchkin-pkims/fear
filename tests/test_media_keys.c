@@ -1,13 +1,15 @@
 /**
- * Test vectors and properties for per-direction media keys (audit M3/M5).
+ * Test vectors and properties for sender-rooted media keys (fear.media.v2).
  *
- * Expected values come from an independent implementation (Python
- * hashlib.blake2b, keyed) of
+ * Expected values were produced by an independent implementation (Python
+ * hashlib.blake2b, keyed) from the derivations in
+ * doc/media-key-migration.md, so this is not the code grading its own
+ * homework. The Kotlin port pins the same values; if the two ever disagree,
+ * desktop and Android calls stop interoperating, which is exactly the class
+ * of bug these vectors exist to catch.
  *
- *     K_media = BLAKE2b(key = master, data = "fear.media.v1" || stream
- *                                            || direction || salt)
- *
- * master = 00 01 .. 1f, saltA = 10 11 .. 1f, saltB = f0 f1 .. ff.
+ * Fixed inputs: K_call = 00..1f, call_id = 10..1f, saltA = a0..af,
+ * saltB = 5a..69, idbind = a fixed Ed25519 pk or 32 zero bytes.
  */
 #include "media_keys.h"
 #include "test_util.h"
@@ -25,166 +27,155 @@ static void bin2hex(const uint8_t *bin, size_t len, char *out) {
     out[2 * len] = '\0';
 }
 
+static void hex2bin(const char *hex, uint8_t *out, size_t out_len) {
+    for (size_t i = 0; i < out_len; i++) {
+        char b[3] = { hex[2 * i], hex[2 * i + 1], 0 };
+        out[i] = (uint8_t)strtoul(b, NULL, 16);
+    }
+}
+
 int main(void) {
     CHECK(sodium_init() >= 0);
 
-    uint8_t master[MK_KEY_BYTES];
-    for (size_t i = 0; i < sizeof master; i++) master[i] = (uint8_t)i;
+    uint8_t k_call[MK_KEY_BYTES];
+    for (size_t i = 0; i < sizeof k_call; i++) k_call[i] = (uint8_t)i;
 
+    uint8_t call_id[MK_CALLID_BYTES], call_id2[MK_CALLID_BYTES];
     uint8_t salt_a[MK_SALT_BYTES], salt_b[MK_SALT_BYTES];
-    for (size_t i = 0; i < MK_SALT_BYTES; i++) {
-        salt_a[i] = (uint8_t)(0x10 + i);
-        salt_b[i] = (uint8_t)(0xF0 ^ i);
+    for (size_t i = 0; i < MK_CALLID_BYTES; i++) {
+        call_id[i]  = (uint8_t)(0x10 + i);
+        call_id2[i] = (uint8_t)(0xE0 + i);
+        salt_a[i]   = (uint8_t)(0xA0 + i);
+        salt_b[i]   = (uint8_t)(0x5A + i);
     }
 
-    char hex[2 * MK_KEY_BYTES + 1];
+    uint8_t pk[MK_IDBIND_BYTES], zeros[MK_IDBIND_BYTES];
+    hex2bin("d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737",
+            pk, sizeof pk);
+    memset(zeros, 0, sizeof zeros);
+
     uint8_t key[MK_KEY_BYTES];
+    char hex[2 * MK_KEY_BYTES + 1];
 
-    /* --- frozen vectors --------------------------------------------------- */
-    CHECK(mk_derive(master, MK_STREAM_AUDIO, MK_DIR_CALLER_TO_CALLEE, salt_a, key) == 0);
+    /* --- HELLO key ---------------------------------------------------------- */
+    CHECK(mk_hello_key(k_call, call_id, key) == 0);
     bin2hex(key, sizeof key, hex);
-    CHECK(strcmp(hex, "2115ba791b04de1beea3d49fecf95748fcf788c1ea5b4901dd534b50279a14d8") == 0);
+    CHECK(strcmp(hex, "e17ec5d029ed2987c577869ec52547ba6b2504b9ea8759c51a6d94645b967924") == 0);
 
-    CHECK(mk_derive(master, MK_STREAM_AUDIO, MK_DIR_CALLEE_TO_CALLER, salt_a, key) == 0);
+    CHECK(mk_hello_key(k_call, call_id2, key) == 0);
     bin2hex(key, sizeof key, hex);
-    CHECK(strcmp(hex, "5dfb5ec2fe608102adb45ddb87635827891ea7b8b4b326b58ef7a27c1a12638b") == 0);
+    CHECK(strcmp(hex, "32593dd97694c649d21f9642d2a188d3918b286a374a09c725e3335cabc2a0a7") == 0);
 
-    CHECK(mk_derive(master, MK_STREAM_VIDEO, MK_DIR_CALLER_TO_CALLEE, salt_a, key) == 0);
-    bin2hex(key, sizeof key, hex);
-    CHECK(strcmp(hex, "c653aba9d730f2f041d465c34fb906f36bdbb73fc4e6516dc66ccbb020645009") == 0);
-
-    CHECK(mk_derive(master, MK_STREAM_VIDEO, MK_DIR_CALLEE_TO_CALLER, salt_a, key) == 0);
-    bin2hex(key, sizeof key, hex);
-    CHECK(strcmp(hex, "0b45aa24615c1af180958bf59e949e516253a119d64baa9fd5d01f553aabb85b") == 0);
-
-    /* Same everything but a different session salt (M5). */
-    CHECK(mk_derive(master, MK_STREAM_AUDIO, MK_DIR_CALLER_TO_CALLEE, salt_b, key) == 0);
-    bin2hex(key, sizeof key, hex);
-    CHECK(strcmp(hex, "64050af487f07cc001e50c3bd1af8301e64084ef41a01d8a7047ca5de4522852") == 0);
-
-    /* --- all four keys of a call are distinct (M3) -------------------------- */
-    uint8_t k[4][MK_KEY_BYTES];
-    CHECK(mk_derive(master, MK_STREAM_AUDIO, MK_DIR_CALLER_TO_CALLEE, salt_a, k[0]) == 0);
-    CHECK(mk_derive(master, MK_STREAM_AUDIO, MK_DIR_CALLEE_TO_CALLER, salt_a, k[1]) == 0);
-    CHECK(mk_derive(master, MK_STREAM_VIDEO, MK_DIR_CALLER_TO_CALLEE, salt_a, k[2]) == 0);
-    CHECK(mk_derive(master, MK_STREAM_VIDEO, MK_DIR_CALLEE_TO_CALLER, salt_a, k[3]) == 0);
-    for (int i = 0; i < 4; i++) {
-        CHECK(memcmp(k[i], master, MK_KEY_BYTES) != 0);
-        for (int j = i + 1; j < 4; j++) CHECK(memcmp(k[i], k[j], MK_KEY_BYTES) != 0);
+    /* --- per-sender keys ----------------------------------------------------- */
+    struct { mk_stream_t s; uint16_t kv; const uint8_t *cid, *salt, *idb; const char *want; } v[] = {
+        /* unsigned audio */
+        { MK_STREAM_AUDIO, 0, call_id,  salt_a, zeros,
+          "0bc7ef4f1ac0a8c46391f4f153ef956893475f84be6a061d88a08139a8554de0" },
+        /* unsigned video: same everything but the counter domain */
+        { MK_STREAM_VIDEO, 0, call_id,  salt_a, zeros,
+          "0d9837fae769f064978fd34c440199c876b0018444f78f5112ab5fda691a7460" },
+        /* signed audio: identity is bound in */
+        { MK_STREAM_AUDIO, 0, call_id,  salt_a, pk,
+          "8a9243ecb9c62c27ba149995fe00efdb28d0e2ca5aad325ea88b86d5c3e6771e" },
+        /* key_version is bound (big endian) */
+        { MK_STREAM_AUDIO, 7, call_id,  salt_a, pk,
+          "77c76b092b98a4fed163eda6aefbe9fd591ae8a96e703c64a3419339eef3edcf" },
+        /* another sender's salt in the same call */
+        { MK_STREAM_AUDIO, 0, call_id,  salt_b, pk,
+          "42175bf01239d346f9ded7e88611f973ccdba9bf4e7856421fd65ebae9ba5128" },
+        /* same sender, different call: a recording cannot replay across calls */
+        { MK_STREAM_AUDIO, 0, call_id2, salt_a, pk,
+          "cd451578c0089eb3e1d63bcb2714723ae9bbf5a65a7e5941180b18ea61077401" },
+    };
+    for (size_t i = 0; i < sizeof v / sizeof v[0]; i++) {
+        CHECK(mk_derive_sender(k_call, v[i].s, v[i].kv, v[i].cid, v[i].salt,
+                               v[i].idb, key) == 0);
+        bin2hex(key, sizeof key, hex);
+        if (strcmp(hex, v[i].want) != 0)
+            fprintf(stderr, "key vector %zu: want %s got %s\n", i, v[i].want, hex);
+        CHECK(strcmp(hex, v[i].want) == 0);
     }
 
-    /* A different session salt changes every key. */
-    uint8_t k_b[MK_KEY_BYTES];
-    CHECK(mk_derive(master, MK_STREAM_AUDIO, MK_DIR_CALLER_TO_CALLEE, salt_b, k_b) == 0);
-    CHECK(memcmp(k_b, k[0], MK_KEY_BYTES) != 0);
+    /* Every one of those differs from every other: no input is ignored. */
+    for (size_t i = 0; i < sizeof v / sizeof v[0]; i++)
+        for (size_t j = i + 1; j < sizeof v / sizeof v[0]; j++)
+            CHECK(strcmp(v[i].want, v[j].want) != 0);
 
-    /* So does a different master key. */
-    uint8_t other_master[MK_KEY_BYTES];
-    memcpy(other_master, master, sizeof other_master);
-    other_master[31] ^= 0x01;
-    CHECK(mk_derive(other_master, MK_STREAM_AUDIO, MK_DIR_CALLER_TO_CALLEE, salt_a, k_b) == 0);
-    CHECK(memcmp(k_b, k[0], MK_KEY_BYTES) != 0);
+    /* --- sender tags ---------------------------------------------------------- */
+    uint8_t sid[MK_SID_BYTES];
+    char sid_hex[2 * MK_SID_BYTES + 1];
 
-    /* --- the two ends agree ------------------------------------------------- */
-    uint8_t caller_send[MK_KEY_BYTES], caller_recv[MK_KEY_BYTES];
-    uint8_t callee_send[MK_KEY_BYTES], callee_recv[MK_KEY_BYTES];
-    CHECK(mk_derive_pair(master, MK_STREAM_AUDIO, 1, salt_a, caller_send, caller_recv) == 0);
-    CHECK(mk_derive_pair(master, MK_STREAM_AUDIO, 0, salt_a, callee_send, callee_recv) == 0);
-    /* What one side encrypts with, the other decrypts with. */
-    CHECK(memcmp(caller_send, callee_recv, MK_KEY_BYTES) == 0);
-    CHECK(memcmp(callee_send, caller_recv, MK_KEY_BYTES) == 0);
-    /* And a peer never sends and receives under the same key. */
-    CHECK(memcmp(caller_send, caller_recv, MK_KEY_BYTES) != 0);
-    CHECK(memcmp(callee_send, callee_recv, MK_KEY_BYTES) != 0);
+    CHECK(mk_sender_id(k_call, call_id, salt_a, zeros, sid) == 0);
+    bin2hex(sid, sizeof sid, sid_hex);
+    CHECK(strcmp(sid_hex, "0f2cee") == 0);
 
-    /* Video pair is independent of the audio pair. */
-    uint8_t v_send[MK_KEY_BYTES], v_recv[MK_KEY_BYTES];
-    CHECK(mk_derive_pair(master, MK_STREAM_VIDEO, 1, salt_a, v_send, v_recv) == 0);
-    CHECK(memcmp(v_send, caller_send, MK_KEY_BYTES) != 0);
-    CHECK(memcmp(v_recv, caller_recv, MK_KEY_BYTES) != 0);
+    CHECK(mk_sender_id(k_call, call_id, salt_a, pk, sid) == 0);
+    bin2hex(sid, sizeof sid, sid_hex);
+    CHECK(strcmp(sid_hex, "5338c1") == 0);
 
-    /* --- salt agreement: frozen vectors ------------------------------------- */
-    /* Independently computed with Python hashlib.blake2b(key=master,
-     * digest_size=16) over "fear.media.salt.v1" || lo || hi. */
-    uint8_t half_c[MK_SALT_BYTES];
-    memset(half_c, 0, sizeof half_c);
-    half_c[MK_SALT_BYTES - 1] = 0x01;
+    CHECK(mk_sender_id(k_call, call_id, salt_b, pk, sid) == 0);
+    bin2hex(sid, sizeof sid, sid_hex);
+    CHECK(strcmp(sid_hex, "19bbc4") == 0);
 
-    uint8_t salt[MK_SALT_BYTES];
-    char salt_hex[2 * MK_SALT_BYTES + 1];
+    CHECK(mk_sender_id(k_call, call_id2, salt_a, pk, sid) == 0);
+    bin2hex(sid, sizeof sid, sid_hex);
+    CHECK(strcmp(sid_hex, "26dd22") == 0);
 
-    CHECK(mk_salt_combine(master, salt_a, salt_b, salt) == 0);
-    bin2hex(salt, sizeof salt, salt_hex);
-    CHECK(strcmp(salt_hex, "72f75f37beebffb6d9da8920b9045063") == 0);
+    /* The tag identifies a participant, not a stream: it takes no stream
+     * argument, so audio and video from one sender share one tag. This is a
+     * structural property of the API, asserted here so a future refactor
+     * cannot quietly add a stream input. */
+    uint8_t sid_again[MK_SID_BYTES];
+    CHECK(mk_sender_id(k_call, call_id, salt_a, pk, sid_again) == 0);
+    CHECK(mk_sender_id(k_call, call_id, salt_a, pk, sid) == 0);
+    CHECK(memcmp(sid, sid_again, MK_SID_BYTES) == 0);
 
-    /* Commutative: the two ends must not have to agree who spoke first. */
-    uint8_t salt_rev[MK_SALT_BYTES];
-    CHECK(mk_salt_combine(master, salt_b, salt_a, salt_rev) == 0);
-    CHECK(memcmp(salt, salt_rev, sizeof salt) == 0);
+    /* --- HELLO MAC ------------------------------------------------------------ */
+    uint8_t hello_key[MK_KEY_BYTES];
+    CHECK(mk_hello_key(k_call, call_id, hello_key) == 0);
 
-    uint8_t zero_master[MK_KEY_BYTES];
-    memset(zero_master, 0, sizeof zero_master);
-    CHECK(mk_salt_combine(zero_master, salt_a, salt_b, salt) == 0);
-    bin2hex(salt, sizeof salt, salt_hex);
-    CHECK(strcmp(salt_hex, "ef6cdd21ef8fb871e10d248a13f3be87") == 0);
+    uint8_t body[40];
+    for (size_t i = 0; i < sizeof body; i++) body[i] = (uint8_t)i;
 
-    CHECK(mk_salt_combine(master, salt_a, half_c, salt) == 0);
-    bin2hex(salt, sizeof salt, salt_hex);
-    CHECK(strcmp(salt_hex, "6c6d840e804427679a352df05065fd2b") == 0);
+    uint8_t mac[MK_MAC_BYTES];
+    char mac_hex[2 * MK_MAC_BYTES + 1];
+    CHECK(mk_hello_mac(hello_key, body, sizeof body, mac) == 0);
+    bin2hex(mac, sizeof mac, mac_hex);
+    CHECK(strcmp(mac_hex, "a0254883e218b3ab5b22aa7a6c11dbd2") == 0);
 
-    /* Every input is bound: change the peer half or the master, get a
-     * different salt. */
-    uint8_t salt_ab[MK_SALT_BYTES], salt_ac[MK_SALT_BYTES], salt_other[MK_SALT_BYTES];
-    CHECK(mk_salt_combine(master, salt_a, salt_b, salt_ab) == 0);
-    CHECK(mk_salt_combine(master, salt_a, half_c, salt_ac) == 0);
-    CHECK(memcmp(salt_ab, salt_ac, MK_SALT_BYTES) != 0);
-    CHECK(mk_salt_combine(other_master, salt_a, salt_b, salt_other) == 0);
-    CHECK(memcmp(salt_ab, salt_other, MK_SALT_BYTES) != 0);
+    CHECK(mk_hello_mac_verify(hello_key, body, sizeof body, mac) == 0);
 
-    /* --- role assignment ------------------------------------------------------ */
-    int a_is_caller = -1, b_is_caller = -1;
-    CHECK(mk_role_from_halves(salt_a, salt_b, &a_is_caller) == 0);
-    CHECK(mk_role_from_halves(salt_b, salt_a, &b_is_caller) == 0);
-    /* Opposite by construction, whichever half happens to be smaller. */
-    CHECK(a_is_caller != b_is_caller);
-    CHECK(a_is_caller == 1);   /* 0x10.. sorts before 0xf0.. */
-
-    /* A reflected HELLO (our own half coming back) must be refused, not
-     * resolved: either answer would put both ends on one key at seq 0. */
-    int dummy = -1;
-    CHECK(mk_role_from_halves(salt_a, salt_a, &dummy) != 0);
-    CHECK(mk_salt_combine(NULL, salt_a, salt_b, salt) != 0);
-    CHECK(mk_role_from_halves(salt_a, salt_b, NULL) != 0);
-
-    /* --- end to end: two peers reach the same keys -------------------------- */
-    /* Peer A knows only its own half and the one it received, and vice
-     * versa; nothing else is exchanged. */
-    uint8_t a_salt[MK_SALT_BYTES], b_salt[MK_SALT_BYTES];
-    int a_role = 0, b_role = 0;
-    CHECK(mk_salt_combine(master, salt_a, salt_b, a_salt) == 0);
-    CHECK(mk_role_from_halves(salt_a, salt_b, &a_role) == 0);
-    CHECK(mk_salt_combine(master, salt_b, salt_a, b_salt) == 0);
-    CHECK(mk_role_from_halves(salt_b, salt_a, &b_role) == 0);
-    CHECK(memcmp(a_salt, b_salt, MK_SALT_BYTES) == 0);
-
-    for (int stream = MK_STREAM_AUDIO; stream <= MK_STREAM_VIDEO; stream++) {
-        uint8_t a_tx[MK_KEY_BYTES], a_rx[MK_KEY_BYTES];
-        uint8_t b_tx[MK_KEY_BYTES], b_rx[MK_KEY_BYTES];
-        CHECK(mk_derive_pair(master, (mk_stream_t)stream, a_role, a_salt, a_tx, a_rx) == 0);
-        CHECK(mk_derive_pair(master, (mk_stream_t)stream, b_role, b_salt, b_tx, b_rx) == 0);
-        /* What A encrypts, B decrypts, and neither reuses a key. */
-        CHECK(memcmp(a_tx, b_rx, MK_KEY_BYTES) == 0);
-        CHECK(memcmp(b_tx, a_rx, MK_KEY_BYTES) == 0);
-        CHECK(memcmp(a_tx, a_rx, MK_KEY_BYTES) != 0);
+    /* A flipped bit anywhere in the body, or in the MAC, must fail. */
+    for (size_t i = 0; i < sizeof body; i += 8) {
+        uint8_t evil[sizeof body];
+        memcpy(evil, body, sizeof evil);
+        evil[i] ^= 0x01;
+        CHECK(mk_hello_mac_verify(hello_key, evil, sizeof evil, mac) != 0);
     }
+    uint8_t bad_mac[MK_MAC_BYTES];
+    memcpy(bad_mac, mac, sizeof bad_mac);
+    bad_mac[MK_MAC_BYTES - 1] ^= 0x01;
+    CHECK(mk_hello_mac_verify(hello_key, body, sizeof body, bad_mac) != 0);
 
-    /* --- argument checks ----------------------------------------------------- */
-    CHECK(mk_derive(NULL, MK_STREAM_AUDIO, MK_DIR_CALLER_TO_CALLEE, salt_a, key) != 0);
-    CHECK(mk_derive(master, MK_STREAM_AUDIO, MK_DIR_CALLER_TO_CALLEE, NULL, key) != 0);
-    CHECK(mk_derive(master, MK_STREAM_AUDIO, MK_DIR_CALLER_TO_CALLEE, salt_a, NULL) != 0);
-    CHECK(mk_derive(master, (mk_stream_t)7, MK_DIR_CALLER_TO_CALLEE, salt_a, key) != 0);
-    CHECK(mk_derive(master, MK_STREAM_AUDIO, (mk_dir_t)9, salt_a, key) != 0);
-    CHECK(mk_derive_pair(master, MK_STREAM_AUDIO, 1, salt_a, NULL, caller_recv) != 0);
+    /* A HELLO from another call must not verify here: that is what locks an
+     * off-path attacker out of the handshake. */
+    uint8_t other_hello_key[MK_KEY_BYTES];
+    CHECK(mk_hello_key(k_call, call_id2, other_hello_key) == 0);
+    CHECK(mk_hello_mac_verify(other_hello_key, body, sizeof body, mac) != 0);
+
+    /* --- call_id is mandatory --------------------------------------------------- */
+    uint8_t zero_call[MK_CALLID_BYTES];
+    memset(zero_call, 0, sizeof zero_call);
+    CHECK(mk_hello_key(k_call, zero_call, key) != 0);
+    CHECK(mk_derive_sender(k_call, MK_STREAM_AUDIO, 0, zero_call, salt_a, pk, key) != 0);
+    CHECK(mk_sender_id(k_call, zero_call, salt_a, pk, sid) != 0);
+
+    /* --- argument checks --------------------------------------------------------- */
+    CHECK(mk_derive_sender(NULL, MK_STREAM_AUDIO, 0, call_id, salt_a, pk, key) != 0);
+    CHECK(mk_derive_sender(k_call, (mk_stream_t)7, 0, call_id, salt_a, pk, key) != 0);
+    CHECK(mk_derive_sender(k_call, MK_STREAM_AUDIO, 0, call_id, salt_a, pk, NULL) != 0);
+    CHECK(mk_sender_id(k_call, call_id, salt_a, NULL, sid) != 0);
+    CHECK(mk_hello_key(k_call, call_id, NULL) != 0);
 
     return t_report("test_media_keys");
 }

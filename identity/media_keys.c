@@ -1,91 +1,129 @@
 /**
  * @file media_keys.c
- * @brief Per-direction media keys (see media_keys.h, audit M3/M5).
+ * @brief Sender-rooted media keys (see media_keys.h).
  */
 #include "media_keys.h"
 
 #include <sodium.h>
+#include <stddef.h>
 #include <string.h>
 
-int mk_salt_combine(const uint8_t master[MK_KEY_BYTES],
-                    const uint8_t half_a[MK_SALT_BYTES],
-                    const uint8_t half_b[MK_SALT_BYTES],
-                    uint8_t out_salt[MK_SALT_BYTES]) {
-    if (!master || !half_a || !half_b || !out_salt) return -1;
+/* BLAKE2b's minimum output; a SID is the first MK_SID_BYTES of one of these. */
+#define MK_SID_FULL_BYTES 16
 
-    /* Order by memcmp so the fold is commutative: the two ends do not have
-     * to agree on who is "a" and who is "b". */
-    const int cmp = memcmp(half_a, half_b, MK_SALT_BYTES);
-    const uint8_t *lo = (cmp <= 0) ? half_a : half_b;
-    const uint8_t *hi = (cmp <= 0) ? half_b : half_a;
-
-    static const char ctx[] = MK_SALT_CTX;
-    const size_t ctx_len = sizeof(ctx) - 1;
-
-    uint8_t info[sizeof(ctx) - 1 + 2 * MK_SALT_BYTES];
-    memcpy(info, ctx, ctx_len);
-    memcpy(info + ctx_len, lo, MK_SALT_BYTES);
-    memcpy(info + ctx_len + MK_SALT_BYTES, hi, MK_SALT_BYTES);
-
-    int rc = crypto_generichash(out_salt, MK_SALT_BYTES,
-                                info, sizeof(info),
-                                master, MK_KEY_BYTES);
-    sodium_memzero(info, sizeof(info));
-    return (rc == 0) ? 0 : -1;
+/* A call_id of all zeros means nobody set one. Refusing it keeps the
+ * cross-call replay barrier from being silently disabled by a caller that
+ * forgot to plumb the field through. */
+static int callid_is_zero(const uint8_t call_id[MK_CALLID_BYTES]) {
+    return sodium_is_zero(call_id, MK_CALLID_BYTES);
 }
 
-int mk_role_from_halves(const uint8_t local_half[MK_SALT_BYTES],
-                        const uint8_t peer_half[MK_SALT_BYTES],
-                        int *out_is_caller) {
-    if (!local_half || !peer_half || !out_is_caller) return -1;
+int mk_hello_key(const uint8_t k_call[MK_KEY_BYTES],
+                 const uint8_t call_id[MK_CALLID_BYTES],
+                 uint8_t out_key[MK_KEY_BYTES]) {
+    if (!k_call || !call_id || !out_key) return -1;
+    if (callid_is_zero(call_id)) return -1;
 
-    const int cmp = memcmp(local_half, peer_half, MK_SALT_BYTES);
-    if (cmp == 0) return -1;   /* reflected HELLO - see media_keys.h */
-
-    *out_is_caller = (cmp < 0) ? 1 : 0;
-    return 0;
-}
-
-int mk_derive(const uint8_t master[MK_KEY_BYTES],
-              mk_stream_t stream, mk_dir_t dir,
-              const uint8_t salt[MK_SALT_BYTES],
-              uint8_t out_key[MK_KEY_BYTES]) {
-    if (!master || !salt || !out_key) return -1;
-    if (stream != MK_STREAM_AUDIO && stream != MK_STREAM_VIDEO) return -1;
-    if (dir != MK_DIR_CALLER_TO_CALLEE && dir != MK_DIR_CALLEE_TO_CALLER) return -1;
-
-    static const char ctx[] = MK_CTX;
+    static const char ctx[] = MK_HELLO_CTX;
     const size_t ctx_len = sizeof(ctx) - 1;
 
-    uint8_t info[sizeof(ctx) - 1 + 2 + MK_SALT_BYTES];
+    uint8_t info[sizeof(ctx) - 1 + MK_CALLID_BYTES];
     memcpy(info, ctx, ctx_len);
-    info[ctx_len]     = (uint8_t)stream;
-    info[ctx_len + 1] = (uint8_t)dir;
-    memcpy(info + ctx_len + 2, salt, MK_SALT_BYTES);
+    memcpy(info + ctx_len, call_id, MK_CALLID_BYTES);
 
     int rc = crypto_generichash(out_key, MK_KEY_BYTES,
                                 info, sizeof(info),
-                                master, MK_KEY_BYTES);
+                                k_call, MK_KEY_BYTES);
     sodium_memzero(info, sizeof(info));
     return (rc == 0) ? 0 : -1;
 }
 
-int mk_derive_pair(const uint8_t master[MK_KEY_BYTES],
-                   mk_stream_t stream, int is_caller,
-                   const uint8_t salt[MK_SALT_BYTES],
-                   uint8_t out_send[MK_KEY_BYTES],
-                   uint8_t out_recv[MK_KEY_BYTES]) {
-    if (!out_send || !out_recv) return -1;
+int mk_derive_sender(const uint8_t k_call[MK_KEY_BYTES],
+                     mk_stream_t stream,
+                     uint16_t key_version,
+                     const uint8_t call_id[MK_CALLID_BYTES],
+                     const uint8_t sender_salt[MK_SALT_BYTES],
+                     const uint8_t idbind[MK_IDBIND_BYTES],
+                     uint8_t out_key[MK_KEY_BYTES]) {
+    if (!k_call || !call_id || !sender_salt || !idbind || !out_key) return -1;
+    if (stream != MK_STREAM_AUDIO && stream != MK_STREAM_VIDEO) return -1;
+    if (callid_is_zero(call_id)) return -1;
 
-    const mk_dir_t send_dir = is_caller ? MK_DIR_CALLER_TO_CALLEE
-                                        : MK_DIR_CALLEE_TO_CALLER;
-    const mk_dir_t recv_dir = is_caller ? MK_DIR_CALLEE_TO_CALLER
-                                        : MK_DIR_CALLER_TO_CALLEE;
+    static const char ctx[] = MK_CTX_V2;
+    const size_t ctx_len = sizeof(ctx) - 1;
 
-    if (mk_derive(master, stream, send_dir, salt, out_send) != 0) return -1;
-    if (mk_derive(master, stream, recv_dir, salt, out_recv) != 0) {
-        sodium_memzero(out_send, MK_KEY_BYTES);
-        return -1;
-    }
+    /* ctx || stream(1) || key_version(2 BE) || call_id || salt || idbind */
+    uint8_t info[sizeof(ctx) - 1 + 1 + 2 + MK_CALLID_BYTES
+                 + MK_SALT_BYTES + MK_IDBIND_BYTES];
+    size_t o = ctx_len;
+    memcpy(info, ctx, ctx_len);
+    info[o++] = (uint8_t)stream;
+    info[o++] = (uint8_t)((key_version >> 8) & 0xFF);   /* big endian */
+    info[o++] = (uint8_t)(key_version & 0xFF);
+    memcpy(info + o, call_id, MK_CALLID_BYTES);       o += MK_CALLID_BYTES;
+    memcpy(info + o, sender_salt, MK_SALT_BYTES);     o += MK_SALT_BYTES;
+    memcpy(info + o, idbind, MK_IDBIND_BYTES);
+
+    int rc = crypto_generichash(out_key, MK_KEY_BYTES,
+                                info, sizeof(info),
+                                k_call, MK_KEY_BYTES);
+    sodium_memzero(info, sizeof(info));
+    return (rc == 0) ? 0 : -1;
+}
+
+int mk_sender_id(const uint8_t k_call[MK_KEY_BYTES],
+                 const uint8_t call_id[MK_CALLID_BYTES],
+                 const uint8_t sender_salt[MK_SALT_BYTES],
+                 const uint8_t idbind[MK_IDBIND_BYTES],
+                 uint8_t out_sid[MK_SID_BYTES]) {
+    if (!k_call || !call_id || !sender_salt || !idbind || !out_sid) return -1;
+    if (callid_is_zero(call_id)) return -1;
+
+    static const char ctx[] = MK_SID_CTX;
+    const size_t ctx_len = sizeof(ctx) - 1;
+
+    /* No `stream`: one tag identifies a participant across every stream. */
+    uint8_t info[sizeof(ctx) - 1 + MK_CALLID_BYTES + MK_SALT_BYTES + MK_IDBIND_BYTES];
+    size_t o = ctx_len;
+    memcpy(info, ctx, ctx_len);
+    memcpy(info + o, call_id, MK_CALLID_BYTES);       o += MK_CALLID_BYTES;
+    memcpy(info + o, sender_salt, MK_SALT_BYTES);     o += MK_SALT_BYTES;
+    memcpy(info + o, idbind, MK_IDBIND_BYTES);
+
+    uint8_t full[MK_SID_FULL_BYTES];
+    int rc = crypto_generichash(full, sizeof(full),
+                                info, sizeof(info),
+                                k_call, MK_KEY_BYTES);
+    sodium_memzero(info, sizeof(info));
+    if (rc != 0) return -1;
+
+    memcpy(out_sid, full, MK_SID_BYTES);
+    sodium_memzero(full, sizeof(full));
     return 0;
+}
+
+int mk_hello_mac(const uint8_t hello_key[MK_KEY_BYTES],
+                 const uint8_t *hello, size_t hello_len,
+                 uint8_t out_mac[MK_MAC_BYTES]) {
+    if (!hello_key || !out_mac) return -1;
+    if (hello_len > 0 && !hello) return -1;
+
+    return (crypto_generichash(out_mac, MK_MAC_BYTES,
+                               hello, hello_len,
+                               hello_key, MK_KEY_BYTES) == 0) ? 0 : -1;
+}
+
+int mk_hello_mac_verify(const uint8_t hello_key[MK_KEY_BYTES],
+                        const uint8_t *hello, size_t hello_len,
+                        const uint8_t mac[MK_MAC_BYTES]) {
+    if (!mac) return -1;
+
+    uint8_t expect[MK_MAC_BYTES];
+    if (mk_hello_mac(hello_key, hello, hello_len, expect) != 0) return -1;
+
+    /* Constant time: a byte-at-a-time compare would leak the MAC one byte
+     * per forgery attempt, and the attacker controls how often it retries. */
+    int rc = sodium_memcmp(expect, mac, MK_MAC_BYTES);
+    sodium_memzero(expect, sizeof(expect));
+    return (rc == 0) ? 0 : -1;
 }

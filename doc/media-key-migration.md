@@ -716,3 +716,29 @@ These are product or ownership decisions. Everything in sections 1 through 10 is
 **O8. Domain separation strings.** `"fear.media.v2"`, `"fear.media.sid.v2"`, `"fear.media.hello.v2"` follow the existing `"fear.media.v1"` / `"fear.epoch.v1"` convention. They freeze into vectors on both platforms the moment step 1 lands, so settle them before step 1.
 
 **O9. Is hub hardening in this release?** `hub_forward` needs no crypto change, which is the payoff of the whole design, but `hub_find_or_add` admits any UDP source with no key check and `hub_prune` is unreachable during an active call. Neither is caused by this work, both are exposed by promoting the hub from "2-party only" to a supported group transport, and both are a real N-party join failure under churn.
+
+---
+
+## Owner decisions (31 July 2026)
+
+The open questions of the revised section are answered as follows.
+
+**O1 - who owns `call_id`: the initiator, delivered beside `K_call`.** The
+side that starts the call draws 16 random bytes and passes them to the media
+binaries the same way the key already travels: a second stdin line on desktop
+and a second parameter to `initialize()` on Android. No signalling layer is
+introduced for this. `mk_*` refuse an all-zero `call_id`, so a path that
+forgets to plumb it fails loudly at the first derivation instead of quietly
+dropping the cross-call replay barrier.
+
+**O2 - group audio first, group video after**, behind the same wire format.
+The format already carries what video needs, so this is purely a scheduling
+split: one mixer and N Opus decoders first, no display work.
+
+**O3 - 32 key slots reserved, decoder count set by what the hardware
+manages.** The table is sized for 32 participants because the transport
+already advertises that many and a table resize is a wire-visible change.
+The number of simultaneous decoders is a runtime limit, not a protocol
+constant: start with what a phone sustains and raise it once measured.
+
+Everything else in the revised section stands as written.
