@@ -1400,7 +1400,14 @@ int recv_and_decrypt(sock_t s, const char *room, const uint8_t *key, const char 
                    (inv.flags & CI_FLAG_VIDEO) ? "video" : "audio");
         }
         fflush(stdout);
-        return;
+        /* Same exit as every other branch. The bare return here leaked all
+         * five buffers on every invitation, and invitations repeat every few
+         * seconds for as long as somebody is waiting to be answered - and it
+         * did not compile at all on a toolchain where a valueless return from
+         * an int function is an error rather than a warning, which is what
+         * had the Windows build red. */
+        free(room_in); free(name); free(cipher); free(ad); free(plain);
+        return 0;
     }
 
     if (msg_type == MSG_TYPE_TEXT) {
