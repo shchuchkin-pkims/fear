@@ -124,6 +124,11 @@ static int g_have_call_id = 0;
 #define VC_MAX_MIX     8
 #define VC_MAX_VIDEO   4
 
+/* Longest we let a stream go without a keyframe. gop_size cannot guarantee
+ * this on its own because it counts frames, so a camera below the configured
+ * rate stretches the interval to match. */
+#define VC_KEYFRAME_MAX_GAP_MS 3000
+
 /* A participant silent this long gives its cell back rather than leaving a
  * frozen face in the grid. Generous, because it also covers the gap while a
  * sender's next keyframe is on its way. */
@@ -327,6 +332,11 @@ typedef struct VideoCall {
     atomic_int display_ready;
 
     /* Shared frame buffer for display thread */
+    /* Set when somebody joins, read by the send thread: a newcomer cannot
+     * decode us until we emit a keyframe, and the receive thread must not
+     * touch the encoder. */
+    atomic_int want_keyframe;
+
     /* Geometry of the most recent picture from anyone, kept only so the
      * peer-timeout path can size its black frame. */
     int disp_width;
@@ -752,6 +762,11 @@ static void handle_hello(VideoCall *vc, const uint8_t *buf, size_t len) {
      * which in a group call means one person rejoining freezes everybody
      * else's picture until their next keyframe. */
 
+    /* A newcomer decodes nothing of ours until a keyframe, and at the two
+     * seconds' worth of frames gop_size asks for it could be a minute on a
+     * slow camera. This is the other half of answering their HELLO. */
+    atomic_store(&vc->want_keyframe, 1);
+
     /* One reply, so the new participant learns our salt without waiting for
      * the next beacon. Repetition really is the announce loop's job now: it
      * keeps running for the life of the call, so a dropped reply costs the
@@ -1124,6 +1139,14 @@ static THREAD_RET th_vsend_func(void *arg) {
     uint32_t frame_id = 0;
     int frame_interval_ms = 1000 / preset->fps;
 
+    /* What we actually put on the wire. A receiver reporting "decoded 0"
+     * while its packet counter climbs is either missing our keyframes or
+     * getting nothing at all, and without a number from this end there is no
+     * way to tell which of the two it is. */
+    uint64_t tx_frames = 0, tx_bytes = 0, tx_keys = 0;
+    uint64_t tx_report_ms = video_time_ms();
+    uint64_t last_key_ms = 0;   /**< zero forces one on the first frame */
+
     while (atomic_load(&vc->running)) {
         uint64_t t0 = video_time_ms();
 
@@ -1163,9 +1186,42 @@ static THREAD_RET th_vsend_func(void *arg) {
         pthread_mutex_unlock(&vc->disp_lock);
 #endif
 
+        /* Somebody joined, or it has simply been too long since the last
+         * keyframe for anyone arriving now to have a way in. */
+        if (atomic_exchange(&vc->want_keyframe, 0) ||
+            (video_time_ms() - last_key_ms) >= VC_KEYFRAME_MAX_GAP_MS) {
+            video_encoder_request_keyframe(vc->v_enc);
+        }
+
         /* Encode VP8 */
         int vp8_size = video_encoder_encode(vc->v_enc, yuv_buf, vp8_buf, VC_MAX_VP8_FRAME);
         if (vp8_size <= 0) continue;
+
+        /* VP8 keeps the frame type in bit 0 of the first byte, clear for a
+         * keyframe. Counting them matters more than it looks: a stream whose
+         * keyframes never arrive decodes to nothing at all, however many
+         * interframes get through. */
+        tx_frames++;
+        tx_bytes += (uint64_t)vp8_size;
+        if ((vp8_buf[0] & 0x01) == 0) {
+            tx_keys++;
+            last_key_ms = video_time_ms();
+        }
+        {
+            uint64_t tnow = video_time_ms();
+            if (tnow - tx_report_ms >= 5000) {
+                double secs = (double)(tnow - tx_report_ms) / 1000.0;
+                printf("[VIDEO-TX] %.1f fps, %.0f kbit/s, %llu keyframes\n",
+                       (double)tx_frames / secs,
+                       (double)tx_bytes * 8.0 / secs / 1000.0,
+                       (unsigned long long)tx_keys);
+                fflush(stdout);
+                tx_frames = 0;
+                tx_bytes = 0;
+                tx_keys = 0;
+                tx_report_ms = tnow;
+            }
+        }
 
         /* Fragment */
         int nfrags = video_fragment_split(vp8_buf, vp8_size, frame_id, &frags);

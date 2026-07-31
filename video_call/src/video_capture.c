@@ -17,6 +17,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <time.h>
+#endif
 
 struct VideoCapture {
     AVFormatContext *fmt_ctx;
@@ -255,6 +260,12 @@ int video_capture_open(VideoCapture **cap, const char *device,
     /* Suppress FFmpeg warnings/info globally (swscaler deprecation, libvpx version, etc.) */
     av_log_set_level(AV_LOG_ERROR);
 
+    /* Non-blocking, so draining the camera queue can tell "empty" from "wait
+     * for the next frame". This has to be set before the device is opened:
+     * v4l2 picks O_NONBLOCK in device_open from this flag and never consults
+     * it again, which is why setting it around the drain did nothing. */
+    c->fmt_ctx->flags |= AVFMT_FLAG_NONBLOCK;
+
     /* First attempt may fail if camera doesn't support requested params — suppress logs */
     av_log_set_level(AV_LOG_QUIET);
     int ret = avformat_open_input(&c->fmt_ctx, input_name, ifmt, &opts);
@@ -277,6 +288,7 @@ int video_capture_open(VideoCapture **cap, const char *device,
 #else
         av_dict_set(&opts2, "input_format", "mjpeg", 0);
 #endif
+        c->fmt_ctx->flags |= AVFMT_FLAG_NONBLOCK;
         ret = avformat_open_input(&c->fmt_ctx, input_name, ifmt, &opts2);
         av_dict_free(&opts2);
 
@@ -381,6 +393,20 @@ int video_capture_open(VideoCapture **cap, const char *device,
     return 0;
 }
 
+/** Longest video_capture_read_latest waits for a first frame, in ms. */
+#define VC_CAPTURE_WAIT_MS 200
+
+static void msleep(unsigned ms) {
+#ifdef _WIN32
+    Sleep(ms);
+#else
+    struct timespec ts;
+    ts.tv_sec = (time_t)(ms / 1000u);
+    ts.tv_nsec = (long)(ms % 1000u) * 1000000L;
+    nanosleep(&ts, NULL);
+#endif
+}
+
 int video_capture_read(VideoCapture *cap, uint8_t *yuv_out, int max_size) {
     if (!cap || !yuv_out) return -1;
 
@@ -390,6 +416,9 @@ int video_capture_read(VideoCapture *cap, uint8_t *yuv_out, int max_size) {
 
     while (1) {
         int ret = av_read_frame(cap->fmt_ctx, cap->pkt);
+        /* Non-blocking context: an empty queue is a normal answer, and
+         * telling it apart from a broken camera is the whole point. */
+        if (ret == AVERROR(EAGAIN)) return 0;
         if (ret < 0) return -1;
 
         if (cap->pkt->stream_index != cap->stream_index) {
@@ -443,68 +472,44 @@ int video_capture_read(VideoCapture *cap, uint8_t *yuv_out, int max_size) {
 int video_capture_read_latest(VideoCapture *cap, uint8_t *yuv_out, int max_size) {
     if (!cap || !yuv_out) return -1;
 
-    /* Read first frame (blocking) */
-    int ret = video_capture_read(cap, yuv_out, max_size);
-    if (ret <= 0) return ret;
-
-    /* Drain any additional buffered frames non-blockingly.
-       On Windows dshow, this prevents rtbufsize from filling up. */
+    /*
+     * Take everything the camera has queued and keep the newest frame.
+     *
+     * The old shape read one frame blocking and then called av_read_frame up
+     * to ten more times, on the stated assumption that it would report EAGAIN
+     * once the queue was empty. On a blocking context it does not: it waits
+     * for the next frame. So every call spent eleven camera frames to return
+     * one, and a 10 fps webcam arrived at the far end as 0.9 fps. It broke
+     * keyframes with it, since gop_size counts frames rather than seconds -
+     * "every two seconds" became one a minute, and anyone who joined between
+     * two of them decoded nothing at all.
+     *
+     * The wait for the first frame is bounded so a camera that has gone quiet
+     * cannot hold the send thread; the caller sleeps briefly and comes back.
+     */
+    int have = 0;
     int drained = 0;
-    while (1) {
-        /* Try to read another frame without blocking.
-           av_read_frame will return AVERROR(EAGAIN) or similar if no more
-           buffered frames are available on some backends. On dshow it may
-           still block briefly, so we limit drain count. */
-        if (drained >= 10) break; /* safety limit */
+    int waited_ms = 0;
 
-        int got = av_read_frame(cap->fmt_ctx, cap->pkt);
-        if (got < 0) break;
+    for (;;) {
+        int n = video_capture_read(cap, yuv_out, max_size);
+        if (n < 0) return have ? 1 : -1;
 
-        if (cap->pkt->stream_index != cap->stream_index) {
-            av_packet_unref(cap->pkt);
+        if (n > 0) {
+            have = 1;
+            /* Bounded, so a camera delivering faster than we encode cannot
+             * keep this loop from ever returning. */
+            if (++drained >= 16) break;
             continue;
         }
 
-        got = avcodec_send_packet(cap->dec_ctx, cap->pkt);
-        av_packet_unref(cap->pkt);
-        if (got < 0) break;
-
-        got = avcodec_receive_frame(cap->dec_ctx, cap->raw_frame);
-        if (got < 0) break;
-
-        /* Convert to YUV420P */
-        sws_scale(cap->sws_ctx,
-                  (const uint8_t * const *)cap->raw_frame->data,
-                  cap->raw_frame->linesize,
-                  0, cap->cam_height,
-                  cap->yuv_frame->data, cap->yuv_frame->linesize);
-
-        /* Copy to output (overwrite previous frame) */
-        int offset = 0;
-        for (int row = 0; row < cap->height; row++) {
-            memcpy(yuv_out + offset,
-                   cap->yuv_frame->data[0] + row * cap->yuv_frame->linesize[0],
-                   cap->width);
-            offset += cap->width;
-        }
-        for (int row = 0; row < cap->height / 2; row++) {
-            memcpy(yuv_out + offset,
-                   cap->yuv_frame->data[1] + row * cap->yuv_frame->linesize[1],
-                   cap->width / 2);
-            offset += cap->width / 2;
-        }
-        for (int row = 0; row < cap->height / 2; row++) {
-            memcpy(yuv_out + offset,
-                   cap->yuv_frame->data[2] + row * cap->yuv_frame->linesize[2],
-                   cap->width / 2);
-            offset += cap->width / 2;
-        }
-
-        ret = offset;
-        drained++;
+        if (have) break;                       /* queue empty, newest in hand */
+        if (waited_ms >= VC_CAPTURE_WAIT_MS) return 0;
+        msleep(2);
+        waited_ms += 2;
     }
 
-    return ret;
+    return 1;
 }
 
 void video_capture_get_size(VideoCapture *cap, int *width, int *height) {
