@@ -117,6 +117,10 @@ static int g_have_call_id = 0;
    peer whose own single reply was lost can still learn our salt. */
 #define AC_HELLO_KEEPALIVE_MS 5000
 
+/* An RTT above this is somebody else's clock arriving in the echo, not a
+ * round trip. See where it is used. */
+#define AC_RTT_SANE_MAX_MS 5000
+
 /* Stats exchange interval (ms) */
 #define AC_STATS_INTERVAL_MS 2000
 
@@ -1083,9 +1087,14 @@ static THREAD_RET th_recv_func(void *arg) {
             AudioStatsPayload sp;
             if (plain_len < sizeof sp) continue;
             memcpy(&sp, plain, sizeof sp);
+            /* Same broadcast echo as the video path, same failure: in a
+             * group call most echoes carry a third machine's clock, and the
+             * subtraction produces the gap between two uptimes rather than a
+             * round trip. Only a plausible value can be one of ours. */
             if (sp.pong_ts != 0) {
                 uint32_t now32 = (uint32_t)(audio_time_ms() & 0xFFFFFFFF);
-                c->measured_rtt_ms = now32 - sp.pong_ts;
+                uint32_t rtt = now32 - sp.pong_ts;
+                if (rtt <= AC_RTT_SANE_MAX_MS) c->measured_rtt_ms = rtt;
             }
             c->last_peer_ping_ts = sp.ping_ts;
             c->peer_ping_recv_time = audio_time_ms();
