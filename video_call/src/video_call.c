@@ -17,6 +17,7 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
+#include <math.h>
 #include <stdatomic.h>
 #include <errno.h>
 #include <signal.h>
@@ -129,6 +130,17 @@ static int g_have_call_id = 0;
  * rate stretches the interval to match. */
 #define VC_KEYFRAME_MAX_GAP_MS 3000
 
+/* Choosing who is on the big view. A challenger has to be clearly louder
+ * than the holder, not merely louder: several people in one room hear each
+ * other's speakers and their levels sit close together, so a bare comparison
+ * hands the view around for no reason a viewer can see. */
+#define VC_SPEECH_FLOOR      900.0
+#define VC_ENERGY_DECAY      0.86
+#define VC_SPEAKER_MARGIN    1.6
+#define VC_SPEAKER_QUIET_MS  700
+#define VC_SPEAKER_DWELL_MS  1500
+#define VC_SPEAKING_HOLD_MS  900
+
 /* A participant silent this long gives its cell back rather than leaving a
  * frozen face in the grid. Generous, because it also covers the gap while a
  * sender's next keyframe is on its way. */
@@ -163,6 +175,8 @@ typedef struct {
     uint64_t     last_ms;    /**< when we last decoded a frame from it */
     int          prefilled;  /**< jitter buffer has reached the play-out depth */
     uint64_t     frames;     /**< frames actually mixed, for the teardown report */
+    double       energy;     /**< smoothed loudness: fast to rise, slow to fall */
+    uint64_t     voice_ms;   /**< when it was last above the speech floor */
 } MixSlot;
 
 /**
@@ -333,6 +347,15 @@ typedef struct VideoCall {
     atomic_int display_ready;
 
     /* Shared frame buffer for display thread */
+    /* Who is on the big view, who the user put there, and when it last
+     * changed hands. Display thread only. */
+    int      main_slot;
+    int      pinned_slot;
+    uint64_t last_switch_ms;
+    /** Which participant each drawn strip cell belongs to, for click picking. */
+    int      tile_slot[VD_MAX_TILES];
+    int      tile_count;
+
     /* Set when somebody joins, read by the send thread: a newcomer cannot
      * decode us until we emit a keyframe, and the receive thread must not
      * touch the encoder. */
@@ -1083,8 +1106,11 @@ static void vc_render_frame(VideoCall *vc) {
     if (!vc->display) return;
 
     VideoTile tiles[VD_MAX_TILES];
+    VideoTile main_tile;
     int n = 0;
+    int have_main = 0;
 
+    mix_lock_take(vc);
 #ifdef _WIN32
     EnterCriticalSection(&vc->disp_lock);
 #else
@@ -1093,21 +1119,88 @@ static void vc_render_frame(VideoCall *vc) {
 
     uint64_t now = video_time_ms();
 
-    /* Slot order rather than arrival order, so a participant keeps its cell
-     * instead of trading places with whoever decoded most recently. */
+    /* Whoever the user chose outranks the speaker: the point of choosing
+     * somebody is that they stay chosen while other people talk. */
+    int want = -1;
+    if (vc->pinned_slot >= 0) {
+        for (int i = 0; i < VC_MAX_VIDEO; i++) {
+            if (vc->vid[i].slot == vc->pinned_slot) { want = vc->pinned_slot; break; }
+        }
+        if (want < 0) vc->pinned_slot = -1;   /* they left */
+    }
+
+    if (want < 0) {
+        /* Somebody with no camera would take the big view and leave it
+         * empty, so the choice is between the pictures that exist. */
+        int holder_alive = 0;
+        for (int i = 0; i < VC_MAX_VIDEO; i++) {
+            if (vc->vid[i].slot >= 0 && vc->vid[i].slot == vc->main_slot) holder_alive = 1;
+        }
+        if (!holder_alive) vc->main_slot = -1;
+
+        int loudest = -1;
+        double loudest_e = 0.0, holder_e = 0.0;
+        uint64_t holder_voice = 0;
+        for (int i = 0; i < VC_MAX_MIX; i++) {
+            MixSlot *m = &vc->mix[i];
+            if (m->slot < 0) continue;
+            int has_video = 0;
+            for (int k = 0; k < VC_MAX_VIDEO; k++) {
+                if (vc->vid[k].slot == m->slot) { has_video = 1; break; }
+            }
+            if (!has_video) continue;
+            if (m->slot == vc->main_slot) { holder_e = m->energy; holder_voice = m->voice_ms; }
+            if (m->energy > loudest_e) { loudest_e = m->energy; loudest = m->slot; }
+        }
+
+        if (vc->main_slot < 0) {
+            for (int i = 0; i < VC_MAX_VIDEO; i++) {
+                if (vc->vid[i].slot >= 0) { vc->main_slot = vc->vid[i].slot; break; }
+            }
+            vc->last_switch_ms = now;
+        } else if (loudest >= 0 && loudest != vc->main_slot &&
+                   loudest_e >= VC_SPEECH_FLOOR &&
+                   loudest_e >= holder_e * VC_SPEAKER_MARGIN &&
+                   (now - holder_voice) >= VC_SPEAKER_QUIET_MS &&
+                   (now - vc->last_switch_ms) >= VC_SPEAKER_DWELL_MS) {
+            vc->main_slot = loudest;
+            vc->last_switch_ms = now;
+        }
+        want = vc->main_slot;
+    } else {
+        vc->main_slot = want;
+    }
+
+    /* Slot order rather than arrival order, so a participant keeps its place
+     * in the strip instead of trading it with whoever decoded most recently. */
     for (int i = 0; i < VC_MAX_VIDEO && n < VD_MAX_TILES; i++) {
         VidSlot *v = &vc->vid[i];
         if (v->slot < 0 || !v->yuv || v->w <= 0 || v->h <= 0) continue;
         if (v->pic_ms && (now - v->pic_ms) > VC_TILE_STALE_MS) continue;
 
-        tiles[n].yuv    = v->yuv;
-        tiles[n].width  = v->w;
-        tiles[n].height = v->h;
-        tiles[n].label  = v->label;
+        int speaking = 0;
+        for (int k = 0; k < VC_MAX_MIX; k++) {
+            if (vc->mix[k].slot != v->slot) continue;
+            speaking = (now - vc->mix[k].voice_ms) < VC_SPEAKING_HOLD_MS;
+            break;
+        }
+
+        tiles[n].yuv      = v->yuv;
+        tiles[n].width    = v->w;
+        tiles[n].height   = v->h;
+        tiles[n].label    = v->label;
+        tiles[n].speaking = speaking;
+        tiles[n].pinned   = (v->slot == vc->pinned_slot);
+        tiles[n].on_main  = (v->slot == want);
+
+        if (v->slot == want) {
+            main_tile = tiles[n];
+            have_main = 1;
+        }
+
         /* Pictures that reached the window, not renders that included this
          * cell: everyone present is redrawn whenever anyone delivers a frame,
-         * so counting renders reported more shown than decoded - 2671 of 443
-         * in the first three-way call - which is worse than not reporting. */
+         * so counting renders reported more shown than decoded. */
         if (v->pic_ms != v->shown_ms) {
             v->shown_ms = v->pic_ms;
             v->shown++;
@@ -1116,9 +1209,21 @@ static void vc_render_frame(VideoCall *vc) {
     }
 
     if (n > 0) {
-        video_display_render_grid(vc->display, tiles, n,
-                                  vc->local_yuv, vc->local_width,
-                                  vc->local_height);
+        video_display_render_speaker(vc->display, have_main ? &main_tile : NULL,
+                                     tiles, n,
+                                     vc->local_yuv, vc->local_width,
+                                     vc->local_height);
+        /* The strip is drawn in the same order as this array, so a click
+         * index maps straight back to a participant. */
+        for (int i = 0; i < n && i < VC_MAX_VIDEO; i++) vc->tile_slot[i] = -1;
+        int t = 0;
+        for (int i = 0; i < VC_MAX_VIDEO && t < n; i++) {
+            VidSlot *v = &vc->vid[i];
+            if (v->slot < 0 || !v->yuv || v->w <= 0 || v->h <= 0) continue;
+            if (v->pic_ms && (now - v->pic_ms) > VC_TILE_STALE_MS) continue;
+            vc->tile_slot[t++] = v->slot;
+        }
+        vc->tile_count = t;
     }
 
 #ifdef _WIN32
@@ -1126,6 +1231,7 @@ static void vc_render_frame(VideoCall *vc) {
 #else
     pthread_mutex_unlock(&vc->disp_lock);
 #endif
+    mix_lock_drop(vc);
 }
 
 /* ===== Thread: Video Send ===== */
@@ -1560,6 +1666,25 @@ static THREAD_RET th_recv_func(void *arg) {
                     memset(pcm + dec_samples * VC_CHANNELS, 0,
                            (VC_FRAME_SAMPLES - dec_samples) * VC_CHANNELS * sizeof(int16_t));
                 }
+                /* Loudness, which is what decides the big view. Video
+                 * arrival cannot decide it: nothing gates sending on speech,
+                 * so every camera streams continuously and "whoever decoded
+                 * last" alternates at random - nine handovers in ten seconds,
+                 * measured, which is why this used to be a fixed choice
+                 * instead of a speaker. Speech is a property of the audio,
+                 * and the mixer has already decoded it. */
+                {
+                    double sum = 0.0;
+                    int n = dec_samples * VC_CHANNELS;
+                    for (int k = 0; k < n; k++) {
+                        double d = (double)pcm[k];
+                        sum += d * d;
+                    }
+                    double rms = (n > 0) ? sqrt(sum / (double)n) : 0.0;
+                    m->energy = (rms > m->energy) ? rms : m->energy * VC_ENERGY_DECAY;
+                    if (rms > VC_SPEECH_FLOOR) m->voice_ms = video_time_ms();
+                }
+
                 pcmring_push(&m->ring, pcm);
                 m->last_ms = video_time_ms();
 
@@ -1757,6 +1882,8 @@ static THREAD_RET th_disp_func(void *arg) {
         /* Render new frame if available */
         if (atomic_load(&vc->disp_new_frame)) {
             atomic_store(&vc->disp_new_frame, 0);
+    vc->main_slot = -1;
+    vc->pinned_slot = -1;
             vc_render_frame(vc);
         } else {
             msleep(16);
@@ -2524,6 +2651,16 @@ static int start_video_call(const char *remote_ip, uint16_t remote_port,
             while (SDL_PollEvent(&ev)) {
                 if (ev.type == SDL_EVENT_QUIT) {
                     atomic_store(&vc->running, 0);
+                } else if (ev.type == SDL_EVENT_MOUSE_BUTTON_DOWN) {
+                    /* A click in the strip pins that participant to the big
+                     * view, and a second click on the same one lets the
+                     * speaker have it back. */
+                    int idx = video_display_hit_test(vc->display, ev.button.x, ev.button.y);
+                    if (idx >= 0 && idx < vc->tile_count) {
+                        int slot = vc->tile_slot[idx];
+                        vc->pinned_slot = (vc->pinned_slot == slot) ? -1 : slot;
+                        atomic_store(&vc->disp_new_frame, 1);
+                    }
                 }
             }
 

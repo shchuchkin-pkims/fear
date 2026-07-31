@@ -26,6 +26,9 @@ typedef struct {
     int width;            /**< frame width */
     int height;           /**< frame height */
     const char *label;    /**< short caption drawn in the cell, or NULL */
+    int speaking;         /**< outlined as the one talking */
+    int pinned;           /**< outlined as chosen by the user */
+    int on_main;          /**< outlined as the one on the big view */
 } VideoTile;
 
 /**
@@ -93,6 +96,37 @@ int video_display_render_pip(VideoDisplay *disp,
 int video_display_render_grid(VideoDisplay *disp,
                               const VideoTile *tiles, int ntiles,
                               const uint8_t *local_yuv, int local_w, int local_h);
+
+/**
+ * @brief Render one participant large with the rest in a strip
+ * @param disp Display context
+ * @param main_tile The participant on the big view, or NULL for none
+ * @param tiles Everyone, in a stable order, for the strip
+ * @param ntiles How many, clamped to VD_MAX_TILES
+ * @param local_yuv Local camera frame (NULL to skip PiP)
+ * @param local_w Local frame width
+ * @param local_h Local frame height
+ * @return 0 on success, -1 on error
+ *
+ * The big view is letterboxed and captioned; the strip cells are captioned
+ * and outlined by state - amber for pinned, blue for whoever is on the big
+ * view, green while they are talking. Cell rectangles are kept so a click
+ * can be turned back into a participant; see video_display_hit_test.
+ */
+int video_display_render_speaker(VideoDisplay *disp,
+                                 const VideoTile *main_tile,
+                                 const VideoTile *tiles, int ntiles,
+                                 const uint8_t *local_yuv,
+                                 int local_w, int local_h);
+
+/**
+ * @brief Which strip cell a click landed in
+ * @param disp Display context
+ * @param x Pointer x, in window coordinates
+ * @param y Pointer y, in window coordinates
+ * @return index into the tiles array of the last render, or -1
+ */
+int video_display_hit_test(VideoDisplay *disp, float x, float y);
 
 /**
  * @brief Set RTT value to display as overlay on video
