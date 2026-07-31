@@ -165,9 +165,6 @@ if(NOT FEAR_GUI_ONLY)
             "${CMAKE_SOURCE_DIR}/updater/cacert.pem"
             "${BIN_DIRECTORY}/cacert.pem"
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "${CMAKE_SOURCE_DIR}/updater/libcurl-x64.dll"
-            "${BIN_DIRECTORY}/libcurl-x64.dll"
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${CMAKE_SOURCE_DIR}/updater/updater.conf"
             "${BIN_DIRECTORY}/updater.conf"
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
@@ -175,6 +172,17 @@ if(NOT FEAR_GUI_ONLY)
             "${DOC_DIRECTORY}/manual.pdf"
         COMMENT "Copying runtime files to output directory"
     )
+
+    # libcurl ships as a DLL beside the updater on Windows only. Copying it
+    # unconditionally put a .dll in the middle of a Linux build output, which
+    # reads like a broken build to anyone who just cloned the repository.
+    if(WIN32)
+        add_custom_command(TARGET copy-runtime-files POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${CMAKE_SOURCE_DIR}/updater/libcurl-x64.dll"
+                "${BIN_DIRECTORY}/libcurl-x64.dll"
+        )
+    endif()
 endif()
 
 # Копирование DLL при сборке на Windows (только для динамически слинкованных библиотек)
