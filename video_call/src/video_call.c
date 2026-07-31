@@ -120,17 +120,18 @@ static int g_have_call_id = 0;
  * table, so it comes back the moment it speaks again.
  *
  * Video is a quarter of audio deliberately: a VP8 decoder costs orders of
- * magnitude more than an Opus one, and only one participant is on screen. */
+ * magnitude more than an Opus one, and four pictures already fill a window. */
 #define VC_MAX_MIX     8
 #define VC_MAX_VIDEO   4
 
-/* Active-speaker hysteresis. One window, several senders, so somebody has to
- * be chosen; the rules and why they are these rules are on
- * vc_speaker_should_switch below. */
-#define VC_SPEAKER_QUIET_MS      700   /* holder silent this long: up for grabs */
-#define VC_SPEAKER_TAKE_FRAMES   2     /* challenger must deliver this many */
-#define VC_SPEAKER_DWELL_MS      1200  /* minimum time between two switches */
-#define VC_SPEAKER_STALE_MS      400   /* a challenger quiet this long is dropped */
+/* A participant silent this long gives its cell back rather than leaving a
+ * frozen face in the grid. Generous, because it also covers the gap while a
+ * sender's next keyframe is on its way. */
+#define VC_TILE_STALE_MS  3000
+
+/* An RTT above this cannot be a round trip on any network we serve, so it is
+ * somebody else's clock arriving in the echo. See where it is used. */
+#define VC_RTT_SANE_MAX_MS 5000
 
 /* AES-GCM constants */
 #define AES_GCM_KEY_LEN   crypto_aead_aes256gcm_KEYBYTES
@@ -177,6 +178,17 @@ typedef struct {
     uint64_t      last_ms;   /**< last fragment accepted from it */
     uint64_t      frames;    /**< pictures decoded, for the teardown report */
     uint64_t      shown;     /**< ...of which reached the window */
+
+    /* This participant's latest picture, its own rather than shared: the
+     * window shows everyone at once, so there is no single current frame.
+     * Written by the receive thread and read by the display thread, both
+     * under disp_lock. */
+    uint8_t      *yuv;
+    size_t        yuv_cap;
+    int           w;
+    int           h;
+    uint64_t      pic_ms;    /**< when that picture was decoded */
+    char          label[8];  /**< sender tag, captioned in the cell */
 } VidSlot;
 
 typedef struct VideoCall {
@@ -254,15 +266,6 @@ typedef struct VideoCall {
      * single YUV buffer below, under disp_lock, exactly as before. */
     VidSlot vid[VC_MAX_VIDEO];
 
-    /* Active speaker: which sender owns the one window, and the state that
-     * keeps a stray packet from taking it. Receive thread only. */
-    int      disp_slot;        /**< sender slot on screen, or -1 */
-    uint64_t disp_last_ms;     /**< last picture from the slot on screen */
-    uint64_t disp_switch_ms;   /**< when the window last changed hands */
-    int      cand_slot;        /**< challenger, or -1 */
-    uint64_t cand_last_ms;     /**< its most recent picture */
-    uint64_t cand_frames;      /**< pictures it has delivered as challenger */
-
     /* Configuration */
     int video_enabled;
     int audio_enabled;
@@ -323,7 +326,8 @@ typedef struct VideoCall {
     atomic_int display_ready;
 
     /* Shared frame buffer for display thread */
-    uint8_t *disp_yuv;
+    /* Geometry of the most recent picture from anyone, kept only so the
+     * peer-timeout path can size its black frame. */
     int disp_width;
     int disp_height;
     atomic_int disp_new_frame;
@@ -964,14 +968,22 @@ static VidSlot *vid_acquire(VideoCall *vc, int slot) {
             video_decoder_close(chosen->dec);
             chosen->dec = NULL;
         }
-        /* The window cannot stay pointed at a participant we no longer
-         * decode, and a challenger that just lost its decoder is not a
-         * challenger any more. */
-        if (vc->disp_slot == chosen->slot) vc->disp_slot = -1;
-        if (vc->cand_slot == chosen->slot) {
-            vc->cand_slot = -1;
-            vc->cand_frames = 0;
-        }
+        /* The picture belongs to the participant losing the slot, so it
+         * leaves with them instead of sitting in the grid under somebody
+         * else's caption. The buffer itself is kept for reuse. */
+#ifdef _WIN32
+        EnterCriticalSection(&vc->disp_lock);
+#else
+        pthread_mutex_lock(&vc->disp_lock);
+#endif
+        chosen->w = 0;
+        chosen->h = 0;
+        chosen->pic_ms = 0;
+#ifdef _WIN32
+        LeaveCriticalSection(&vc->disp_lock);
+#else
+        pthread_mutex_unlock(&vc->disp_lock);
+#endif
     }
 
     if (!chosen->dec) {
@@ -988,61 +1000,72 @@ static VidSlot *vid_acquire(VideoCall *vc, int slot) {
     chosen->slot = slot;
     chosen->frames = 0;
     chosen->shown = 0;
+    {
+        /* Resolved here, on the thread that owns the sender table, so the
+         * display side never reads it. */
+        uint8_t sid[MK_SID_BYTES];
+        vc_sid_of(vc, slot, sid);
+        snprintf(chosen->label, sizeof chosen->label, "%02x%02x%02x",
+                 sid[0], sid[1], sid[2]);
+    }
     return chosen;
 }
 
 /**
- * Active-speaker policy: whether `slot` should take over the one window.
+ * Paint every participant we are decoding, tiled, with our own camera in the
+ * corner.
  *
- * There is a single SDL window and no tiling, so one participant has to be
- * chosen. The behaviour this replaces was "render whichever picture decoded
- * last", which with three senders repaints the window from a different person
- * several times a second and is what makes three senders look broken.
+ * This replaces an active-speaker policy that chose one participant to show.
+ * That policy was a fair reading of a one-window constraint, but the
+ * constraint was self-imposed: the decoders and reassemblers were already per
+ * sender and only the presentation was not. Choosing between people is a
+ * worse answer than showing them, and it read exactly as the defect it was -
+ * "I saw either the laptop or the phone, never both".
  *
- * The policy is sticky: the participant holding the window keeps it while its
- * pictures keep arriving, and hands over only after VC_SPEAKER_QUIET_MS with
- * nothing from it, to a challenger that has delivered VC_SPEAKER_TAKE_FRAMES
- * pictures of its own. VC_SPEAKER_DWELL_MS is a floor on how often the window
- * may change hands at all, so a participant whose video keeps stalling and
- * resuming cannot make it strobe.
- *
- * Sticky rather than most-recently-arrived, and this is the part worth
- * arguing with: nothing in this build gates sending on speech, so every
- * camera streams continuously and "whose picture arrived most recently"
- * alternates at random between everyone present. Any rule built on it hands
- * the window back and forth on a timer - measured, with two 30 fps senders it
- * switched nine times in ten seconds. Video arrival simply is not a speaking
- * signal here. A real active-speaker switch needs audio energy, which this
- * build does not compute anywhere; until it does, holding one participant
- * steady and naming them is the honest thing the available signal supports.
- *
- * Driven by decoded pictures rather than arriving fragments on purpose:
- * handing the window to a participant whose decoder has not yet seen a
- * keyframe would freeze it on the previous holder's last frame.
- *
- * Call once per decoded picture. Returns 1 when `slot` takes the window.
+ * Rendering happens under disp_lock, as it did before: the alternative is
+ * copying every participant's frame out first, which costs more than the
+ * receive thread waiting out a present.
  */
-static int vc_speaker_should_switch(VideoCall *vc, int slot, uint64_t now) {
-    if (vc->disp_slot < 0) return 1;
-    if (slot == vc->disp_slot) return 0;
+static void vc_render_frame(VideoCall *vc) {
+    if (!vc->display) return;
 
-    /* One challenger at a time, and it keeps its candidacy while it keeps
-     * sending. A third participant interleaving its own pictures cannot reset
-     * the count - if it could, two senders arriving alternately would cancel
-     * each other out forever and the window would stay frozen on somebody who
-     * has already left the call. */
-    if (vc->cand_slot < 0 ||
-        (slot != vc->cand_slot && (now - vc->cand_last_ms) >= VC_SPEAKER_STALE_MS)) {
-        vc->cand_slot = slot;
-        vc->cand_frames = 0;
+    VideoTile tiles[VD_MAX_TILES];
+    int n = 0;
+
+#ifdef _WIN32
+    EnterCriticalSection(&vc->disp_lock);
+#else
+    pthread_mutex_lock(&vc->disp_lock);
+#endif
+
+    uint64_t now = video_time_ms();
+
+    /* Slot order rather than arrival order, so a participant keeps its cell
+     * instead of trading places with whoever decoded most recently. */
+    for (int i = 0; i < VC_MAX_VIDEO && n < VD_MAX_TILES; i++) {
+        VidSlot *v = &vc->vid[i];
+        if (v->slot < 0 || !v->yuv || v->w <= 0 || v->h <= 0) continue;
+        if (v->pic_ms && (now - v->pic_ms) > VC_TILE_STALE_MS) continue;
+
+        tiles[n].yuv    = v->yuv;
+        tiles[n].width  = v->w;
+        tiles[n].height = v->h;
+        tiles[n].label  = v->label;
+        v->shown++;
+        n++;
     }
-    if (slot != vc->cand_slot) return 0;
-    vc->cand_last_ms = now;
-    vc->cand_frames++;
 
-    if ((now - vc->disp_last_ms) < VC_SPEAKER_QUIET_MS) return 0;
-    if ((now - vc->disp_switch_ms) < VC_SPEAKER_DWELL_MS) return 0;
-    return vc->cand_frames >= VC_SPEAKER_TAKE_FRAMES;
+    if (n > 0) {
+        video_display_render_grid(vc->display, tiles, n,
+                                  vc->local_yuv, vc->local_width,
+                                  vc->local_height);
+    }
+
+#ifdef _WIN32
+    LeaveCriticalSection(&vc->disp_lock);
+#else
+    pthread_mutex_unlock(&vc->disp_lock);
+#endif
 }
 
 /* ===== Thread: Video Send ===== */
@@ -1490,44 +1513,26 @@ static THREAD_RET th_recv_func(void *arg) {
             if (yuv_size <= 0 || dec_w <= 0 || dec_h <= 0) continue;
             v->frames++;
 
-            /* One window, so one speaker. Without this the window shows
-             * whichever sender decoded most recently and flips several times
-             * a second with three people in the room. */
-            if (vc_speaker_should_switch(vc, slot, now)) {
-                uint8_t was[MK_SID_BYTES], is[MK_SID_BYTES];
-                vc_sid_of(vc, vc->disp_slot, was);
-                vc_sid_of(vc, slot, is);
-                if (vc->disp_slot >= 0) {
-                    printf("[VIDEO] active speaker %02x%02x%02x (was %02x%02x%02x)\n",
-                           is[0], is[1], is[2], was[0], was[1], was[2]);
-                } else {
-                    printf("[VIDEO] active speaker %02x%02x%02x\n",
-                           is[0], is[1], is[2]);
-                }
-                fflush(stdout);
-                vc->disp_slot = slot;
-                vc->disp_switch_ms = now;
-                vc->cand_slot = -1;
-                vc->cand_frames = 0;
-            }
-            if (slot != vc->disp_slot) continue;
-            vc->disp_last_ms = now;
-            v->shown++;
-
-            /* Pass to the display side */
+            /* Every participant keeps its own picture. Nothing is chosen
+             * between them any more; the window is a grid. */
 #ifdef _WIN32
             EnterCriticalSection(&vc->disp_lock);
 #else
             pthread_mutex_lock(&vc->disp_lock);
 #endif
-            if (!vc->disp_yuv || vc->disp_width != dec_w || vc->disp_height != dec_h) {
-                free(vc->disp_yuv);
-                vc->disp_yuv = (uint8_t *)malloc(yuv_size);
+            if (!v->yuv || v->yuv_cap < (size_t)yuv_size) {
+                free(v->yuv);
+                v->yuv = (uint8_t *)malloc((size_t)yuv_size);
+                v->yuv_cap = v->yuv ? (size_t)yuv_size : 0;
+            }
+            if (v->yuv) {
+                memcpy(v->yuv, yuv_dec, (size_t)yuv_size);
+                v->w = dec_w;
+                v->h = dec_h;
+                v->pic_ms = now;
+                /* Only for sizing the black frame on peer timeout. */
                 vc->disp_width = dec_w;
                 vc->disp_height = dec_h;
-            }
-            if (vc->disp_yuv) {
-                memcpy(vc->disp_yuv, yuv_dec, yuv_size);
                 atomic_store(&vc->disp_new_frame, 1);
             }
 #ifdef _WIN32
@@ -1552,9 +1557,32 @@ static THREAD_RET th_recv_func(void *arg) {
 
                 /* RTT: sp.rtt_ms = echo of our ping + hold time
                    sp.reserved = peer's current ping timestamp */
+                /* The echo is addressed to nobody. A participant echoes
+                 * whichever peer it heard from last, and every participant
+                 * receives it, so in a group call most echoes carry a
+                 * timestamp taken on a third machine's clock - and
+                 * subtracting that from ours yields the difference between
+                 * two unrelated uptimes.
+                 *
+                 * That is not a hypothesis. It is where the
+                 * "[quality] RTT 248084855 ms (critical), capping to LOW" in
+                 * a live three-way call came from: 2.9 days, which pinned
+                 * every sender at 320x240 for the whole call.
+                 *
+                 * Foreign values are spread over the full 32-bit millisecond
+                 * range, so demanding a plausible one keeps ours and discards
+                 * theirs - the odds of a third machine's clock landing within
+                 * a few seconds of ours are about one in a million per
+                 * packet. What survives is a real round trip to a real peer:
+                 * whichever one echoed us last, not necessarily the worst
+                 * path. Naming the peer would need a field in the stats
+                 * payload and a wire break on both platforms; this needs
+                 * neither, and it is the difference between a usable number
+                 * and a catastrophic one. */
                 if (sp.rtt_ms != 0) {
                     uint32_t now32 = (uint32_t)(video_time_ms() & 0xFFFFFFFF);
-                    vc->measured_rtt_ms = now32 - sp.rtt_ms;
+                    uint32_t rtt = now32 - sp.rtt_ms;
+                    if (rtt <= VC_RTT_SANE_MAX_MS) vc->measured_rtt_ms = rtt;
                 }
                 vc->last_peer_ping_ts = sp.reserved;
                 vc->peer_ping_recv_time = video_time_ms();
@@ -1627,22 +1655,8 @@ static THREAD_RET th_disp_func(void *arg) {
 
         /* Render new frame if available */
         if (atomic_load(&vc->disp_new_frame)) {
-#ifdef _WIN32
-            EnterCriticalSection(&vc->disp_lock);
-#else
-            pthread_mutex_lock(&vc->disp_lock);
-#endif
-            if (vc->disp_yuv) {
-                video_display_render_pip(vc->display,
-                                         vc->disp_yuv, vc->disp_width, vc->disp_height,
-                                         vc->local_yuv, vc->local_width, vc->local_height);
-            }
             atomic_store(&vc->disp_new_frame, 0);
-#ifdef _WIN32
-            LeaveCriticalSection(&vc->disp_lock);
-#else
-            pthread_mutex_unlock(&vc->disp_lock);
-#endif
+            vc_render_frame(vc);
         } else {
             msleep(16);
         }
@@ -1810,7 +1824,7 @@ static void video_call_stop(VideoCall *vc) {
 
     if (vc->tcp_sock) CLOSESOCK(vc->tcp_sock);
     if (vc->sock) CLOSESOCK(vc->sock);
-    free(vc->disp_yuv);
+    for (int i = 0; i < VC_MAX_VIDEO; i++) free(vc->vid[i].yuv);
     free(vc->local_yuv);
 
 #ifdef _WIN32
@@ -2192,8 +2206,6 @@ static int start_video_call(const char *remote_ip, uint16_t remote_port,
         vc->vid[i].shown = 0;
         video_frag_receiver_init(&vc->vid[i].frag);
     }
-    vc->disp_slot = -1;
-    vc->cand_slot = -1;
 
     /* Socket */
     vc->sock = (socket_t)socket(AF_INET, SOCK_DGRAM, 0);
@@ -2433,22 +2445,8 @@ static int start_video_call(const char *remote_ip, uint16_t remote_port,
             }
 
             if (atomic_load(&vc->disp_new_frame)) {
-#ifdef _WIN32
-                EnterCriticalSection(&vc->disp_lock);
-#else
-                pthread_mutex_lock(&vc->disp_lock);
-#endif
-                if (vc->disp_yuv) {
-                    video_display_render_pip(vc->display,
-                                             vc->disp_yuv, vc->disp_width, vc->disp_height,
-                                             vc->local_yuv, vc->local_width, vc->local_height);
-                }
                 atomic_store(&vc->disp_new_frame, 0);
-#ifdef _WIN32
-                LeaveCriticalSection(&vc->disp_lock);
-#else
-                pthread_mutex_unlock(&vc->disp_lock);
-#endif
+                vc_render_frame(vc);
             }
 
             msleep(16);
