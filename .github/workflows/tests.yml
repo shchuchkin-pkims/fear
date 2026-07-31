@@ -45,8 +45,11 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DFEAR_GUI_ONLY=ON
 
-      - name: Build tests and console client
-        run: cmake --build build --target fear test_identity test_backup test_contacts test_key_schedule test_rotation test_media_keys test_blob_auth -j
+      # Build everything rather than an enumerated list: the list went stale
+      # the moment a new test target was added, and ctest then failed on a
+      # missing executable instead of on a real defect.
+      - name: Build
+        run: cmake --build build -j
 
       - name: Run tests
         run: ctest --test-dir build --output-on-failure
