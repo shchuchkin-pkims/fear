@@ -747,8 +747,10 @@ static void handle_hello(VideoCall *vc, const uint8_t *buf, size_t len) {
      * which in a group call means one person rejoining freezes everybody
      * else's picture until their next keyframe. */
 
-    /* Exactly one reply, so the new participant learns our salt. Repetition is
-     * the announce loop's job, not this path's. */
+    /* One reply, so the new participant learns our salt without waiting for
+     * the next beacon. Repetition really is the announce loop's job now: it
+     * keeps running for the life of the call, so a dropped reply costs the
+     * newcomer a beacon interval instead of the whole call. */
     if (vc->peer_set || vc->tcp_sock) send_hello(vc);
 }
 
@@ -2370,15 +2372,32 @@ static int start_video_call(const char *remote_ip, uint16_t remote_port,
     /* Main loop: SDL event handling + frame rendering + peer timeout */
     #define PEER_TIMEOUT_MS 5000
     #define HELLO_REANNOUNCE_MS 1000
+    #define HELLO_KEEPALIVE_MS 5000
     uint64_t last_announce_ms = video_time_ms();
     while (!atomic_load(&g_sigint) && atomic_load(&vc->running)) {
-        /* Re-announce until somebody answers. A HELLO2 carries only our own
-         * salt, and ms_install is idempotent per salt, so repeating it resets
-         * nothing at the peer. This replaces the spin the send threads used to
-         * do, which blocked encryption on a handshake it no longer needs. */
-        if (atomic_load(&vc->peers_known) == 0 && (vc->peer_set || vc->tcp_sock)) {
+        /* Announce for the whole call: quickly while nobody has answered,
+         * because the first HELLO is simply lost if the other side is not up
+         * yet, and slowly afterwards, because the single reply a newcomer
+         * draws from us is one packet with no retransmission behind it.
+         *
+         * This loop used to stop at the first peer, and that is exactly what
+         * a three-device call fell over on: two participants found each other
+         * and went quiet, a phone joined afterwards, and its HELLO was heard
+         * by both while neither reply reached it. It sent video everyone
+         * could see and received nothing, then timed out - five times in a
+         * row. audio_call has carried the two-rate shape since the group work
+         * landed; video never got it, which is also why an audio call to the
+         * same phone had always worked.
+         *
+         * A HELLO2 carries only our own salt, ms_install is idempotent per
+         * salt, and a repeat draws no reply of its own, so this resets
+         * nothing at the peer and cannot become a handshake storm. */
+        if (vc->peer_set || vc->tcp_sock) {
             uint64_t now_ms = video_time_ms();
-            if (now_ms - last_announce_ms >= HELLO_REANNOUNCE_MS) {
+            uint64_t hello_gap = atomic_load(&vc->peers_known) == 0
+                                     ? HELLO_REANNOUNCE_MS
+                                     : HELLO_KEEPALIVE_MS;
+            if (now_ms - last_announce_ms >= hello_gap) {
                 if (vc->relay_mode && !vc->tcp_sock) send_udp_registration(vc);
                 send_hello(vc);
                 last_announce_ms = now_ms;
