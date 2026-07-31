@@ -11,11 +11,31 @@
 | **v0.4.1** | ECDH key exchange, Ed25519 identity (TOFU), Android v0.4.1 | Done |
 | **v0.4.2** | TCP media relay, server keepalive, Android in-app updates | Done |
 | **v0.4.3** | RTT latency measurement, video call latency fixes | Done |
-| **v1.0** | CI/CD, security hardening, full testing | Planned |
+| **v0.5.0** | Phase A/B: identity handles, encrypted backup (file + QR), local history, server SQLite, contacts blob, DM | Done |
+| **v0.5.1** | Audit remediation (5 Critical), signed releases, hardened relay | Done |
+| **v0.6.0** | Phase C-F: key rotation, metadata privacy, offline inbox, push | In progress |
 
 ---
 
 ## Completed
+
+### v0.5.1 - Audit remediation, test infrastructure, Phase C groundwork
+- [x] All five Critical audit findings (memory corruption in the media path,
+      server BLOB_PUT, desktop FILE_START; ECDH MITM bypass)
+- [x] Signed releases: Ed25519 signature in CI, mandatory verification in the
+      updater, Zip-Slip archives rejected
+- [x] Relay hardening: I/O timeouts, per-IP connection cap, blob quotas,
+      sender anti-spoofing
+- [x] BLOB_GET is owner-only via a signed one-shot challenge (M10) - server,
+      desktop and Android
+- [x] Onboarding: identity created on first run, Connect no longer hard-locks
+      on an inconclusive registration probe
+- [x] Honest connection status, visible file-transfer progress, modal warning
+      when the identity key of a peer changes
+- [x] Unit tests for the crypto core, a server + two-client integration smoke
+      test, and a protocol test for M10, all wired into ctest
+- [x] CI: those tests run on every push to dev/main; Android runs its JVM unit
+      tests before building the APK
 
 ### v0.4.3 — RTT Latency & Video Call Improvements
 - [x] RTT ping/pong measurement in video calls (StatsPayload with hold-time compensation)
@@ -75,24 +95,30 @@
 
 ## In Progress
 
+- [ ] **Phase C - crypto evolution.** The primitives have landed with frozen
+      test vectors (`identity/key_schedule.c`, `identity/rotation.c`,
+      `identity/media_keys.c`, plus the Kotlin ports in `com.fear.crypto`).
+      Nothing calls them yet: wiring them into the live chat and media paths
+      is the remaining work, and the media switchover breaks the call wire
+      format, so desktop and Android have to land together
 - [ ] Documentation updates and localization
-- [ ] Security audit remediation (see SECURITY_AUDIT.md)
 
 ## Planned
 
 ### Security
-- [ ] Secure key storage on client (system keychain integration)
-- [ ] Automatic key rotation (rekeying)
-- [ ] Binary signature verification
+- [ ] Desktop identity key encrypted at rest (libsecret / DPAPI) - Android already
+      uses a Keystore-backed EncryptedFile; the desktop file is 0600 but plaintext
+- [ ] Post-compromise security (Signal-style ratchet) - deliberately out of scope
+      for v0.6.0, recorded so the gap is not mistaken for an oversight
 
 ### Networking
 - [ ] NAT traversal (ICE/STUN/TURN)
 - [ ] TLS for TCP transport layer
 
 ### Quality
-- [ ] CI/CD pipeline (GitHub Actions)
-- [ ] Unit tests for cryptographic functions
 - [ ] Load testing for server and calls
+- [ ] Fuzzing the frame parsers (server.c, client.c, media decrypt glue)
+- [ ] One UI instead of two (ChatWindow vs the legacy MainWindow)
 
 ### Features
 - [ ] Noise suppression and auto-level for audio
