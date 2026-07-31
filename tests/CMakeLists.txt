@@ -52,16 +52,25 @@ set_tests_properties(integration_smoke PROPERTIES TIMEOUT 60)
 # Трёхсторонний медиа-loopback: три процесса через hub, каждый расшифровывает
 # двух других. Единственный тест, способный поймать инверсию ролей или
 # несогласованную соль - модульные тесты живут внутри одного процесса.
-add_test(NAME media_loopback
-         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/media_loopback.sh $<TARGET_FILE:audio_call>)
-set_tests_properties(media_loopback PROPERTIES TIMEOUT 120)
+#
+# Регистрируются только когда соответствующие таргеты вообще собираются.
+# При FEAR_GUI_ONLY=ON подпроекты audio_call/video_call пропускаются, и
+# безусловный $<TARGET_FILE:audio_call> валит не тест, а саму генерацию
+# сборки - то есть все четыре пайплайна разом, ещё до компиляции.
+if(TARGET audio_call)
+    add_test(NAME media_loopback
+             COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/media_loopback.sh $<TARGET_FILE:audio_call>)
+    set_tests_properties(media_loopback PROPERTIES TIMEOUT 120)
+endif()
 
 # То же для video_call: три процесса, аудио-тракт через пер-отправительские
 # декодеры и микшер. Видео здесь не проверяется - на машине без камеры и
 # дисплея VP8 не кодируется вовсе, и тест об этом честно молчит.
-add_test(NAME video_loopback
-         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/video_loopback.sh $<TARGET_FILE:video_call>)
-set_tests_properties(video_loopback PROPERTIES TIMEOUT 120)
+if(TARGET video_call)
+    add_test(NAME video_loopback
+             COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/video_loopback.sh $<TARGET_FILE:video_call>)
+    set_tests_properties(video_loopback PROPERTIES TIMEOUT 120)
+endif()
 
 # Протокольный тест M10: BLOB_GET доступен только владельцу pk (подписанный
 # challenge). Бинарь ходит на живой сервер через реальные sp_*-функции;
