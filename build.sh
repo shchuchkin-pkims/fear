@@ -163,10 +163,36 @@ case "${1:-build}" in
         # SDL3 is not yet in Ubuntu repos — check if installed
         if ! pkg-config --exists sdl3 2>/dev/null; then
             print_info "SDL3 not found in system packages, building from source..."
-            sudo apt-get install -y libwayland-dev libxkbcommon-dev wayland-protocols libpulse-dev libasound2-dev
+            # SDL refuses to configure unless it finds a window system. The
+            # Wayland set alone is not enough: if any Wayland piece is missing
+            # (or the machine has no compositor headers at all) SDL falls back
+            # to X11, and without the X11 headers below it aborts with
+            # "could not find X11 or Wayland development libraries".
+            sudo apt-get install -y \
+                libx11-dev libxext-dev libxrandr-dev libxcursor-dev \
+                libxi-dev libxfixes-dev libxss-dev \
+                libwayland-dev libwayland-bin wayland-protocols \
+                libxkbcommon-dev libdecor-0-dev \
+                libpulse-dev libasound2-dev
             SDL_TMP=$(mktemp -d)
             git clone --depth 1 https://github.com/libsdl-org/SDL.git -b release-3.2.x "${SDL_TMP}/SDL"
-            cmake -S "${SDL_TMP}/SDL" -B "${SDL_TMP}/SDL/build" -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr
+            # On a headless box (server, Pi without a desktop) there is no
+            # window system to find and the check above is not wanted:
+            #   FEAR_SDL_HEADLESS=1 ./build.sh deps
+            SDL_EXTRA_FLAGS=""
+            if [ -n "${FEAR_SDL_HEADLESS:-}" ]; then
+                print_info "FEAR_SDL_HEADLESS set — building SDL without X11/Wayland video"
+                SDL_EXTRA_FLAGS="-DSDL_UNIX_CONSOLE_BUILD=ON"
+            fi
+            if ! cmake -S "${SDL_TMP}/SDL" -B "${SDL_TMP}/SDL/build" \
+                    -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr \
+                    ${SDL_EXTRA_FLAGS}; then
+                print_error "SDL configuration failed."
+                print_info "On a desktop machine: check that the X11/Wayland -dev packages above installed."
+                print_info "On a headless machine: re-run with FEAR_SDL_HEADLESS=1 ./build.sh deps"
+                rm -rf "${SDL_TMP}"
+                exit 1
+            fi
             cmake --build "${SDL_TMP}/SDL/build" -j$(nproc)
             sudo cmake --install "${SDL_TMP}/SDL/build"
             rm -rf "${SDL_TMP}"
