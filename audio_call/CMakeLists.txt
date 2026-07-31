@@ -19,6 +19,7 @@ set(SOURCES
     ${CMAKE_SOURCE_DIR}/identity/media_keys.c
     ${CMAKE_SOURCE_DIR}/identity/media_hello.c
     ${CMAKE_SOURCE_DIR}/identity/media_senders.c
+    ${CMAKE_SOURCE_DIR}/identity/media_packet.c
 )
 
 # Создание исполняемого файла
