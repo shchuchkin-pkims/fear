@@ -10,7 +10,12 @@
 #
 # The contract it asserts, printed by audio_call itself:
 #     [MEDIA] self <sid>              once, at start
-#     [MEDIA] peer <sid> decrypted N  once per installed peer, at teardown
+#     [MEDIA] peer <sid> decrypted N mixed M   once per peer, at teardown
+#
+# Both numbers matter. Decrypting without mixing is a real failure mode and
+# it looks like success from every other angle: the keys agree, the packets
+# authenticate, and nobody hears anything - which is what a single shared
+# Opus decoder does to three streams. This test asserts both.
 #
 # args: [1] path to the audio_call binary
 
@@ -101,6 +106,12 @@ for i in 1 2 3; do
         line=$(grep -oP "^\[MEDIA\] peer ${SELF[$j]} decrypted \K[0-9]+" "$WORK/p$i.log" | head -1)
         [ -n "$line" ] || fail "participant $i never installed participant $j (${SELF[$j]})"
         [ "$line" -gt 0 ] || fail "participant $i installed participant $j but decrypted nothing"
+
+        mixed=$(grep -oP "^\[MEDIA\] peer ${SELF[$j]} decrypted [0-9]+ mixed \K[0-9]+" "$WORK/p$i.log" | head -1)
+        [ -n "$mixed" ] || fail "participant $i reported no mix count for participant $j"
+        # Rendering is the half that decryption cannot prove: one decoder
+        # shared between senders decrypts everything and plays nothing.
+        [ "$mixed" -gt 0 ] || fail "participant $i decrypted $line frames from participant $j and rendered none of them"
     done
 done
 

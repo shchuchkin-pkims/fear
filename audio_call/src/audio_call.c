@@ -130,6 +130,16 @@ static int g_have_call_id = 0;
 /* Небольшая задержка */
 #define PLAYOUT_BUFFER_FRAMES 6
 
+/* How many participants are rendered at once.
+ *
+ * The key table holds 32 senders because the transport does, but decoding
+ * and mixing 32 streams is not something a phone will do, and a room where
+ * eight people talk at once is already unusable for human reasons. Senders
+ * beyond this are still authenticated and still tracked - they simply are
+ * not rendered, and the least recently heard one gives up its decoder when
+ * somebody new speaks. */
+#define AC_MAX_MIX 8
+
 /* Хаб: параметры */
 #define HUB_MAX_CLIENTS 1024
 #define HUB_CLIENT_TIMEOUT_SEC 60
@@ -157,6 +167,19 @@ static int g_have_call_id = 0;
 
 /* The HELLO2 wire format - flags, sizes, MAC and signature - belongs to
    identity/media_hello.c, so nothing about it is defined here any more. */
+
+/**
+ * One rendered participant: its decoder, its jitter buffer, and enough
+ * bookkeeping to decide who gives up a decoder when a new voice arrives.
+ */
+typedef struct {
+    int          slot;       /**< sender-table slot, or -1 when free */
+    OpusDecoder *dec;
+    PcmRing      ring;
+    uint64_t     last_ms;    /**< when we last decoded a frame from it */
+    int          prefilled;  /**< jitter buffer has reached the play-out depth */
+    uint64_t     frames;     /**< frames actually mixed, for the teardown report */
+} MixSlot;
 
 typedef struct AudioCall {
     socket_t sock;
@@ -208,9 +231,22 @@ typedef struct AudioCall {
     PaStream *in_stream;
     PaStream *out_stream;
     OpusEncoder *enc;
-    OpusDecoder *dec;
 
-    PcmRing out_ring;
+    /* One decoder and one jitter buffer per rendered participant.
+     *
+     * A single decoder cannot serve several senders: Opus carries state
+     * across frames, so interleaving two streams through one decoder makes
+     * both unintelligible - and a single output buffer would have them
+     * overwrite each other rather than mix. That is why the crypto working
+     * for N participants is not the same as the call working for N: this is
+     * the other half. */
+    MixSlot mix[AC_MAX_MIX];
+    int mix_ready;   /**< rings and lock exist; teardown is a no-op without it */
+#ifdef _WIN32
+    CRITICAL_SECTION mix_lock;
+#else
+    pthread_mutex_t mix_lock;
+#endif
 
     /* RTT measurement (ping/pong via stats packets) */
     uint32_t last_peer_ping_ts;            /* peer's timestamp to echo back */
@@ -229,9 +265,11 @@ typedef struct AudioCall {
 #ifdef _WIN32
     HANDLE th_send;
     HANDLE th_recv;
+    HANDLE th_play;
 #else
     pthread_t th_send;
     pthread_t th_recv;
+    pthread_t th_play;
 #endif
     atomic_int running;
 } AudioCall;
@@ -614,6 +652,89 @@ static int ac_send_packet(AudioCall *c, const uint8_t *data, int len) {
  * MK_STREAM_AUDIO key. Two packet types on one counter never repeat a nonce;
  * two counters under one key would collide immediately.
  */
+/**
+ * Release every decoder, jitter buffer and the lock. Safe to call on a
+ * half-built call: the object is calloc'd, so mix_ready is what says whether
+ * any of this was ever set up.
+ */
+static void mix_teardown(AudioCall *c) {
+    if (!c->mix_ready) return;
+    for (int i = 0; i < AC_MAX_MIX; i++) {
+        if (c->mix[i].dec) {
+            opus_decoder_destroy(c->mix[i].dec);
+            c->mix[i].dec = NULL;
+        }
+        pcmring_free(&c->mix[i].ring);
+        c->mix[i].slot = -1;
+    }
+#ifdef _WIN32
+    DeleteCriticalSection(&c->mix_lock);
+#else
+    pthread_mutex_destroy(&c->mix_lock);
+#endif
+    c->mix_ready = 0;
+}
+
+static void mix_lock_take(AudioCall *c) {
+#ifdef _WIN32
+    EnterCriticalSection(&c->mix_lock);
+#else
+    pthread_mutex_lock(&c->mix_lock);
+#endif
+}
+
+static void mix_lock_drop(AudioCall *c) {
+#ifdef _WIN32
+    LeaveCriticalSection(&c->mix_lock);
+#else
+    pthread_mutex_unlock(&c->mix_lock);
+#endif
+}
+
+/**
+ * The decoder and jitter buffer for a sender, creating or reassigning one if
+ * this is a voice we are not currently rendering.
+ *
+ * Reassignment resets the Opus state: the buffer would otherwise carry the
+ * previous speaker's history into the new stream and decode it as noise.
+ * Returns NULL only if a decoder cannot be created at all.
+ */
+static MixSlot *mix_acquire(AudioCall *c, int slot) {
+    MixSlot *chosen = NULL;
+
+    for (int i = 0; i < AC_MAX_MIX; i++) {
+        if (c->mix[i].slot == slot) return &c->mix[i];
+    }
+    for (int i = 0; i < AC_MAX_MIX; i++) {
+        if (c->mix[i].slot < 0) { chosen = &c->mix[i]; break; }
+    }
+    if (!chosen) {
+        /* Everything is busy: the voice heard longest ago steps aside. Its
+         * key and replay window survive in the sender table, so it comes
+         * back the moment it speaks again. */
+        chosen = &c->mix[0];
+        for (int i = 1; i < AC_MAX_MIX; i++) {
+            if (c->mix[i].last_ms < chosen->last_ms) chosen = &c->mix[i];
+        }
+        int16_t discard[AC_FRAME_SAMPLES * AC_CHANNELS];
+        while (pcmring_pop(&chosen->ring, discard) == 0) { }
+        if (chosen->dec) opus_decoder_ctl(chosen->dec, OPUS_RESET_STATE);
+    }
+
+    if (!chosen->dec) {
+        int err = 0;
+        chosen->dec = opus_decoder_create(AC_SAMPLE_RATE, AC_CHANNELS, &err);
+        if (!chosen->dec || err != OPUS_OK) {
+            chosen->dec = NULL;
+            return NULL;
+        }
+    }
+    chosen->slot = slot;
+    chosen->prefilled = 0;
+    chosen->frames = 0;
+    return chosen;
+}
+
 static int encrypt_media(AudioCall *c, uint8_t type,
                          const uint8_t *plain, size_t plain_len,
                          uint8_t *out, size_t out_cap, size_t *out_len,
@@ -781,6 +902,80 @@ static THREAD_RET th_send_func(void *arg) {
 #endif
 }
 
+/**
+ * Play-out: mix every rendered participant into one stream.
+ *
+ * This runs on its own thread rather than inside the receive loop, because
+ * with several senders the receive loop fires several times per frame period
+ * and would push the device far faster than real time. Pa_WriteStream blocks
+ * until the device has room, so writing one frame per iteration is what
+ * paces this thread - including the silent frames, which keep the device fed
+ * while nobody is speaking.
+ */
+/* Defined below, next to the other teardown helpers; declared here because
+ * the media-key setup path frees a half-built call on failure. */
+static void ac_free_wiped(AudioCall *c);
+
+static THREAD_RET th_play_func(void *arg) {
+    ThreadArgs *ta = (ThreadArgs*)arg;
+    AudioCall *c = ta->c;
+    free(ta);
+
+    const size_t nsamp = AC_FRAME_SAMPLES * AC_CHANNELS;
+    int32_t acc[AC_FRAME_SAMPLES * AC_CHANNELS];
+    int16_t frame[AC_FRAME_SAMPLES * AC_CHANNELS];
+    int16_t play[AC_FRAME_SAMPLES * AC_CHANNELS];
+
+    while (atomic_load(&c->running)) {
+        memset(acc, 0, sizeof acc);
+
+        mix_lock_take(c);
+        for (int i = 0; i < AC_MAX_MIX; i++) {
+            MixSlot *m = &c->mix[i];
+            if (m->slot < 0) continue;
+
+            /* Wait for a little depth before starting a voice, and go back to
+             * waiting if it runs dry: playing every frame the instant it
+             * arrives turns ordinary network jitter into chopped audio. */
+            if (!m->prefilled) {
+                if (atomic_load(&m->ring.count) < PLAYOUT_BUFFER_FRAMES) continue;
+                m->prefilled = 1;
+            }
+            if (pcmring_pop(&m->ring, frame) != 0) {
+                m->prefilled = 0;
+                continue;
+            }
+            for (size_t k = 0; k < nsamp; k++) acc[k] += frame[k];
+            m->frames++;
+        }
+        mix_lock_drop(c);
+
+        if (!c->out_stream) {
+            /* No output device: still drain at roughly real time so the
+             * jitter buffers cannot grow without bound. */
+            msleep(20);
+            continue;
+        }
+
+        /* Saturate rather than wrap. Wrapping turns two loud speakers into a
+         * full-scale square wave, which is unpleasant in a way that clipping
+         * is not. */
+        for (size_t k = 0; k < nsamp; k++) {
+            int32_t v = acc[k];
+            if (v > 32767) v = 32767;
+            else if (v < -32768) v = -32768;
+            play[k] = (int16_t)v;
+        }
+        Pa_WriteStream(c->out_stream, play, AC_FRAME_SAMPLES);
+    }
+
+#ifdef _WIN32
+    return 0;
+#else
+    return NULL;
+#endif
+}
+
 static THREAD_RET th_recv_func(void *arg) {
     ThreadArgs *ta = (ThreadArgs*)arg;
     AudioCall *c = ta->c;
@@ -834,10 +1029,9 @@ static THREAD_RET th_recv_func(void *arg) {
            order and no other (see decrypt_media). */
         uint8_t ptype = 0;
         size_t plain_len = 0;
-        if (decrypt_media(c, rbuf, (size_t)n, plain, sizeof plain,
-                          &plain_len, &ptype) < 0) {
-            continue;
-        }
+        int slot = decrypt_media(c, rbuf, (size_t)n, plain, sizeof plain,
+                                 &plain_len, &ptype);
+        if (slot < 0) continue;
 
         /* Stats packet: RTT ping/pong. The type byte is authenticated as
            associated data, so it can no longer be flipped between audio and
@@ -856,32 +1050,33 @@ static THREAD_RET th_recv_func(void *arg) {
         }
         if (ptype != PKT_VER_AUDIO) continue;
 
-        int dec_samples = opus_decode(c->dec, plain, (opus_int32)plain_len,
+        /* Decode into this sender's own decoder. Opus keeps state between
+           frames, so one decoder shared by several senders would garble all
+           of them - which is why a call whose packets all decrypt correctly
+           can still be unintelligible. */
+        mix_lock_take(c);
+        MixSlot *m = mix_acquire(c, slot);
+        if (!m) { mix_lock_drop(c); continue; }
+
+        int dec_samples = opus_decode(m->dec, plain, (opus_int32)plain_len,
                                       pcm, AC_FRAME_SAMPLES, 0);
-        if (dec_samples <= 0) continue;
-        if (dec_samples < AC_FRAME_SAMPLES) {
-            memset(pcm + dec_samples * AC_CHANNELS, 0,
-                   (AC_FRAME_SAMPLES - dec_samples) * AC_CHANNELS * sizeof(int16_t));
-        }
+        if (dec_samples > 0) {
+            if (dec_samples < AC_FRAME_SAMPLES) {
+                memset(pcm + dec_samples * AC_CHANNELS, 0,
+                       (AC_FRAME_SAMPLES - dec_samples) * AC_CHANNELS * sizeof(int16_t));
+            }
+            pcmring_push(&m->ring, pcm);
+            m->last_ms = audio_time_ms();
 
-        pcmring_push(&c->out_ring, pcm);
-
-        /* Latency control: if buffer grows too large, drain old frames.
-           Max ~20 frames (400ms) prevents unbounded latency accumulation
-           that occurs with TCP relay bursts. */
-        #define MAX_PLAYOUT_FRAMES 20
-        while (atomic_load(&c->out_ring.count) > MAX_PLAYOUT_FRAMES) {
-            int16_t discard[AC_FRAME_SAMPLES];
-            pcmring_pop(&c->out_ring, discard);
-        }
-
-        // Воспроизводим только если выходной поток доступен и буфер достаточно наполнен
-        if (c->out_stream && atomic_load(&c->out_ring.count) >= PLAYOUT_BUFFER_FRAMES) {
-            int16_t play[AC_FRAME_SAMPLES];
-            if (pcmring_pop(&c->out_ring, play) == 0) {
-                Pa_WriteStream(c->out_stream, play, AC_FRAME_SAMPLES);
+            /* Latency control per sender: a relay burst must not turn into
+               half a second of delay that never drains. */
+            #define MAX_PLAYOUT_FRAMES 20
+            while (atomic_load(&m->ring.count) > MAX_PLAYOUT_FRAMES) {
+                int16_t discard[AC_FRAME_SAMPLES * AC_CHANNELS];
+                pcmring_pop(&m->ring, discard);
             }
         }
+        mix_lock_drop(c);
     }
 
 #ifdef _WIN32
@@ -1046,8 +1241,29 @@ static int audio_init_codec(AudioCall *c) {
     opus_encoder_ctl(c->enc, OPUS_SET_INBAND_FEC(1));
     opus_encoder_ctl(c->enc, OPUS_SET_PACKET_LOSS_PERC(10));
 
-    c->dec = opus_decoder_create(AC_SAMPLE_RATE, AC_CHANNELS, &err);
-    if (!c->dec || err != OPUS_OK) {
+    /* Decoders are created per participant when that participant is first
+       heard, not here: one decoder cannot serve several senders. */
+    for (int i = 0; i < AC_MAX_MIX; i++) {
+        c->mix[i].slot = -1;
+        c->mix[i].dec = NULL;
+        c->mix[i].last_ms = 0;
+        c->mix[i].prefilled = 0;
+        c->mix[i].frames = 0;
+        if (pcmring_init(&c->mix[i].ring, 32) != 0) {
+            fprintf(stderr, "pcmring_init failed for mix slot %d\n", i);
+            for (int j = 0; j < i; j++) pcmring_free(&c->mix[j].ring);
+            ac_free_wiped(c);
+            return -1;
+        }
+    }
+#ifdef _WIN32
+    InitializeCriticalSection(&c->mix_lock);
+#else
+    pthread_mutex_init(&c->mix_lock, NULL);
+#endif
+    c->mix_ready = 1;
+
+    if (0) {
         fprintf(stderr, "opus_decoder_create error: %d\n", err);
         return -1;
     }
@@ -1071,6 +1287,11 @@ void audio_call_stop(AudioCall *c) {
         CloseHandle(c->th_recv);
         c->th_recv = NULL;
     }
+    if (c->th_play) {
+        WaitForSingleObject(c->th_play, INFINITE);
+        CloseHandle(c->th_play);
+        c->th_play = NULL;
+    }
 #else
     if (c->th_send) {
         pthread_join(c->th_send, NULL);
@@ -1079,6 +1300,10 @@ void audio_call_stop(AudioCall *c) {
     if (c->th_recv) {
         pthread_join(c->th_recv, NULL);
         c->th_recv = 0;
+    }
+    if (c->th_play) {
+        pthread_join(c->th_play, NULL);
+        c->th_play = 0;
     }
 #endif
 
@@ -1098,10 +1323,7 @@ void audio_call_stop(AudioCall *c) {
         opus_encoder_destroy(c->enc);
         c->enc = NULL;
     }
-    if (c->dec) {
-        opus_decoder_destroy(c->dec);
-        c->dec = NULL;
-    }
+
 
     if (c->tcp_sock) {
         CLOSESOCK(c->tcp_sock);
@@ -1118,12 +1340,6 @@ void audio_call_stop(AudioCall *c) {
     if (c->relay_mode) pthread_mutex_destroy(&c->tcp_send_lock);
 #endif
 
-    pcmring_free(&c->out_ring);
-
-    /* Wipe every secret before the memory goes back to the allocator: the
-       call key, the derived send key, the HELLO key, our salt, the identity
-       secret key and every per-sender key in the table. The pre-group code
-       wiped none of them. */
     /* One line per participant we installed, with how many of their packets
      * actually decrypted. A peer that was installed but never decrypted is
      * the exact symptom of a key that both ends derived differently, which
@@ -1131,11 +1347,23 @@ void audio_call_stop(AudioCall *c) {
     for (int i = 0; i < MS_MAX_SLOTS; i++) {
         if (!c->senders.slots[i].used) continue;
         const uint8_t *sid = c->senders.slots[i].sid;
-        printf("[MEDIA] peer %02x%02x%02x decrypted %llu\n",
+        uint64_t mixed = 0;
+        for (int k = 0; k < AC_MAX_MIX; k++) {
+            if (c->mix[k].slot == i) { mixed = c->mix[k].frames; break; }
+        }
+        printf("[MEDIA] peer %02x%02x%02x decrypted %llu mixed %llu\n",
                sid[0], sid[1], sid[2],
-               (unsigned long long)c->rx_count[i]);
+               (unsigned long long)c->rx_count[i],
+               (unsigned long long)mixed);
     }
     fflush(stdout);
+
+    mix_teardown(c);
+
+    /* Wipe every secret before the memory goes back to the allocator: the
+       call key, the derived send key, the HELLO key, our salt, the identity
+       secret key and every per-sender key in the table. The pre-group code
+       wiped none of them. */
 
     ms_clear(&c->senders);
     sodium_memzero(c, sizeof *c);
@@ -1233,7 +1461,7 @@ int audio_call_start(AudioCall **out_call,
         c->relay_name[0] = '\0';
     }
 
-    if (pcmring_init(&c->out_ring, 128) != 0) {
+    if (0) {
         ac_free_wiped(c);
         return -1;
     }
@@ -1241,7 +1469,7 @@ int audio_call_start(AudioCall **out_call,
     c->sock = (socket_t)socket(AF_INET, SOCK_DGRAM, 0);
     if (c->sock == (socket_t)SOCK_ERR) {
         fprintf(stderr, "socket() failed\n");
-        pcmring_free(&c->out_ring);
+        mix_teardown(c);
         ac_free_wiped(c);
         return -1;
     }
@@ -1275,7 +1503,7 @@ int audio_call_start(AudioCall **out_call,
     if (bind(c->sock, (struct sockaddr*)&local, sizeof(local)) == SOCK_ERR) {
         fprintf(stderr, "bind() failed (port %u)\n", bind_port);
         CLOSESOCK(c->sock);
-        pcmring_free(&c->out_ring);
+        mix_teardown(c);
         ac_free_wiped(c);
         return -1;
     }
@@ -1288,7 +1516,7 @@ int audio_call_start(AudioCall **out_call,
         if (resolve_host_v4(remote_ip, &c->peer.sin_addr) != 0) {
             fprintf(stderr, "cannot resolve host %s\n", remote_ip);
             CLOSESOCK(c->sock);
-            pcmring_free(&c->out_ring);
+            mix_teardown(c);
             ac_free_wiped(c);
             return -1;
         }
@@ -1297,14 +1525,14 @@ int audio_call_start(AudioCall **out_call,
 
     if (audio_init_ports(c, input_device_id, output_device_id) != 0) {
         CLOSESOCK(c->sock);
-        pcmring_free(&c->out_ring);
+        mix_teardown(c);
         ac_free_wiped(c);
         return -1;
     }
     if (audio_init_codec(c) != 0) {
         Pa_Terminate();
         CLOSESOCK(c->sock);
-        pcmring_free(&c->out_ring);
+        mix_teardown(c);
         ac_free_wiped(c);
         return -1;
     }
@@ -1318,13 +1546,13 @@ int audio_call_start(AudioCall **out_call,
 #endif
         if (tcp_relay_connect(c, remote_ip, remote_port) != 0) {
             Pa_Terminate(); CLOSESOCK(c->sock);
-            pcmring_free(&c->out_ring); ac_free_wiped(c);
+            mix_teardown(c); ac_free_wiped(c);
             return -1;
         }
         if (tcp_relay_register(c) != 0) {
             fprintf(stderr, "TCP relay registration failed\n");
             CLOSESOCK(c->tcp_sock); Pa_Terminate(); CLOSESOCK(c->sock);
-            pcmring_free(&c->out_ring); ac_free_wiped(c);
+            mix_teardown(c); ac_free_wiped(c);
             return -1;
         }
         c->peer_set = 1; /* so send guards pass */
@@ -1346,25 +1574,32 @@ int audio_call_start(AudioCall **out_call,
         if (a2) free(a2);
         /* cleanup */
         if (c->enc) opus_encoder_destroy(c->enc);
-        if (c->dec) opus_decoder_destroy(c->dec);
         Pa_Terminate();
         CLOSESOCK(c->sock);
-        pcmring_free(&c->out_ring);
+        mix_teardown(c);
         ac_free_wiped(c);
         return -1;
     }
     a1->c = c; a2->c = c;
 
 #ifdef _WIN32
+    ThreadArgs *a3 = (ThreadArgs*)malloc(sizeof(ThreadArgs));
+    if (!a3) { audio_call_stop(c); return -1; }
+    a3->c = c;
     c->th_recv = CreateThread(NULL, 0, th_recv_func, a1, 0, NULL);
     c->th_send = CreateThread(NULL, 0, th_send_func, a2, 0, NULL);
+    c->th_play = CreateThread(NULL, 0, th_play_func, a3, 0, NULL);
     if (!c->th_recv || !c->th_send) {
         audio_call_stop(c);
         return -1;
     }
 #else
+    ThreadArgs *a3 = (ThreadArgs*)malloc(sizeof(ThreadArgs));
+    if (!a3) { audio_call_stop(c); return -1; }
+    a3->c = c;
     if (pthread_create(&c->th_recv, NULL, th_recv_func, a1) != 0 ||
-        pthread_create(&c->th_send, NULL, th_send_func, a2) != 0) {
+        pthread_create(&c->th_send, NULL, th_send_func, a2) != 0 ||
+        pthread_create(&c->th_play, NULL, th_play_func, a3) != 0) {
         audio_call_stop(c);
         return -1;
     }
