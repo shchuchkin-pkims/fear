@@ -188,6 +188,7 @@ typedef struct {
     int           w;
     int           h;
     uint64_t      pic_ms;    /**< when that picture was decoded */
+    uint64_t      shown_ms;  /**< pic_ms of the last picture counted as shown */
     char          label[8];  /**< sender tag, captioned in the cell */
 } VidSlot;
 
@@ -979,6 +980,7 @@ static VidSlot *vid_acquire(VideoCall *vc, int slot) {
         chosen->w = 0;
         chosen->h = 0;
         chosen->pic_ms = 0;
+        chosen->shown_ms = 0;
 #ifdef _WIN32
         LeaveCriticalSection(&vc->disp_lock);
 #else
@@ -1051,7 +1053,14 @@ static void vc_render_frame(VideoCall *vc) {
         tiles[n].width  = v->w;
         tiles[n].height = v->h;
         tiles[n].label  = v->label;
-        v->shown++;
+        /* Pictures that reached the window, not renders that included this
+         * cell: everyone present is redrawn whenever anyone delivers a frame,
+         * so counting renders reported more shown than decoded - 2671 of 443
+         * in the first three-way call - which is worse than not reporting. */
+        if (v->pic_ms != v->shown_ms) {
+            v->shown_ms = v->pic_ms;
+            v->shown++;
+        }
         n++;
     }
 
