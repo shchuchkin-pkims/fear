@@ -103,6 +103,81 @@ int main(void) {
     CHECK(memcmp(v_send, caller_send, MK_KEY_BYTES) != 0);
     CHECK(memcmp(v_recv, caller_recv, MK_KEY_BYTES) != 0);
 
+    /* --- salt agreement: frozen vectors ------------------------------------- */
+    /* Independently computed with Python hashlib.blake2b(key=master,
+     * digest_size=16) over "fear.media.salt.v1" || lo || hi. */
+    uint8_t half_c[MK_SALT_BYTES];
+    memset(half_c, 0, sizeof half_c);
+    half_c[MK_SALT_BYTES - 1] = 0x01;
+
+    uint8_t salt[MK_SALT_BYTES];
+    char salt_hex[2 * MK_SALT_BYTES + 1];
+
+    CHECK(mk_salt_combine(master, salt_a, salt_b, salt) == 0);
+    bin2hex(salt, sizeof salt, salt_hex);
+    CHECK(strcmp(salt_hex, "72f75f37beebffb6d9da8920b9045063") == 0);
+
+    /* Commutative: the two ends must not have to agree who spoke first. */
+    uint8_t salt_rev[MK_SALT_BYTES];
+    CHECK(mk_salt_combine(master, salt_b, salt_a, salt_rev) == 0);
+    CHECK(memcmp(salt, salt_rev, sizeof salt) == 0);
+
+    uint8_t zero_master[MK_KEY_BYTES];
+    memset(zero_master, 0, sizeof zero_master);
+    CHECK(mk_salt_combine(zero_master, salt_a, salt_b, salt) == 0);
+    bin2hex(salt, sizeof salt, salt_hex);
+    CHECK(strcmp(salt_hex, "ef6cdd21ef8fb871e10d248a13f3be87") == 0);
+
+    CHECK(mk_salt_combine(master, salt_a, half_c, salt) == 0);
+    bin2hex(salt, sizeof salt, salt_hex);
+    CHECK(strcmp(salt_hex, "6c6d840e804427679a352df05065fd2b") == 0);
+
+    /* Every input is bound: change the peer half or the master, get a
+     * different salt. */
+    uint8_t salt_ab[MK_SALT_BYTES], salt_ac[MK_SALT_BYTES], salt_other[MK_SALT_BYTES];
+    CHECK(mk_salt_combine(master, salt_a, salt_b, salt_ab) == 0);
+    CHECK(mk_salt_combine(master, salt_a, half_c, salt_ac) == 0);
+    CHECK(memcmp(salt_ab, salt_ac, MK_SALT_BYTES) != 0);
+    CHECK(mk_salt_combine(other_master, salt_a, salt_b, salt_other) == 0);
+    CHECK(memcmp(salt_ab, salt_other, MK_SALT_BYTES) != 0);
+
+    /* --- role assignment ------------------------------------------------------ */
+    int a_is_caller = -1, b_is_caller = -1;
+    CHECK(mk_role_from_halves(salt_a, salt_b, &a_is_caller) == 0);
+    CHECK(mk_role_from_halves(salt_b, salt_a, &b_is_caller) == 0);
+    /* Opposite by construction, whichever half happens to be smaller. */
+    CHECK(a_is_caller != b_is_caller);
+    CHECK(a_is_caller == 1);   /* 0x10.. sorts before 0xf0.. */
+
+    /* A reflected HELLO (our own half coming back) must be refused, not
+     * resolved: either answer would put both ends on one key at seq 0. */
+    int dummy = -1;
+    CHECK(mk_role_from_halves(salt_a, salt_a, &dummy) != 0);
+    CHECK(mk_salt_combine(NULL, salt_a, salt_b, salt) != 0);
+    CHECK(mk_role_from_halves(salt_a, salt_b, NULL) != 0);
+
+    /* --- end to end: two peers reach the same keys -------------------------- */
+    /* Peer A knows only its own half and the one it received, and vice
+     * versa; nothing else is exchanged. */
+    uint8_t a_salt[MK_SALT_BYTES], b_salt[MK_SALT_BYTES];
+    int a_role = 0, b_role = 0;
+    CHECK(mk_salt_combine(master, salt_a, salt_b, a_salt) == 0);
+    CHECK(mk_role_from_halves(salt_a, salt_b, &a_role) == 0);
+    CHECK(mk_salt_combine(master, salt_b, salt_a, b_salt) == 0);
+    CHECK(mk_role_from_halves(salt_b, salt_a, &b_role) == 0);
+    CHECK(memcmp(a_salt, b_salt, MK_SALT_BYTES) == 0);
+
+    for (int stream = MK_STREAM_AUDIO; stream <= MK_STREAM_VIDEO; stream++) {
+        uint8_t a_tx[MK_KEY_BYTES], a_rx[MK_KEY_BYTES];
+        uint8_t b_tx[MK_KEY_BYTES], b_rx[MK_KEY_BYTES];
+        CHECK(mk_derive_pair(master, (mk_stream_t)stream, a_role, a_salt, a_tx, a_rx) == 0);
+        CHECK(mk_derive_pair(master, (mk_stream_t)stream, b_role, b_salt, b_tx, b_rx) == 0);
+        /* What A encrypts, B decrypts, and neither reuses a key. */
+        CHECK(memcmp(a_tx, b_rx, MK_KEY_BYTES) == 0);
+        CHECK(memcmp(b_tx, a_rx, MK_KEY_BYTES) == 0);
+        CHECK(memcmp(a_tx, a_rx, MK_KEY_BYTES) != 0);
+    }
+
     /* --- argument checks ----------------------------------------------------- */
     CHECK(mk_derive(NULL, MK_STREAM_AUDIO, MK_DIR_CALLER_TO_CALLEE, salt_a, key) != 0);
     CHECK(mk_derive(master, MK_STREAM_AUDIO, MK_DIR_CALLER_TO_CALLEE, NULL, key) != 0);
