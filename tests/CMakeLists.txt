@@ -37,6 +37,7 @@ add_fear_test(test_backup   test_backup.c   ${IDENTITY_DIR}/identity_backup.c ${
 add_fear_test(test_contacts test_contacts.c ${IDENTITY_DIR}/contacts_cipher.c)
 add_fear_test(test_key_schedule test_key_schedule.c ${IDENTITY_DIR}/key_schedule.c)
 add_fear_test(test_rotation     test_rotation.c     ${IDENTITY_DIR}/rotation.c)
+add_fear_test(test_media_keys   test_media_keys.c   ${IDENTITY_DIR}/media_keys.c)
 
 # Интеграционный smoke-тест: сервер + два консольных клиента (ECDH create/join,
 # доставка сообщений в обе стороны). Требует собранного таргета fear.
