@@ -166,6 +166,7 @@
 ### Уровень 2 — K_epoch (эпохальный ключ)
 - Производный, **никогда не хранится** на диске
 - `K_epoch[N] = HKDF(K_room_v, "fear.epoch.v1" || N)`, где N = час от UNIX epoch
+- **Реализовано** (`identity/key_schedule.c`, Phase C-1): `K_epoch = BLAKE2b(key=K_room, data="fear.epoch.v1" || key_version(2, LE) || N(4, LE), out=32)`. BLAKE2b keyed вместо HKDF — тот же примитив, что во всём проекте (libsodium `crypto_generichash`). В вход добавлен `key_version`: это ничего не стоит и превращает рассинхрон «заголовок говорит v1, отправитель шифровал v2» в честный отказ аутентификации вместо тихой деривации не того ключа. Тест-векторы заморожены в `tests/test_key_schedule.c` — порты на Android и web обязаны воспроизводить их побайтово
 - Все участники независимо вычисляют один K_epoch для одного N
 - Заголовок пакета содержит `[room_key_version: 2 bytes][epoch_num: 4 bytes]`
 
