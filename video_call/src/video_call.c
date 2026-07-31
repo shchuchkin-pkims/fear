@@ -70,12 +70,19 @@ static int resolve_host_v4(const char *host, struct in_addr *out) {
 #include "audio_crypto.h"
 #include "audio_hub.h"
 #include "media_keys.h"
+#include "media_hello.h"
+#include "media_senders.h"
+#include "media_packet.h"
 
-/* Per-call identifier from --call-id. Step 5 of the group-call migration
- * makes it mandatory and binds it into every media key; today it is parsed
- * and validated only, so nothing on the wire changes. */
+/* Per-call identifier from --call-id. Mandatory: every media key, every
+ * sender tag and the HELLO2 MAC key are bound to it, so there is nothing
+ * sensible to derive without one. */
 static uint8_t g_call_id[MK_CALLID_BYTES];
 static int g_have_call_id = 0;
+
+/* K_room generation. Nothing produces a nonzero one yet and every platform
+ * must agree on it, so it is fixed at 0 and announced in HELLO2. */
+#define VC_KEY_VERSION 0
 
 /* Video modules */
 #include "video_types.h"
@@ -103,43 +110,10 @@ static int g_have_call_id = 0;
 #define AES_GCM_NONCE_LEN crypto_aead_aes256gcm_NPUBBYTES
 #define AES_GCM_ABYTES    crypto_aead_aes256gcm_ABYTES
 
-/* ---- Replay protection: sliding window over authenticated sequence numbers ---- */
-
-typedef struct {
-    uint64_t max_seq;   /**< highest sequence number accepted so far */
-    uint64_t bitmap;    /**< bit i set => (max_seq - i) has been accepted */
-    int      started;   /**< 0 until the first packet is accepted */
-} replay_window_t;
-
-/**
- * @brief Accept a sequence number once; reject duplicates and stale packets.
- *
- * Call this only for packets whose AEAD tag has already verified. Feeding it
- * unauthenticated sequence numbers would let an off-path attacker poison the
- * window and lock the real peer out.
- *
- * @return 0 if the packet is fresh, -1 if it is a replay or older than the window.
- */
-static int replay_accept(replay_window_t *w, uint64_t seq) {
-    if (!w->started) {
-        w->started = 1;
-        w->max_seq = seq;
-        w->bitmap = 1;
-        return 0;
-    }
-    if (seq > w->max_seq) {
-        uint64_t shift = seq - w->max_seq;
-        w->bitmap = (shift >= 64) ? 0 : (w->bitmap << shift);
-        w->bitmap |= 1;
-        w->max_seq = seq;
-        return 0;
-    }
-    uint64_t diff = w->max_seq - seq;
-    if (diff >= 64) return -1;                  /* older than the window */
-    if (w->bitmap & (1ULL << diff)) return -1;  /* already seen */
-    w->bitmap |= (1ULL << diff);
-    return 0;
-}
+/* Replay protection now lives in media_senders.h: one sliding window per
+ * (sender, counter domain), fed only by ms_accept_seq and only after the AEAD
+ * tag has verified. The single global window this file used to keep could not
+ * survive a second sender, and it accepted arbitrarily large forward jumps. */
 
 /* ===== VideoCall state ===== */
 
@@ -148,19 +122,32 @@ typedef struct VideoCall {
     struct sockaddr_in peer;
     int peer_set;
 
-    /* Master key and derived sub-keys */
+    /* Shared call key (K_call) and our own send context. Every field here is
+     * drawn or derived once, before any thread starts, and is immutable for
+     * the life of the call: that is what lets the counters run without a lock. */
     uint8_t master_key[AES_GCM_KEY_LEN];
-    uint8_t audio_key[AES_GCM_KEY_LEN];
-    uint8_t video_key[AES_GCM_KEY_LEN];
+    uint8_t call_id[MK_CALLID_BYTES];
+    uint8_t hello_key[MK_KEY_BYTES];
+    uint8_t own_salt[MK_SALT_BYTES];
+    uint8_t own_sid[MK_SID_BYTES];
+    uint8_t own_idbind[MK_IDBIND_BYTES];
+    /** Our send keys, indexed by counter domain (mk_stream_t). */
+    uint8_t send_key[MS_STREAMS][MK_KEY_BYTES];
 
-    uint8_t local_nonce_prefix[NONCE_PREFIX_LEN];
-    uint8_t remote_nonce_prefix[NONCE_PREFIX_LEN];
-    atomic_int remote_prefix_ready;
+    /* Receive side: one key slot and one replay window per sender. Installed
+     * and read only by the receive thread (ms_init runs before any thread
+     * starts), so the table itself needs no lock. */
+    ms_table_t senders;
+    /** Senders installed so far; the announce loop on the main thread reads it. */
+    atomic_int peers_known;
+    /** One line about a pre-group peer, not one line per packet. */
+    int legacy_warned;
+    /** Likewise for a table that cannot take another sender. */
+    int install_warned;
 
-    replay_window_t rx_video;   /**< replay window for video fragments */
-    replay_window_t rx_audio;   /**< replay window for audio packets */
-    replay_window_t rx_stats;   /**< replay window for stats packets */
-
+    /* Transmit counters, one per counter domain. Audio packets use the audio
+     * counter; video fragments AND stats share the video counter, which is
+     * exactly why they must also share the video key (see media_keys.h). */
     atomic_uint_fast64_t audio_seq_tx;
     atomic_uint_fast64_t video_seq_tx;
 
@@ -459,110 +446,214 @@ static int vc_send_packet(VideoCall *vc, const uint8_t *data, int len) {
     return -1;
 }
 
-/* ===== Key derivation ===== */
+/* ===== Key derivation =====
+ *
+ * One key per sender per counter domain, derived from K_call plus what that
+ * sender announces. Nothing is negotiated, so a participant joining or leaving
+ * changes nobody else's keys. The old crypto_kdf_derive_from_key pair - and
+ * with it the KDF_CONTEXT_* / KDF_SUBKEY_* constants in video_types.h - is
+ * dead: it produced one key per call that both peers shared, separated only by
+ * a 4-byte nonce prefix while both started their counters at 0.
+ */
 
-static int derive_subkeys(VideoCall *vc) {
-    if (crypto_kdf_derive_from_key(vc->audio_key, AES_GCM_KEY_LEN,
-                                    KDF_SUBKEY_AUDIO, KDF_CONTEXT_AUDIO,
-                                    vc->master_key) != 0) {
-        fprintf(stderr, "KDF failed for audio sub-key\n");
+static int vc_setup_media_keys(VideoCall *vc) {
+    /* Our identity binding: our own Ed25519 public key when an identity is
+     * loaded, 32 zero bytes when the call runs unsigned. */
+    if (vc->has_identity) {
+        memcpy(vc->own_idbind, vc->identity_pk, MK_IDBIND_BYTES);
+    } else {
+        memset(vc->own_idbind, 0, MK_IDBIND_BYTES);
+    }
+
+    /* Drawn once per call object, before any thread starts, never re-drawn. */
+    randombytes_buf(vc->own_salt, MK_SALT_BYTES);
+
+    if (mk_hello_key(vc->master_key, vc->call_id, vc->hello_key) != 0) {
+        fprintf(stderr, "Failed to derive the HELLO key\n");
         return -1;
     }
-    if (crypto_kdf_derive_from_key(vc->video_key, AES_GCM_KEY_LEN,
-                                    KDF_SUBKEY_VIDEO, KDF_CONTEXT_VIDEO,
-                                    vc->master_key) != 0) {
-        fprintf(stderr, "KDF failed for video sub-key\n");
+    if (mk_sender_id(vc->master_key, vc->call_id, vc->own_salt,
+                     vc->own_idbind, vc->own_sid) != 0) {
+        fprintf(stderr, "Failed to derive our sender id\n");
+        return -1;
+    }
+    if (mk_derive_sender(vc->master_key, MK_STREAM_AUDIO, VC_KEY_VERSION,
+                         vc->call_id, vc->own_salt, vc->own_idbind,
+                         vc->send_key[MK_STREAM_AUDIO]) != 0 ||
+        mk_derive_sender(vc->master_key, MK_STREAM_VIDEO, VC_KEY_VERSION,
+                         vc->call_id, vc->own_salt, vc->own_idbind,
+                         vc->send_key[MK_STREAM_VIDEO]) != 0) {
+        fprintf(stderr, "Failed to derive our media keys\n");
+        return -1;
+    }
+    /* Passing our own salt lets the table refuse it when a relay echoes our
+     * own HELLO back at us, which would install a slot holding our send keys. */
+    if (ms_init(&vc->senders, vc->master_key, vc->call_id, vc->own_salt) != MS_OK) {
+        fprintf(stderr, "Failed to initialise the sender table\n");
         return -1;
     }
     return 0;
 }
 
-/* ===== HELLO handshake ===== */
+/* ===== HELLO2 handshake ===== */
 
+/**
+ * Announce ourselves: the call we are in, the K_room generation, our own salt
+ * and, when we have one, our identity. A receiver needs nothing else to derive
+ * our keys, so this is the whole handshake.
+ *
+ * The buffer used to be sized HELLO_SIZE_VIDEO + pk + sig = 107 bytes, which a
+ * signed HELLO2 (MH_SIZE_SIGNED = 158) would have smashed on every send.
+ */
 static int send_hello(VideoCall *vc) {
-    /* Max HELLO size: HELLO_SIZE_VIDEO + IDENTITY_PK_BYTES + IDENTITY_SIG_BYTES = 107 */
-    uint8_t pkt[HELLO_SIZE_VIDEO + IDENTITY_PK_BYTES + IDENTITY_SIG_BYTES];
-    pkt[0] = PKT_TYPE_HELLO;
-    memcpy(pkt + 1, vc->local_nonce_prefix, NONCE_PREFIX_LEN);
+    mh_hello_t h;
+    memset(&h, 0, sizeof h);
 
-    int pkt_len;
-    if (vc->video_enabled) {
-        uint8_t flags = 0;
-        if (vc->video_enabled) flags |= HELLO_FLAG_VIDEO;
-        if (vc->audio_enabled) flags |= HELLO_FLAG_AUDIO;
-        if (vc->has_identity) flags |= HELLO_FLAG_IDENTITY;
-        pkt[5] = flags;
+    /* Flags say what this binary sends, not what it can display. */
+    if (vc->video_enabled) h.flags |= MH_FLAG_VIDEO;
+    if (vc->audio_enabled) h.flags |= MH_FLAG_AUDIO;
+    if (vc->has_identity)  h.flags |= MH_FLAG_IDENTITY;
 
+    h.key_version = VC_KEY_VERSION;
+    memcpy(h.call_id, vc->call_id, MK_CALLID_BYTES);
+    memcpy(h.sender_salt, vc->own_salt, MK_SALT_BYTES);
+
+    /* Video parameters are meaningful only with the flag; mh_build zeroes them
+     * otherwise, so a receiver never dispatches on length. */
+    if (h.flags & MH_FLAG_VIDEO) {
         const VideoQualityPreset *preset = quality_get_preset(&vc->quality);
-        uint16_t w = htons((uint16_t)preset->width);
-        uint16_t h = htons((uint16_t)preset->height);
-        memcpy(pkt + 6, &w, 2);
-        memcpy(pkt + 8, &h, 2);
-        pkt[10] = (uint8_t)preset->fps;
-        pkt_len = HELLO_SIZE_VIDEO;
-
-        if (vc->has_identity) {
-            memcpy(pkt + pkt_len, vc->identity_pk, IDENTITY_PK_BYTES);
-            /* Sign all preceding HELLO bytes */
-            identity_sign(pkt, (size_t)pkt_len + IDENTITY_PK_BYTES, vc->identity_sk,
-                          pkt + pkt_len + IDENTITY_PK_BYTES);
-            pkt_len += IDENTITY_PK_BYTES + IDENTITY_SIG_BYTES;
-        }
-    } else {
-        if (vc->has_identity) {
-            /* Audio-only signed: [0x7F][prefix(4)][flags(1)][pk(32)][sig(64)] */
-            pkt[5] = HELLO_FLAG_AUDIO | HELLO_FLAG_IDENTITY;
-            pkt_len = 6;
-            memcpy(pkt + pkt_len, vc->identity_pk, IDENTITY_PK_BYTES);
-            identity_sign(pkt, (size_t)pkt_len + IDENTITY_PK_BYTES, vc->identity_sk,
-                          pkt + pkt_len + IDENTITY_PK_BYTES);
-            pkt_len += IDENTITY_PK_BYTES + IDENTITY_SIG_BYTES;
-        } else {
-            pkt_len = HELLO_SIZE_AUDIO;
-        }
+        h.width  = (uint16_t)preset->width;
+        h.height = (uint16_t)preset->height;
+        h.fps    = (uint8_t)preset->fps;
     }
 
-    return vc_send_packet(vc, pkt, pkt_len);
-}
-
-static int handle_hello(VideoCall *vc, const uint8_t *buf, size_t len) {
-    if (len < HELLO_SIZE_AUDIO) {
-        fprintf(stderr, "[handle_hello] REJECTED: len=%zu < HELLO_SIZE_AUDIO=%d\n",
-                len, HELLO_SIZE_AUDIO);
+    uint8_t pkt[MH_SIZE_SIGNED];
+    size_t pkt_len = 0;
+    mh_status_t st = mh_build(&h, vc->hello_key,
+                              vc->has_identity ? vc->identity_sk : NULL,
+                              pkt, sizeof pkt, &pkt_len);
+    if (st != MH_OK) {
+        fprintf(stderr, "HELLO2 build failed: %s\n", mh_strerror(st));
         return -1;
     }
-    fprintf(stderr, "[handle_hello] OK: len=%zu, setting remote_prefix_ready=1\n", len);
 
-    /* Detect if peer reconnected (different nonce prefix = new session) */
-    int prefix_changed = (atomic_load(&vc->remote_prefix_ready) &&
-                          memcmp(vc->remote_nonce_prefix, buf + 1, NONCE_PREFIX_LEN) != 0);
+    return vc_send_packet(vc, pkt, (int)pkt_len);
+}
 
-    memcpy(vc->remote_nonce_prefix, buf + 1, NONCE_PREFIX_LEN);
-    atomic_store(&vc->remote_prefix_ready, 1);
-
-    /* A new prefix means the peer restarted and its sequence numbers begin at 0
-     * again, so the replay windows have to start over. An unchanged prefix must
-     * keep them, or a replayed HELLO would reopen the history for replay. */
-    if (prefix_changed) {
-        memset(&vc->rx_video, 0, sizeof vc->rx_video);
-        memset(&vc->rx_audio, 0, sizeof vc->rx_audio);
-        memset(&vc->rx_stats, 0, sizeof vc->rx_stats);
+/**
+ * Handle an arriving HELLO. A packet that does not verify installs nothing,
+ * resets nothing and is never answered: the old code replied to anything that
+ * was merely long enough, which told an off-path prober it had found a live
+ * call without ever holding the room key.
+ */
+static void handle_hello(VideoCall *vc, const uint8_t *buf, size_t len) {
+    mh_hello_t h;
+    mh_status_t st = mh_parse(buf, len, vc->hello_key, &h);
+    if (st != MH_OK) {
+        if (st == MH_ERR_LEGACY_PEER && !vc->legacy_warned) {
+            vc->legacy_warned = 1;
+            printf("Peer speaks the pre-group HELLO and cannot join this call.\n"
+                   "It must be updated to a build with group-call support.\n");
+            fflush(stdout);
+        }
+        return;
     }
+
+    /* Redundant with the MAC, whose key is derived from call_id, but it costs
+     * nothing and makes the binding explicit. */
+    if (memcmp(h.call_id, vc->call_id, MK_CALLID_BYTES) != 0) return;
+
+    uint8_t idbind[MK_IDBIND_BYTES];
+    if (h.flags & MH_FLAG_IDENTITY) {
+        memcpy(idbind, h.pk, MK_IDBIND_BYTES);
+    } else {
+        memset(idbind, 0, sizeof idbind);
+    }
+
+    /* ms_install is idempotent per salt, so a repeated HELLO installs nothing
+     * and, crucially, resets no replay window. Comparing the slot count is how
+     * we tell a genuinely new participant from a retransmission. */
+    int before = ms_count(&vc->senders);
+    int idx = -1;
+    ms_status_t ins = ms_install(&vc->senders, h.sender_salt, idbind,
+                                 h.key_version, &idx);
+    (void)idx;
+    if (ins != MS_OK) {
+        /* MS_ERR_SELF is our own announcement coming back off the relay, and
+         * a full or SID-capped table is a standing condition, so neither is
+         * worth a line per arriving packet. */
+        if (ins != MS_ERR_SELF && !vc->install_warned) {
+            vc->install_warned = 1;
+            fprintf(stderr, "HELLO2: sender not installed (status %d)\n", (int)ins);
+        }
+        return;
+    }
+    int is_new = (ms_count(&vc->senders) > before);
+
     atomic_store(&vc->last_recv_time, video_time_ms());
     atomic_store(&vc->peer_connected, 1);
 
-    if (prefix_changed) {
-        printf("Peer reconnected, resetting state\n");
-        /* Reset fragment receiver for new session */
+    /* Peer media parameters are display information, not replay state, so they
+     * follow every verified announcement. Log only when they change. */
+    int new_video = (h.flags & MH_FLAG_VIDEO) ? 1 : 0;
+    if (new_video != vc->peer_video_enabled || (int)h.width != vc->peer_width ||
+        (int)h.height != vc->peer_height || (int)h.fps != vc->peer_fps) {
+        if (new_video) {
+            printf("Peer video: %ux%u @ %u fps\n",
+                   (unsigned)h.width, (unsigned)h.height, (unsigned)h.fps);
+        } else {
+            printf("Peer is audio-only\n");
+        }
+        fflush(stdout);
+    }
+    vc->peer_video_enabled = new_video;
+    vc->peer_width  = (int)h.width;
+    vc->peer_height = (int)h.height;
+    vc->peer_fps    = (int)h.fps;
+
+    if (!is_new) return;
+
+    atomic_fetch_add(&vc->peers_known, 1);
+
+    if (h.flags & MH_FLAG_IDENTITY) {
+        /* mh_parse already verified the signature, so this only decides trust.
+         * TOFU is keyed by the peer's own public key: a call has many
+         * participants now, and one shared "peer" entry would make every new
+         * participant look like a key change. */
+        char fp[IDENTITY_FINGERPRINT_LEN];
+        identity_pk_fingerprint(h.pk, fp);
+        tofu_result_t tofu = identity_tofu_check(vc->known_keys_path, fp, h.pk);
+        memcpy(vc->peer_identity_pk, h.pk, IDENTITY_PK_BYTES);
+        if (tofu == TOFU_NEW_KEY) {
+            printf("[TOFU] New peer identity: %s\n", fp);
+            vc->peer_verified = 1;
+        } else if (tofu == TOFU_KEY_MATCH) {
+            printf("[VERIFIED] Peer identity: %s\n", fp);
+            vc->peer_verified = 1;
+        } else {
+            printf("[WARNING] PEER KEY CHANGED! Fingerprint: %s\n", fp);
+            vc->peer_verified = -1;
+        }
+        fflush(stdout);
+    } else {
+        printf("Peer joined without an identity (unsigned)\n");
+        fflush(stdout);
+    }
+
+    /* A peer that restarts draws a fresh salt and therefore arrives as a new
+     * sender: its replay window starts clean in its own slot, but the
+     * reassembler and the decoder still hold the previous session's leftovers,
+     * whose frame ids restart at 0. Not on the very first announcement, when
+     * there is nothing to clear. */
+    if (before > 0) {
+        printf("New participant, resetting reassembly and decoder\n");
         video_frag_receiver_free(&vc->frag_recv);
         video_frag_receiver_init(&vc->frag_recv);
-        /* Reset decoder for clean keyframe */
         if (vc->v_dec) {
             video_decoder_close(vc->v_dec);
             vc->v_dec = NULL;
             video_decoder_open(&vc->v_dec);
         }
-        /* Clear stale display frame */
 #ifdef _WIN32
         EnterCriticalSection(&vc->disp_lock);
 #else
@@ -578,211 +669,80 @@ static int handle_hello(VideoCall *vc, const uint8_t *buf, size_t len) {
 #else
         pthread_mutex_unlock(&vc->disp_lock);
 #endif
-        /* Force peer params to 0 so they get re-logged below */
-        vc->peer_width = 0;
-        vc->peer_height = 0;
-        vc->peer_fps = 0;
-        vc->peer_video_enabled = 0;
     }
 
-    if (len >= HELLO_SIZE_VIDEO) {
-        uint8_t flags = buf[5];
-        int new_video = (flags & HELLO_FLAG_VIDEO) ? 1 : 0;
-
-        uint16_t w, h;
-        memcpy(&w, buf + 6, 2);
-        memcpy(&h, buf + 8, 2);
-        int new_w = ntohs(w);
-        int new_h = ntohs(h);
-        int new_fps = buf[10];
-
-        /* Only log when peer video params change */
-        if (new_w != vc->peer_width || new_h != vc->peer_height ||
-            new_fps != vc->peer_fps || new_video != vc->peer_video_enabled) {
-            printf("Peer video: %dx%d @ %d fps\n", new_w, new_h, new_fps);
-        }
-
-        vc->peer_video_enabled = new_video;
-        vc->peer_width = new_w;
-        vc->peer_height = new_h;
-        vc->peer_fps = new_fps;
-
-        /* Check for identity extension in video HELLO (only on first HELLO) */
-        if (vc->peer_verified == 0 &&
-            (flags & HELLO_FLAG_IDENTITY) &&
-            len >= HELLO_SIZE_VIDEO + IDENTITY_PK_BYTES + IDENTITY_SIG_BYTES) {
-            const uint8_t *peer_pk = buf + HELLO_SIZE_VIDEO;
-            const uint8_t *sig = peer_pk + IDENTITY_PK_BYTES;
-            /* Verify: signature covers [0x7F..fps][pk] = first HELLO_SIZE_VIDEO + PK bytes */
-            if (identity_verify(buf, HELLO_SIZE_VIDEO + IDENTITY_PK_BYTES, sig, peer_pk) == 0) {
-                memcpy(vc->peer_identity_pk, peer_pk, IDENTITY_PK_BYTES);
-                tofu_result_t tofu = identity_tofu_check(vc->known_keys_path, "peer", peer_pk);
-                char fp[IDENTITY_FINGERPRINT_LEN];
-                identity_pk_fingerprint(peer_pk, fp);
-                if (tofu == TOFU_NEW_KEY) {
-                    printf("[TOFU] New peer identity: %s\n", fp);
-                    vc->peer_verified = 1;
-                } else if (tofu == TOFU_KEY_MATCH) {
-                    printf("[VERIFIED] Peer identity: %s\n", fp);
-                    vc->peer_verified = 1;
-                } else if (tofu == TOFU_KEY_CONFLICT) {
-                    printf("[WARNING] PEER KEY CHANGED! Fingerprint: %s\n", fp);
-                    vc->peer_verified = -1;
-                }
-                fflush(stdout);
-            } else {
-                printf("[!] Peer identity signature verification failed\n");
-                fflush(stdout);
-                vc->peer_verified = -1;
-            }
-        }
-    } else if (len >= 6) {
-        /* Audio-only with flags byte: [0x7F][prefix(4)][flags(1)]... */
-        uint8_t flags = buf[5];
-        if (vc->peer_video_enabled != 0) {
-            printf("Peer is audio-only\n");
-        }
-        vc->peer_video_enabled = 0;
-
-        /* Check for identity in audio-only HELLO with flags (only on first HELLO) */
-        if (vc->peer_verified == 0 &&
-            (flags & HELLO_FLAG_IDENTITY) &&
-            len >= 6 + IDENTITY_PK_BYTES + IDENTITY_SIG_BYTES) {
-            const uint8_t *peer_pk = buf + 6;
-            const uint8_t *sig = peer_pk + IDENTITY_PK_BYTES;
-            if (identity_verify(buf, 6 + IDENTITY_PK_BYTES, sig, peer_pk) == 0) {
-                memcpy(vc->peer_identity_pk, peer_pk, IDENTITY_PK_BYTES);
-                tofu_result_t tofu = identity_tofu_check(vc->known_keys_path, "peer", peer_pk);
-                char fp[IDENTITY_FINGERPRINT_LEN];
-                identity_pk_fingerprint(peer_pk, fp);
-                if (tofu == TOFU_NEW_KEY) {
-                    printf("[TOFU] New peer identity: %s\n", fp);
-                    vc->peer_verified = 1;
-                } else if (tofu == TOFU_KEY_MATCH) {
-                    printf("[VERIFIED] Peer identity: %s\n", fp);
-                    vc->peer_verified = 1;
-                } else if (tofu == TOFU_KEY_CONFLICT) {
-                    printf("[WARNING] PEER KEY CHANGED! Fingerprint: %s\n", fp);
-                    vc->peer_verified = -1;
-                }
-                fflush(stdout);
-            }
-        }
-    } else {
-        if (vc->peer_video_enabled != 0) {
-            printf("Peer is audio-only\n");
-        }
-        vc->peer_video_enabled = 0;
-    }
-
-    return 0;
+    /* Exactly one reply, so the new participant learns our salt. Repetition is
+     * the announce loop's job, not this path's. */
+    if (vc->peer_set || vc->tcp_sock) send_hello(vc);
 }
 
-/* ===== Encryption helpers ===== */
+/* ===== Encryption helpers =====
+ *
+ * Send: mp_encrypt with our own SID, our own key for that counter domain, and
+ * the existing per-stream transmit counter. The counter may still start at 0,
+ * which is safe now only because the key is ours alone.
+ *
+ * Receive: the SID in the header picks the key, so there is no "the peer" any
+ * more and nothing caches a nonce prefix.
+ */
 
 static int encrypt_audio_pkt(VideoCall *vc, const uint8_t *opus, size_t opus_len,
-                              uint8_t *out, size_t *out_len, uint64_t seq) {
-    return audio_encrypt_packet(opus, opus_len, vc->audio_key,
-                                vc->local_nonce_prefix, seq, out, out_len);
+                              uint8_t *out, size_t out_cap, size_t *out_len,
+                              uint64_t counter) {
+    return mp_encrypt(PKT_TYPE_AUDIO, vc->own_sid, counter,
+                      vc->send_key[MK_STREAM_AUDIO],
+                      opus, opus_len, out, out_cap, out_len);
 }
 
 static int encrypt_video_frag(VideoCall *vc, const uint8_t *frag, size_t frag_len,
-                               uint8_t *out, size_t *out_len, uint64_t seq) {
-    /* Packet format: [0x02][seq(8)][AES-GCM(frag_header+vp8_data)+tag(16)] */
-    out[0] = PKT_TYPE_VIDEO_FRAG;
-    uint64_t be_seq = htonll_u64(seq);
-    memcpy(out + 1, &be_seq, 8);
-
-    uint8_t nonce[AES_GCM_NONCE_LEN];
-    memcpy(nonce, vc->local_nonce_prefix, NONCE_PREFIX_LEN);
-    memcpy(nonce + NONCE_PREFIX_LEN, &be_seq, 8);
-
-    unsigned long long clen = 0;
-    if (crypto_aead_aes256gcm_encrypt(
-            out + 1 + 8, &clen,
-            frag, frag_len,
-            NULL, 0, NULL, nonce, vc->video_key) != 0) {
-        return -1;
-    }
-
-    *out_len = 1 + 8 + (size_t)clen;
-    return 0;
-}
-
-static int decrypt_video_frag(VideoCall *vc, const uint8_t *pkt, size_t pkt_len,
-                               uint8_t *frag_out, size_t *frag_len) {
-    if (pkt_len < 1 + 8 + AES_GCM_ABYTES) return -1;
-    if (pkt[0] != PKT_TYPE_VIDEO_FRAG) return -1;
-
-    uint64_t be_seq;
-    memcpy(&be_seq, pkt + 1, 8);
-
-    uint8_t nonce[AES_GCM_NONCE_LEN];
-    memcpy(nonce, vc->remote_nonce_prefix, NONCE_PREFIX_LEN);
-    memcpy(nonce + NONCE_PREFIX_LEN, &be_seq, 8);
-
-    unsigned long long mlen = 0;
-    if (crypto_aead_aes256gcm_decrypt(
-            frag_out, &mlen, NULL,
-            pkt + 1 + 8, pkt_len - (1 + 8),
-            NULL, 0, nonce, vc->video_key) != 0) {
-        return -1;
-    }
-
-    *frag_len = (size_t)mlen;
-    return 0;
+                               uint8_t *out, size_t out_cap, size_t *out_len,
+                               uint64_t counter) {
+    return mp_encrypt(PKT_TYPE_VIDEO_FRAG, vc->own_sid, counter,
+                      vc->send_key[MK_STREAM_VIDEO],
+                      frag, frag_len, out, out_cap, out_len);
 }
 
 static int encrypt_stats(VideoCall *vc, const StatsPayload *stats,
-                          uint8_t *out, size_t *out_len, uint64_t seq) {
-    out[0] = PKT_TYPE_STATS;
-    uint64_t be_seq = htonll_u64(seq);
-    memcpy(out + 1, &be_seq, 8);
-
-    uint8_t nonce[AES_GCM_NONCE_LEN];
-    memcpy(nonce, vc->local_nonce_prefix, NONCE_PREFIX_LEN);
-    memcpy(nonce + NONCE_PREFIX_LEN, &be_seq, 8);
-
-    unsigned long long clen = 0;
-    if (crypto_aead_aes256gcm_encrypt(
-            out + 1 + 8, &clen,
-            (const uint8_t *)stats, sizeof(StatsPayload),
-            NULL, 0, NULL, nonce, vc->video_key) != 0) {
-        return -1;
-    }
-
-    *out_len = 1 + 8 + (size_t)clen;
-    return 0;
+                          uint8_t *out, size_t out_cap, size_t *out_len,
+                          uint64_t counter) {
+    /* Stats are drawn from the video transmit counter (see th_vsend_func), so
+     * they must use the video key: two counter domains under one key would
+     * repeat a nonce, one packet type per domain never does. */
+    return mp_encrypt(PKT_TYPE_STATS, vc->own_sid, counter,
+                      vc->send_key[MK_STREAM_VIDEO],
+                      (const uint8_t *)stats, sizeof(StatsPayload),
+                      out, out_cap, out_len);
 }
 
-static int decrypt_stats(VideoCall *vc, const uint8_t *pkt, size_t pkt_len,
-                          StatsPayload *stats_out) {
-    if (pkt_len < 1 + 8 + AES_GCM_ABYTES) return -1;
+/**
+ * Decrypt one arriving media packet, whoever sent it.
+ *
+ * Order matters and is the whole point: peek the SID, collect the slots that
+ * answer to it (a 3-byte tag really does collide, so there can be two), try
+ * each candidate's key for this counter domain, and only once a tag verifies
+ * offer the counter to that slot's replay window. Touching the window before
+ * the packet authenticates is how a single forged packet at a huge counter
+ * silences a real sender for good.
+ *
+ * @return the slot index on success, -1 if nothing decrypted it or it was stale
+ */
+static int decrypt_from_sender(VideoCall *vc, const uint8_t *pkt, size_t pkt_len,
+                               mk_stream_t stream,
+                               uint8_t *out, size_t out_cap, size_t *out_len) {
+    uint8_t sid[MK_SID_BYTES];
+    uint64_t counter = 0;
+    if (mp_peek(pkt, pkt_len, NULL, sid, &counter) != 0) return -1;
 
-    uint64_t be_seq;
-    memcpy(&be_seq, pkt + 1, 8);
-
-    uint8_t nonce[AES_GCM_NONCE_LEN];
-    memcpy(nonce, vc->remote_nonce_prefix, NONCE_PREFIX_LEN);
-    memcpy(nonce + NONCE_PREFIX_LEN, &be_seq, 8);
-
-    unsigned long long mlen = 0;
-    uint8_t plain[64];
-    /* Bound the AEAD output BEFORE decrypting: libsodium writes (clen - ABYTES)
-     * bytes into `plain` and touches that buffer even when the tag is invalid,
-     * so an oversized STATS packet would overflow this stack buffer without a
-     * room key. The length check below runs too late to prevent that. */
-    if (pkt_len - (1 + 8) - AES_GCM_ABYTES > sizeof plain) return -1;
-    if (crypto_aead_aes256gcm_decrypt(
-            plain, &mlen, NULL,
-            pkt + 1 + 8, pkt_len - (1 + 8),
-            NULL, 0, nonce, vc->video_key) != 0) {
-        return -1;
+    int cand[MS_SID_CAP];
+    int ncand = ms_find_by_sid(&vc->senders, sid, cand);
+    for (int i = 0; i < ncand; i++) {
+        const uint8_t *key = ms_key(&vc->senders, cand[i], stream);
+        if (!key) continue;
+        if (mp_decrypt(pkt, pkt_len, key, out, out_cap, out_len) != 0) continue;
+        if (ms_accept_seq(&vc->senders, cand[i], stream, counter) != MS_FRESH) return -1;
+        return cand[i];
     }
-
-    if (mlen < sizeof(StatsPayload)) return -1;
-    memcpy(stats_out, plain, sizeof(StatsPayload));
-    return 0;
+    return -1;
 }
 
 /* ===== Thread: Video Send ===== */
@@ -808,8 +768,10 @@ static THREAD_RET th_vsend_func(void *arg) {
     int yuv_size = actual_w * actual_h * 3 / 2;
     uint8_t *yuv_buf = (uint8_t *)malloc(yuv_size);
     uint8_t *vp8_buf = (uint8_t *)malloc(VC_MAX_VP8_FRAME);
-    /* Max encrypted fragment: 1 + 8 + FRAG_HEADER_SIZE + FRAG_MAX_PAYLOAD + 16 */
-    uint8_t enc_buf[1 + 8 + FRAG_HEADER_SIZE + FRAG_MAX_PAYLOAD + AES_GCM_ABYTES];
+    /* Largest packet this thread builds is a full fragment. The 9-byte media
+     * header replaces the old 1 + 8, so the size does not change. Stats are far
+     * smaller and share the buffer. */
+    uint8_t enc_buf[MP_HEADER_BYTES + FRAG_HEADER_SIZE + FRAG_MAX_PAYLOAD + MP_TAG_BYTES];
     FragList frags;
 
     if (!yuv_buf || !vp8_buf) {
@@ -822,14 +784,11 @@ static THREAD_RET th_vsend_func(void *arg) {
 #endif
     }
 
-    /* Wait for handshake while continuously draining camera frames.
-       Without this, dshow buffer fills up during handshake and all new frames get dropped. */
-    while (atomic_load(&vc->running)) {
-        if (atomic_load(&vc->remote_prefix_ready)) break;
-        /* Keep reading frames to prevent dshow buffer overflow */
-        video_capture_read(vc->capture, yuv_buf, yuv_size);
-    }
-
+    /* No handshake wait. Our send key comes from our own salt, so we can
+     * encrypt from the first frame; the old spin blocked here until somebody
+     * answered, which in a group call means blocking on whoever happens to
+     * answer first. video_capture_read_latest below drains the camera queue,
+     * so the dshow overflow the spin also guarded against cannot build up. */
     uint32_t frame_id = 0;
     int frame_interval_ms = 1000 / preset->fps;
 
@@ -885,7 +844,7 @@ static THREAD_RET th_vsend_func(void *arg) {
             uint64_t seq = atomic_fetch_add(&vc->video_seq_tx, 1);
             size_t enc_len = 0;
             if (encrypt_video_frag(vc, frags.data[i], frags.sizes[i],
-                                    enc_buf, &enc_len, seq) != 0) {
+                                    enc_buf, sizeof enc_buf, &enc_len, seq) != 0) {
                 continue;
             }
 
@@ -916,7 +875,7 @@ static THREAD_RET th_vsend_func(void *arg) {
 
             uint64_t seq = atomic_fetch_add(&vc->video_seq_tx, 1);
             size_t enc_len = 0;
-            if (encrypt_stats(vc, &sp, enc_buf, &enc_len, seq) == 0) {
+            if (encrypt_stats(vc, &sp, enc_buf, sizeof enc_buf, &enc_len, seq) == 0) {
                 vc_send_packet(vc, enc_buf, (int)enc_len);
             }
 
@@ -948,20 +907,8 @@ static THREAD_RET th_asend_func(void *arg) {
     VideoCall *vc = ta->vc;
     free(ta);
 
-    /* Wait for handshake */
-    int waited = 0;
-    while (atomic_load(&vc->running)) {
-        if (atomic_load(&vc->remote_prefix_ready)) break;
-        if (waited == 0 && (vc->peer_set || vc->tcp_sock)) send_hello(vc);
-        waited++;
-        msleep(50);
-        if (waited % 20 == 0 && (vc->peer_set || vc->tcp_sock)) {
-            /* Re-send UDP relay registration periodically (only for UDP relay) */
-            if (vc->relay_mode && !vc->tcp_sock) send_udp_registration(vc);
-            send_hello(vc);
-        }
-    }
-
+    /* No handshake wait here either. Re-announcing moved to the main loop,
+     * which repeats the HELLO2 without holding up a single encrypted packet. */
     if (!vc->audio_enabled) {
 #ifdef _WIN32
         return 0;
@@ -972,7 +919,7 @@ static THREAD_RET th_asend_func(void *arg) {
 
     int16_t pcm[VC_FRAME_SAMPLES];
     uint8_t opus_buf[VC_MAX_OPUS_BYTES];
-    uint8_t packet[1 + 8 + VC_MAX_OPUS_BYTES + AES_GCM_ABYTES];
+    uint8_t packet[MP_HEADER_BYTES + VC_MAX_OPUS_BYTES + MP_TAG_BYTES];
 
     while (atomic_load(&vc->running)) {
         if (vc->in_stream == NULL) {
@@ -990,7 +937,7 @@ static THREAD_RET th_asend_func(void *arg) {
         uint64_t seq = atomic_fetch_add(&vc->audio_seq_tx, 1);
         size_t pkt_len = 0;
         if (encrypt_audio_pkt(vc, opus_buf, (size_t)enc_bytes,
-                               packet, &pkt_len, seq) != 0) {
+                               packet, sizeof packet, &pkt_len, seq) != 0) {
             continue;
         }
 
@@ -1069,14 +1016,14 @@ static THREAD_RET th_recv_func(void *arg) {
 
         uint8_t pkt_type = rbuf[0];
 
-        /* HELLO handshake */
-        if (pkt_type == PKT_TYPE_HELLO) {
+        /* HELLO handshake. Both packet types land here: mh_parse recognises
+         * the pre-group 0x7F and says so, instead of it being dropped as
+         * garbage and the call staying silently dead. handle_hello decides
+         * whether to answer - an unverified HELLO is never answered. */
+        if (pkt_type == MH_TYPE || pkt_type == MH_LEGACY_TYPE) {
             handle_hello(vc, rbuf, (size_t)n);
-            if (vc->peer_set || vc->tcp_sock) send_hello(vc);
             continue;
         }
-
-        if (!atomic_load(&vc->remote_prefix_ready)) continue;
 
         /* Update last receive time for peer timeout detection */
         atomic_store(&vc->last_recv_time, video_time_ms());
@@ -1085,17 +1032,10 @@ static THREAD_RET th_recv_func(void *arg) {
         /* Audio packet */
         if (pkt_type == PKT_TYPE_AUDIO && vc->audio_enabled) {
             size_t opus_len = 0;
-            if (audio_decrypt_packet(rbuf, (size_t)n, vc->audio_key,
-                                      vc->remote_nonce_prefix,
-                                      opus_buf, VC_MAX_OPUS_BYTES, &opus_len) != 0) {
+            /* Picks the sender by SID and drops replays; both are inside. */
+            if (decrypt_from_sender(vc, rbuf, (size_t)n, MK_STREAM_AUDIO,
+                                    opus_buf, VC_MAX_OPUS_BYTES, &opus_len) < 0) {
                 continue;
-            }
-
-            /* Authenticated: drop replayed or stale audio frames. */
-            {
-                uint64_t be_seq_a;
-                memcpy(&be_seq_a, rbuf + 1, 8);
-                if (replay_accept(&vc->rx_audio, ntohll_u64(be_seq_a)) != 0) continue;
             }
 
             int dec_samples = opus_decode(vc->dec, opus_buf, (opus_int32)opus_len,
@@ -1128,16 +1068,11 @@ static THREAD_RET th_recv_func(void *arg) {
         /* Video fragment */
         if (pkt_type == PKT_TYPE_VIDEO_FRAG && vc->video_enabled) {
             size_t frag_len = 0;
-            if (decrypt_video_frag(vc, rbuf, (size_t)n, dec_buf, &frag_len) != 0) {
+            /* Replays are dropped inside, before the reassembler ever sees the
+             * fragment: a repeat there would corrupt a frame. */
+            if (decrypt_from_sender(vc, rbuf, (size_t)n, MK_STREAM_VIDEO,
+                                    dec_buf, VC_MAX_VP8_FRAME, &frag_len) < 0) {
                 continue;
-            }
-
-            /* Authenticated: drop replayed fragments before they reach the
-             * reassembler, where a repeated fragment would corrupt a frame. */
-            {
-                uint64_t be_seq_v;
-                memcpy(&be_seq_v, rbuf + 1, 8);
-                if (replay_accept(&vc->rx_video, ntohll_u64(be_seq_v)) != 0) continue;
             }
 
             /* Expire old incomplete frames */
@@ -1185,15 +1120,16 @@ static THREAD_RET th_recv_func(void *arg) {
             continue;
         }
 
-        /* Stats packet */
+        /* Stats packet. Stats are drawn from the sender's video counter, so
+         * the video key decrypts them: one counter domain, one key. */
         if (pkt_type == PKT_TYPE_STATS) {
+            uint8_t plain[64];
+            size_t plain_len = 0;
             StatsPayload sp;
-            if (decrypt_stats(vc, rbuf, (size_t)n, &sp) == 0) {
-                /* Authenticated: reject replays. Re-sent old measurements would
-                 * otherwise let an on-path attacker steer the quality controller. */
-                uint64_t be_seq_s;
-                memcpy(&be_seq_s, rbuf + 1, 8);
-                if (replay_accept(&vc->rx_stats, ntohll_u64(be_seq_s)) != 0) continue;
+            if (decrypt_from_sender(vc, rbuf, (size_t)n, MK_STREAM_VIDEO,
+                                    plain, sizeof plain, &plain_len) >= 0 &&
+                plain_len >= sizeof(StatsPayload)) {
+                memcpy(&sp, plain, sizeof sp);
                 quality_record_peer_stats(&vc->quality, sp.packets_received, sp.packets_lost);
 
                 /* RTT: sp.rtt_ms = echo of our ping + hold time
@@ -1450,10 +1386,15 @@ static void video_call_stop(VideoCall *vc) {
     if (vc->relay_mode) pthread_mutex_destroy(&vc->tcp_send_lock);
 #endif
 
-    /* Secure wipe keys */
+    /* Secure wipe: every key, salt and identity secret this call held. */
+    ms_clear(&vc->senders);
+    sodium_memzero(vc->send_key, sizeof(vc->send_key));
+    sodium_memzero(vc->hello_key, sizeof(vc->hello_key));
+    sodium_memzero(vc->own_salt, sizeof(vc->own_salt));
+    sodium_memzero(vc->own_sid, sizeof(vc->own_sid));
+    sodium_memzero(vc->call_id, sizeof(vc->call_id));
+    sodium_memzero(vc->identity_sk, sizeof(vc->identity_sk));
     sodium_memzero(vc->master_key, sizeof(vc->master_key));
-    sodium_memzero(vc->audio_key, sizeof(vc->audio_key));
-    sodium_memzero(vc->video_key, sizeof(vc->video_key));
 
     free(vc);
 }
@@ -1536,6 +1477,7 @@ static void print_usage(const char *argv0) {
         "  %s hub <port>\n"
         "\n"
         "Options:\n"
+        "  --call-id HEX32       Call identifier, 32 hex chars (REQUIRED)\n"
         "  --key-file FILE       Read key from file\n"
         "  --quality low|medium|high  Quality preset (default: medium)\n"
         "  --adaptive            Enable adaptive quality (default)\n"
@@ -1595,7 +1537,7 @@ static int parse_options(int argc, char **argv, int start_idx, CallOptions *opts
                 return 1;
             }
             g_have_call_id = 1;
-            i += 2;
+            i++;   /* the loop's own i++ steps past the value */
         } else if (strcmp(argv[i], "--key-file") == 0 && i + 1 < argc) {
             opts->keyfile = argv[++i];
         } else if (strcmp(argv[i], "--quality") == 0 && i + 1 < argc) {
@@ -1670,6 +1612,16 @@ static int resolve_key(const CallOptions *opts, uint8_t key[AES_GCM_KEY_LEN]) {
 
 static int start_video_call(const char *remote_ip, uint16_t remote_port,
                              const CallOptions *opts) {
+    /* Mandatory. Every media key, every sender tag and the HELLO2 MAC key are
+     * bound to the call_id, so there is nothing to derive without one, and an
+     * all-zero default would silently drop the cross-call replay barrier. */
+    if (!g_have_call_id) {
+        fprintf(stderr,
+                "Error: --call-id is required (%d hex characters, from the call invite).\n"
+                "       Every media key is bound to it; a call cannot start without one.\n",
+                MK_CALLID_BYTES * 2);
+        return -1;
+    }
     if (net_init_once() != 0) return -1;
     if (sodium_init() < 0) { fprintf(stderr, "libsodium init failed\n"); return -1; }
 
@@ -1682,12 +1634,12 @@ static int start_video_call(const char *remote_ip, uint16_t remote_port,
     VideoCall *vc = (VideoCall *)calloc(1, sizeof(VideoCall));
     if (!vc) return -1;
 
-    /* Resolve key and derive sub-keys */
+    /* Resolve the shared call key. Everything derived from it waits until the
+     * identity is known, because our idbind is one of the inputs. */
     if (resolve_key(opts, vc->master_key) != 0) { free(vc); SDL_Quit(); return -1; }
-    if (derive_subkeys(vc) != 0) { free(vc); SDL_Quit(); return -1; }
+    memcpy(vc->call_id, g_call_id, MK_CALLID_BYTES);
 
-    randombytes_buf(vc->local_nonce_prefix, NONCE_PREFIX_LEN);
-    atomic_store(&vc->remote_prefix_ready, 0);
+    atomic_store(&vc->peers_known, 0);
     atomic_store(&vc->audio_seq_tx, 0);
     atomic_store(&vc->video_seq_tx, 0);
     atomic_store(&vc->running, 1);
@@ -1714,6 +1666,17 @@ static int start_video_call(const char *remote_ip, uint16_t remote_port,
             identity_pk_fingerprint(vc->identity_pk, fp);
             fprintf(stderr, "Identity loaded: %s\n", fp);
         }
+    }
+
+    /* Draw our salt and derive our whole send context. This has to come after
+     * the identity load: idbind is our own public key when one is loaded and
+     * 32 zero bytes otherwise, and getting it wrong changes every key we use.
+     * It still runs before any thread starts, which is what the modules
+     * require - nothing here may change mid-call. */
+    if (vc_setup_media_keys(vc) != 0) {
+        sodium_memzero(vc->master_key, sizeof vc->master_key);
+        sodium_memzero(vc->identity_sk, sizeof vc->identity_sk);
+        free(vc); SDL_Quit(); return -1;
     }
 
 #ifdef _WIN32
@@ -1905,7 +1868,22 @@ static int start_video_call(const char *remote_ip, uint16_t remote_port,
 
     /* Main loop: SDL event handling + frame rendering + peer timeout */
     #define PEER_TIMEOUT_MS 5000
+    #define HELLO_REANNOUNCE_MS 1000
+    uint64_t last_announce_ms = video_time_ms();
     while (!atomic_load(&g_sigint) && atomic_load(&vc->running)) {
+        /* Re-announce until somebody answers. A HELLO2 carries only our own
+         * salt, and ms_install is idempotent per salt, so repeating it resets
+         * nothing at the peer. This replaces the spin the send threads used to
+         * do, which blocked encryption on a handshake it no longer needs. */
+        if (atomic_load(&vc->peers_known) == 0 && (vc->peer_set || vc->tcp_sock)) {
+            uint64_t now_ms = video_time_ms();
+            if (now_ms - last_announce_ms >= HELLO_REANNOUNCE_MS) {
+                if (vc->relay_mode && !vc->tcp_sock) send_udp_registration(vc);
+                send_hello(vc);
+                last_announce_ms = now_ms;
+            }
+        }
+
         if (vc->display) {
             SDL_Event ev;
             while (SDL_PollEvent(&ev)) {

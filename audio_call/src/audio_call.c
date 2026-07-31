@@ -67,6 +67,9 @@ typedef int socket_t;
 #include "audio_crypto.h"
 #include "audio_hub.h"
 #include "media_keys.h"
+#include "media_hello.h"
+#include "media_senders.h"
+#include "media_packet.h"
 #include "identity.h"
 
 /* -------------------------- Конфигурация --------------------------------- */
@@ -80,67 +83,49 @@ typedef int socket_t;
 #define AC_OPUS_COMPLEXITY   5
 #define AC_UDP_RECV_BUFSZ    1500
 
-/* ---- Replay protection: sliding window over authenticated sequence numbers ---- */
+/* Replay protection now lives in the sender table (identity/media_senders.h):
+ * one sliding window per participant and per counter domain, keyed by the
+ * salt that participant announced. The two windows that used to sit here
+ * could only ever track one peer, so in a call with three people they
+ * tracked whoever spoke last. */
 
-typedef struct {
-    uint64_t max_seq;   /**< highest sequence number accepted so far */
-    uint64_t bitmap;    /**< bit i set => (max_seq - i) has been accepted */
-    int      started;   /**< 0 until the first packet is accepted */
-} replay_window_t;
-
-/**
- * @brief Accept a sequence number once; reject duplicates and stale packets.
- *
- * Call this only for packets whose AEAD tag has already verified. Feeding it
- * unauthenticated sequence numbers would let an off-path attacker poison the
- * window and lock the real peer out.
- *
- * @return 0 if the packet is fresh, -1 if it is a replay or older than the window.
- */
-/* Per-call identifier from --call-id. Step 5 of the group-call migration
- * makes it mandatory and binds it into every media key; today it is parsed
- * and validated only, so this changes nothing on the wire. */
+/* Per-call identifier from --call-id. Mandatory: it is mixed into every
+ * media key, so the same room key used for two calls never produces the same
+ * key stream and a recording cannot be replayed into a later call. Every
+ * participant must be handed the same value or their keys will not match. */
 static uint8_t g_call_id[MK_CALLID_BYTES];
 static int g_have_call_id = 0;
 
-static int replay_accept(replay_window_t *w, uint64_t seq) {
-    if (!w->started) {
-        w->started = 1;
-        w->max_seq = seq;
-        w->bitmap = 1;
-        return 0;
-    }
-    if (seq > w->max_seq) {
-        uint64_t shift = seq - w->max_seq;
-        w->bitmap = (shift >= 64) ? 0 : (w->bitmap << shift);
-        w->bitmap |= 1;
-        w->max_seq = seq;
-        return 0;
-    }
-    uint64_t diff = w->max_seq - seq;
-    if (diff >= 64) return -1;                  /* older than the window */
-    if (w->bitmap & (1ULL << diff)) return -1;  /* already seen */
-    w->bitmap |= (1ULL << diff);
-    return 0;
-}
 #define AC_MAX_OPUS_BYTES    1275
 #define AC_PCM_BYTES_PER_FR  (AC_FRAME_SAMPLES * sizeof(int16_t) * AC_CHANNELS)
 
-/* Пакеты протокола */
+/* Пакеты протокола. Значения байта типа не меняются. HELLO теперь приходит
+   с типом MH_TYPE (0x7E); старый 0x7F распознаётся только для того, чтобы
+   сказать пользователю, что у собеседника сборка без групповых звонков. */
 #define PKT_VER_AUDIO  0x01
 #define PKT_VER_STATS  0x04
-#define PKT_VER_HELLO  0x7F
+
+/* key_version under which this build derives every media key. Nothing
+   produces a nonzero generation yet, and desktop and Android must agree. */
+#define AC_KEY_VERSION 0
+
+/* How often to repeat our HELLO2 while nobody has answered us (ms). */
+#define AC_HELLO_RETRY_MS 1000
+
+/* ...and how often once somebody has. A repeat costs one small packet and is
+   a no-op at every peer that already installed us, but it is the only way a
+   peer whose own single reply was lost can still learn our salt. */
+#define AC_HELLO_KEEPALIVE_MS 5000
 
 /* Stats exchange interval (ms) */
 #define AC_STATS_INTERVAL_MS 2000
 
-/* AES-GCM конфигурация */
-#define AES_GCM_NONCE_LEN crypto_aead_aes256gcm_NPUBBYTES  /* 12 байт */
+/* AES-GCM конфигурация. Ключ звонка ровно той же длины, что и выводимые из
+   него ключи отправителей: AES_GCM_KEY_LEN == MK_KEY_BYTES == 32.
+   Nonce и тег целиком собираются в identity/media_packet.c, здесь их нет:
+   4-байтовый префикс nonce, который передавался в HELLO, удалён вместе со
+   всей схемой "один ключ на звонок". */
 #define AES_GCM_KEY_LEN   crypto_aead_aes256gcm_KEYBYTES   /* 32 байта */
-#define AES_GCM_ABYTES    crypto_aead_aes256gcm_ABYTES     /* 16 байт */
-
-/* Nonce для AES-GCM (12 байт): 4 байта префикс + 8 байт seq */
-#define NONCE_PREFIX_LEN 4
 
 /* Небольшая задержка */
 #define PLAYOUT_BUFFER_FRAMES 6
@@ -170,11 +155,8 @@ static int replay_accept(replay_window_t *w, uint64_t seq) {
 
 /* --------------------------- Состояние звонка ---------------------------- */
 
-/* HELLO flags for identity */
-#define HELLO_FLAG_IDENTITY 0x01
-
-/* Signed HELLO: [0x7F][prefix(4)][flags(1)][pk(32)][sig(64)] = 102 bytes */
-#define HELLO_SIZE_SIGNED (1 + NONCE_PREFIX_LEN + 1 + IDENTITY_PK_BYTES + IDENTITY_SIG_BYTES)
+/* The HELLO2 wire format - flags, sizes, MAC and signature - belongs to
+   identity/media_hello.c, so nothing about it is defined here any more. */
 
 typedef struct AudioCall {
     socket_t sock;
@@ -192,14 +174,36 @@ typedef struct AudioCall {
     pthread_mutex_t tcp_send_lock;
 #endif
 
-    uint8_t key[AES_GCM_KEY_LEN];
-    uint8_t local_nonce_prefix[NONCE_PREFIX_LEN];
-    uint8_t remote_nonce_prefix[NONCE_PREFIX_LEN];
-    atomic_int remote_prefix_ready;
-    replay_window_t rx_audio;   /**< replay window for audio packets */
-    replay_window_t rx_stats;   /**< replay window for stats packets */
+    /* Group-call media keys (identity/media_keys.h). Every field below is
+       drawn once in audio_call_start, before any thread exists, and is
+       immutable afterwards - which is what lets the send thread encrypt
+       without a lock: there is no re-derivation for it to race against. */
+    uint8_t master_key[MK_KEY_BYTES];   /**< K_call, the room key from the invite */
+    uint8_t call_id[MK_CALLID_BYTES];   /**< binds every key to this one call */
+    uint8_t hello_key[MK_KEY_BYTES];    /**< mk_hello_key(K_call, call_id) */
+    uint8_t own_salt[MK_SALT_BYTES];    /**< our announcement; never re-drawn */
+    uint8_t own_sid[MK_SID_BYTES];      /**< our tag on the wire */
+    uint8_t idbind[MK_IDBIND_BYTES];    /**< our Ed25519 pk, or 32 zero bytes */
+    /* One counter domain in this binary: audio frames and stats both draw
+       from seq_tx, so they share this key. Two packet types on one counter
+       are safe because the counter never repeats; a second counter would
+       need a second stream id. */
+    uint8_t send_key_audio[MK_KEY_BYTES];
 
-    atomic_uint_fast64_t seq_tx;
+    /* Receive side: a key slot and a replay window per participant. Touched
+       only by the receive thread, so it needs no lock. */
+    ms_table_t senders;
+    /* Packets successfully decrypted from each slot. Only the teardown
+     * report uses it, and that report is what the three-party loopback test
+     * asserts on: without a count there is no way to tell "installed a
+     * peer" apart from "actually heard that peer". */
+    uint64_t rx_count[MS_MAX_SLOTS];
+    atomic_int have_peer;        /**< set once any peer has been installed */
+    int legacy_peer_warned;      /**< an old peer is reported once, not per packet */
+    int foreign_call_warned;     /**< likewise for a HELLO of another call */
+    int install_warned;          /**< likewise for a table that cannot take a peer */
+
+    atomic_uint_fast64_t seq_tx; /**< transmit counter, shared by audio and stats */
 
     PaStream *in_stream;
     PaStream *out_stream;
@@ -241,75 +245,147 @@ typedef struct AudioCall {
 /* Forward declaration (defined after TCP relay helpers) */
 static int ac_send_packet(AudioCall *c, const uint8_t *data, int len);
 
+/**
+ * Announce ourselves with one HELLO2: this call's id, our own salt and,
+ * when an identity is loaded, our signed public key. That is everything a
+ * peer needs to derive the key we encrypt with - there is nothing to
+ * negotiate and no reply to wait for.
+ *
+ * Only immutable state is read here, so both threads may call it.
+ */
 static int send_hello(AudioCall *c) {
-    if (c->has_identity) {
-        /* Signed HELLO: [0x7F][prefix(4)][flags(1)][pk(32)][sig(64)] */
-        uint8_t pkt[HELLO_SIZE_SIGNED];
-        pkt[0] = PKT_VER_HELLO;
-        memcpy(pkt + 1, c->local_nonce_prefix, NONCE_PREFIX_LEN);
-        pkt[1 + NONCE_PREFIX_LEN] = HELLO_FLAG_IDENTITY;
-        memcpy(pkt + 1 + NONCE_PREFIX_LEN + 1, c->identity_pk, IDENTITY_PK_BYTES);
-        identity_sign(c->local_nonce_prefix, NONCE_PREFIX_LEN,
-                      c->identity_sk,
-                      pkt + 1 + NONCE_PREFIX_LEN + 1 + IDENTITY_PK_BYTES);
-        return ac_send_packet(c, pkt, (int)sizeof(pkt));
-    } else {
-        /* Unsigned HELLO: [0x7F][prefix(4)] */
-        uint8_t pkt[1 + NONCE_PREFIX_LEN];
-        pkt[0] = PKT_VER_HELLO;
-        memcpy(pkt + 1, c->local_nonce_prefix, NONCE_PREFIX_LEN);
-        return ac_send_packet(c, pkt, (int)sizeof(pkt));
+    mh_hello_t h;
+    memset(&h, 0, sizeof h);
+    /* This binary sends audio only. Width, height and fps stay zero because
+       MH_FLAG_VIDEO is not set. */
+    h.flags = MH_FLAG_AUDIO;
+    if (c->has_identity) h.flags |= MH_FLAG_IDENTITY;
+    h.key_version = AC_KEY_VERSION;
+    memcpy(h.call_id, c->call_id, MK_CALLID_BYTES);
+    memcpy(h.sender_salt, c->own_salt, MK_SALT_BYTES);
+
+    uint8_t pkt[MH_SIZE_SIGNED];
+    size_t pkt_len = 0;
+    mh_status_t st = mh_build(&h, c->hello_key,
+                              c->has_identity ? c->identity_sk : NULL,
+                              pkt, sizeof pkt, &pkt_len);
+    if (st != MH_OK) {
+        fprintf(stderr, "[hello] cannot build HELLO: %s\n", mh_strerror(st));
+        return -1;
+    }
+    int rc = ac_send_packet(c, pkt, (int)pkt_len);
+    sodium_memzero(pkt, sizeof pkt);
+    return rc;
+}
+
+/** Why the sender table refused a peer, for a log line the user can act on. */
+static const char *ms_reason(ms_status_t s) {
+    switch (s) {
+        case MS_ERR_FULL:    return "the call is full";
+        case MS_ERR_SID_CAP: return "too many participants share this sender tag";
+        case MS_ERR_ARGS:    return "the announcement is malformed";
+        default:             return "unknown error";
     }
 }
-static int handle_hello(AudioCall *c, const uint8_t *buf, size_t len) {
-    if (len < 1 + NONCE_PREFIX_LEN) return -1;
-    /* A new prefix means the peer restarted its session and its sequence
-     * numbers begin at 0 again, so the replay windows must start over too.
-     * An unchanged prefix keeps the window intact - otherwise a replayed
-     * HELLO would reopen the whole history for replay. */
-    int prefix_changed = (atomic_load(&c->remote_prefix_ready) &&
-                          memcmp(c->remote_nonce_prefix, buf + 1, NONCE_PREFIX_LEN) != 0);
-    memcpy(c->remote_nonce_prefix, buf + 1, NONCE_PREFIX_LEN);
-    atomic_store(&c->remote_prefix_ready, 1);
-    if (prefix_changed) {
-        memset(&c->rx_audio, 0, sizeof c->rx_audio);
-        memset(&c->rx_stats, 0, sizeof c->rx_stats);
+
+/**
+ * Trust-on-first-use for one participant, filed under its own public key.
+ *
+ * The pre-group code filed every peer under the literal name "peer", so with
+ * more than two people in a call each new participant looked like the same
+ * peer changing its key.
+ */
+static void ac_tofu_report(AudioCall *c, const uint8_t peer_pk[IDENTITY_PK_BYTES]) {
+    char fp[IDENTITY_FINGERPRINT_LEN];
+    identity_pk_fingerprint(peer_pk, fp);
+    tofu_result_t tofu = identity_tofu_check(c->known_keys_path, fp, peer_pk);
+    if (tofu == TOFU_NEW_KEY) {
+        printf("[TOFU] New participant identity: %s\n", fp);
+        c->peer_verified = 1;
+    } else if (tofu == TOFU_KEY_MATCH || tofu == TOFU_KEY_MATCH_VERIFIED) {
+        printf("[VERIFIED] Participant identity: %s\n", fp);
+        c->peer_verified = 1;
+    } else {
+        printf("[WARNING] PARTICIPANT KEY CHANGED! Fingerprint: %s\n", fp);
+        c->peer_verified = -1;
+    }
+    memcpy(c->peer_identity_pk, peer_pk, IDENTITY_PK_BYTES);
+    fflush(stdout);
+}
+
+/**
+ * Handle an arriving HELLO2.
+ *
+ * Called only from the receive thread, which is also the only thread that
+ * reads or writes the sender table.
+ */
+static void handle_hello(AudioCall *c, const uint8_t *buf, size_t len) {
+    mh_hello_t h;
+    mh_status_t st = mh_parse(buf, len, c->hello_key, &h);
+    if (st != MH_OK) {
+        if (st == MH_ERR_LEGACY_PEER && !c->legacy_peer_warned) {
+            c->legacy_peer_warned = 1;
+            printf("[!] A peer is running a pre-group build of F.E.A.R. and cannot be "
+                   "heard: it has to be updated.\n");
+            fflush(stdout);
+        }
+        /* Never answer a HELLO that failed to parse. The old code replied to
+           anything shaped like one, which told an off-path prober whether it
+           had guessed the room key and let a single packet start an
+           unbounded exchange. */
+        return;
     }
 
-    /* Check for identity extension (only on first HELLO) */
-    if (len >= HELLO_SIZE_SIGNED && c->peer_verified == 0) {
-        uint8_t flags = buf[1 + NONCE_PREFIX_LEN];
-        if (flags & HELLO_FLAG_IDENTITY) {
-            const uint8_t *peer_pk = buf + 1 + NONCE_PREFIX_LEN + 1;
-            const uint8_t *sig = peer_pk + IDENTITY_PK_BYTES;
-            /* Verify signature over nonce_prefix */
-            if (identity_verify(buf + 1, NONCE_PREFIX_LEN, sig, peer_pk) == 0) {
-                memcpy(c->peer_identity_pk, peer_pk, IDENTITY_PK_BYTES);
-                tofu_result_t tofu = identity_tofu_check(c->known_keys_path, "peer", peer_pk);
-                char fp[IDENTITY_FINGERPRINT_LEN];
-                identity_pk_fingerprint(peer_pk, fp);
-                if (tofu == TOFU_NEW_KEY) {
-                    printf("[TOFU] New peer identity: %s\n", fp);
-                    c->peer_verified = 1;
-                } else if (tofu == TOFU_KEY_MATCH) {
-                    printf("[VERIFIED] Peer identity: %s\n", fp);
-                    c->peer_verified = 1;
-                } else if (tofu == TOFU_KEY_CONFLICT) {
-                    printf("[WARNING] PEER KEY CHANGED! Fingerprint: %s\n", fp);
-                    c->peer_verified = -1;
-                }
-                fflush(stdout);
-            } else {
-                printf("[!] Peer identity signature verification failed\n");
-                fflush(stdout);
-                c->peer_verified = -1;
-            }
+    /* The MAC already binds the call, but a room member could still announce
+       a different call_id in the body: its keys would then hang off a value
+       we do not have and nothing it sends would ever decrypt. Say so once
+       rather than dropping its media in silence. */
+    if (memcmp(h.call_id, c->call_id, MK_CALLID_BYTES) != 0) {
+        if (!c->foreign_call_warned) {
+            c->foreign_call_warned = 1;
+            printf("[!] Ignoring a HELLO that announces a different call id.\n");
+            fflush(stdout);
         }
-    } else if (len == 1 + NONCE_PREFIX_LEN) {
-        /* Old-style unsigned HELLO */
-        c->peer_verified = 0;
+        return;
     }
-    return 0;
+
+    /* An unsigned participant binds 32 zero bytes, exactly as it did when it
+       derived its own send key. */
+    uint8_t idbind[MK_IDBIND_BYTES];
+    memset(idbind, 0, sizeof idbind);
+    if (h.flags & MH_FLAG_IDENTITY) memcpy(idbind, h.pk, MH_PK_BYTES);
+
+    /* Installing the same announcement twice is a no-op by construction, so
+       a repeated (or replayed) HELLO cannot reset anybody's replay window. */
+    const int before = ms_count(&c->senders);
+    int idx = -1;
+    ms_status_t ss = ms_install(&c->senders, h.sender_salt, idbind,
+                                h.key_version, &idx);
+    if (ss != MS_OK) {
+        /* MS_ERR_SELF is our own announcement coming back off the relay and
+           is entirely normal. The rest mean we cannot hear this peer. */
+        if (ss != MS_ERR_SELF && !c->install_warned) {
+            c->install_warned = 1;
+            printf("[!] Cannot add a participant: %s\n", ms_reason(ss));
+            fflush(stdout);
+        }
+        return;
+    }
+    if (ms_count(&c->senders) == before) return;  /* already installed */
+
+    atomic_store(&c->have_peer, 1);
+    if (h.flags & MH_FLAG_IDENTITY) {
+        ac_tofu_report(c, h.pk);
+    } else {
+        printf("[hello] New participant (unsigned); %d now in call\n",
+               ms_count(&c->senders));
+        fflush(stdout);
+    }
+
+    /* Exactly one reply, and only for a participant we had not seen before,
+       so the newcomer learns our salt without a HELLO storm when several
+       people join at once. */
+    if (c->peer_set || c->tcp_sock) send_hello(c);
 }
 
 /* ===== UDP relay registration ===== */
@@ -524,27 +600,30 @@ static int ac_send_packet(AudioCall *c, const uint8_t *data, int len) {
 
 /* --------------------------- AEAD-helpers -------------------------------- */
 
-/* Криптографические функции теперь в audio_crypto.h:
-   - audio_encrypt_packet() - шифрование с sequence number
-   - audio_decrypt_packet() - расшифровка с проверкой
-*/
+/* Кадрирование и AEAD теперь в identity/media_packet.c: mp_encrypt / mp_peek
+   / mp_decrypt, заголовок [type(1)][SID(3)][counter(5)], он же AAD.
+   audio_encrypt_packet()/audio_decrypt_packet() из audio_crypto.h этим
+   файлом больше не используются: у них один ключ на весь звонок и префикс
+   nonce, выученный из HELLO - ровно то, что ломало групповые звонки. */
 
-static int encrypt_opus(AudioCall *c, const uint8_t *opus, size_t opus_len,
-                        uint8_t *out, size_t *out_len, uint64_t seq)
+/**
+ * Encrypt one outgoing packet: our own tag, our own counter, our own key.
+ *
+ * audio_call keeps a single transmit counter (c->seq_tx) that carries both
+ * audio frames and stats, so the two are one counter domain and share the
+ * MK_STREAM_AUDIO key. Two packet types on one counter never repeat a nonce;
+ * two counters under one key would collide immediately.
+ */
+static int encrypt_media(AudioCall *c, uint8_t type,
+                         const uint8_t *plain, size_t plain_len,
+                         uint8_t *out, size_t out_cap, size_t *out_len,
+                         uint64_t counter)
 {
-    return audio_encrypt_packet(opus, opus_len, c->key,
-                                c->local_nonce_prefix, seq, out, out_len);
+    return mp_encrypt(type, c->own_sid, counter, c->send_key_audio,
+                      plain, plain_len, out, out_cap, out_len);
 }
 
-static int decrypt_opus(AudioCall *c, const uint8_t *pkt, size_t pkt_len,
-                        uint8_t *opus_out, size_t opus_cap, size_t *opus_len)
-{
-    if (!atomic_load(&c->remote_prefix_ready)) return -2;
-    return audio_decrypt_packet(pkt, pkt_len, c->key,
-                                c->remote_nonce_prefix, opus_out, opus_cap, opus_len);
-}
-
-/* ===== Stats packet: [0x04][seq(8 BE)][AES-GCM(16 bytes payload + 16 tag)] ===== */
+/* ===== Stats packet: [0x04][SID(3)][counter(5)][AES-GCM(16 payload + 16 tag)] ===== */
 
 typedef struct {
     uint32_t ping_ts;    /* sender's timestamp (lower 32 bits of ms) */
@@ -553,55 +632,40 @@ typedef struct {
     uint32_t reserved2;
 } AudioStatsPayload;
 
-static int encrypt_stats(AudioCall *c, const AudioStatsPayload *sp,
-                          uint8_t *out, size_t *out_len, uint64_t seq) {
-    out[0] = PKT_VER_STATS;
-    uint64_t be_seq = htonll_u64(seq);
-    memcpy(out + 1, &be_seq, 8);
+/**
+ * Authenticate one arriving packet and identify which participant sent it.
+ *
+ * The order here is the whole point. The SID selects candidate slots - a
+ * 3-byte tag really does collide, so there can be two - each candidate's key
+ * is tried, and only once one of them authenticates the packet is the
+ * counter offered to that slot's replay window. Moving the window before the
+ * tag verifies is exactly how one forged packet at a huge counter can
+ * silence a real sender for the rest of the call.
+ *
+ * @return the slot index, or -1 if no key decrypts it or it is not fresh
+ */
+static int decrypt_media(AudioCall *c, const uint8_t *pkt, size_t pkt_len,
+                         uint8_t *out, size_t out_cap, size_t *out_len,
+                         uint8_t *out_type)
+{
+    uint8_t sid[MK_SID_BYTES];
+    uint64_t counter = 0;
+    if (mp_peek(pkt, pkt_len, out_type, sid, &counter) != 0) return -1;
 
-    uint8_t nonce[AES_GCM_NONCE_LEN];
-    memcpy(nonce, c->local_nonce_prefix, NONCE_PREFIX_LEN);
-    memcpy(nonce + NONCE_PREFIX_LEN, &be_seq, 8);
-
-    unsigned long long clen = 0;
-    if (crypto_aead_aes256gcm_encrypt(
-            out + 1 + 8, &clen,
-            (const uint8_t *)sp, sizeof(AudioStatsPayload),
-            NULL, 0, NULL, nonce, c->key) != 0) {
-        return -1;
+    int cand[MS_SID_CAP];
+    const int ncand = ms_find_by_sid(&c->senders, sid, cand);
+    for (int i = 0; i < ncand; i++) {
+        const uint8_t *k = ms_key(&c->senders, cand[i], MK_STREAM_AUDIO);
+        if (!k) continue;
+        if (mp_decrypt(pkt, pkt_len, k, out, out_cap, out_len) != 0) continue;
+        /* Authenticated. Only now may this packet touch the window. */
+        if (ms_accept_seq(&c->senders, cand[i], MK_STREAM_AUDIO, counter) != MS_FRESH) {
+            return -1;   /* replayed, older than the window, or a forged jump */
+        }
+        if (cand[i] >= 0 && cand[i] < MS_MAX_SLOTS) c->rx_count[cand[i]]++;
+        return cand[i];
     }
-    *out_len = 1 + 8 + (size_t)clen;
-    return 0;
-}
-
-static int decrypt_stats(AudioCall *c, const uint8_t *pkt, size_t pkt_len,
-                          AudioStatsPayload *sp_out) {
-    if (pkt_len < 1 + 8 + AES_GCM_ABYTES) return -1;
-    if (!atomic_load(&c->remote_prefix_ready)) return -2;
-
-    uint64_t be_seq;
-    memcpy(&be_seq, pkt + 1, 8);
-
-    uint8_t nonce[AES_GCM_NONCE_LEN];
-    memcpy(nonce, c->remote_nonce_prefix, NONCE_PREFIX_LEN);
-    memcpy(nonce + NONCE_PREFIX_LEN, &be_seq, 8);
-
-    unsigned long long mlen = 0;
-    uint8_t plain[64];
-    /* Bound the AEAD output BEFORE decrypting: libsodium writes (clen - ABYTES)
-     * bytes into `plain` and touches that buffer even when the tag is invalid,
-     * so an oversized STATS packet would overflow this stack buffer without a
-     * room key. The length check below runs too late to prevent that. */
-    if (pkt_len - (1 + 8) - AES_GCM_ABYTES > sizeof plain) return -1;
-    if (crypto_aead_aes256gcm_decrypt(
-            plain, &mlen, NULL,
-            pkt + 1 + 8, pkt_len - (1 + 8),
-            NULL, 0, nonce, c->key) != 0) {
-        return -1;
-    }
-    if (mlen < sizeof(AudioStatsPayload)) return -1;
-    memcpy(sp_out, plain, sizeof(AudioStatsPayload));
-    return 0;
+    return -1;
 }
 
 static uint64_t audio_time_ms(void) {
@@ -625,23 +689,16 @@ static THREAD_RET th_send_func(void *arg) {
     AudioCall *c = ta->c;
     free(ta);
 
-    int waited = 0;
-    while (atomic_load(&c->running)) {
-        if (atomic_load(&c->remote_prefix_ready)) break;
-        if (waited == 0 && (c->peer_set || c->tcp_sock)) send_hello(c);
-        waited++;
-        msleep(50);
-        if (waited % 20 == 0 && (c->peer_set || c->tcp_sock)) {
-            /* Re-send UDP relay registration periodically (only for UDP relay) */
-            if (c->relay_mode && !c->tcp_sock) send_udp_registration(c);
-            send_hello(c);
-        }
-    }
-
+    /* Nothing to wait for. Our key comes from our own salt, so we can
+       encrypt from the very first frame. The old build spun here until a
+       peer's nonce prefix arrived - the same cached prefix that made a
+       third participant impossible. */
     int16_t pcm[AC_FRAME_SAMPLES];
     uint8_t opus[AC_MAX_OPUS_BYTES];
-    uint8_t packet[1 + 8 + AC_MAX_OPUS_BYTES + AES_GCM_ABYTES];
+    uint8_t packet[MP_HEADER_BYTES + AC_MAX_OPUS_BYTES + MP_TAG_BYTES];
 
+    if (c->peer_set || c->tcp_sock) send_hello(c);
+    uint64_t last_hello_ms = audio_time_ms();
     c->last_stats_time_ms = audio_time_ms();
 
     while (atomic_load(&c->running)) {
@@ -664,14 +721,32 @@ static THREAD_RET th_send_func(void *arg) {
 
         uint64_t seq = atomic_fetch_add(&c->seq_tx, 1);
         size_t pkt_len = 0;
-        if (encrypt_opus(c, opus, (size_t)enc_bytes, packet, &pkt_len, seq) != 0) {
+        if (encrypt_media(c, PKT_VER_AUDIO, opus, (size_t)enc_bytes,
+                          packet, sizeof packet, &pkt_len, seq) != 0) {
             continue;
         }
 
         ac_send_packet(c, packet, (int)pkt_len);
 
-        /* Send stats every 2 seconds */
         uint64_t now = audio_time_ms();
+
+        /* Re-announce ourselves: quickly while nobody has answered, because
+           the first HELLO is simply lost if the other side is not up yet,
+           and slowly afterwards, because a peer whose single reply to us was
+           dropped has no other way to hear our salt. A repeat installs
+           nothing new and draws no reply, so this cannot turn into a
+           handshake storm. */
+        const uint64_t hello_gap = atomic_load(&c->have_peer)
+                                       ? AC_HELLO_KEEPALIVE_MS
+                                       : AC_HELLO_RETRY_MS;
+        if ((c->peer_set || c->tcp_sock) && (now - last_hello_ms) >= hello_gap) {
+            last_hello_ms = now;
+            /* Re-send UDP relay registration periodically (only for UDP relay) */
+            if (c->relay_mode && !c->tcp_sock) send_udp_registration(c);
+            send_hello(c);
+        }
+
+        /* Send stats every 2 seconds */
         if ((now - c->last_stats_time_ms) >= AC_STATS_INTERVAL_MS) {
             c->last_stats_time_ms = now;
 
@@ -684,10 +759,13 @@ static THREAD_RET th_send_func(void *arg) {
                 sp.pong_ts = c->last_peer_ping_ts + hold_time;
             }
 
-            uint8_t stats_pkt[1 + 8 + sizeof(AudioStatsPayload) + AES_GCM_ABYTES];
+            uint8_t stats_pkt[MP_HEADER_BYTES + sizeof(AudioStatsPayload) + MP_TAG_BYTES];
             size_t stats_len = 0;
+            /* The same counter as the audio frames above, deliberately: one
+               counter domain, one key, and the counter never repeats. */
             uint64_t stats_seq = atomic_fetch_add(&c->seq_tx, 1);
-            if (encrypt_stats(c, &sp, stats_pkt, &stats_len, stats_seq) == 0) {
+            if (encrypt_media(c, PKT_VER_STATS, (const uint8_t *)&sp, sizeof sp,
+                              stats_pkt, sizeof stats_pkt, &stats_len, stats_seq) == 0) {
                 ac_send_packet(c, stats_pkt, (int)stats_len);
             }
 
@@ -709,7 +787,8 @@ static THREAD_RET th_recv_func(void *arg) {
     free(ta);
 
     uint8_t rbuf[AC_UDP_RECV_BUFSZ];
-    uint8_t opus[AC_MAX_OPUS_BYTES];
+    /* Decrypted payload: an Opus frame, or a stats struct. */
+    uint8_t plain[AC_MAX_OPUS_BYTES];
     int16_t pcm[AC_FRAME_SAMPLES];
 
     while (atomic_load(&c->running)) {
@@ -743,45 +822,41 @@ static THREAD_RET th_recv_func(void *arg) {
             }
         }
 
-        if (rbuf[0] == PKT_VER_HELLO) {
+        /* HELLO2, or the pre-group HELLO kept only so an old peer can be
+           named as such. Replies happen inside handle_hello and only for a
+           peer that is genuinely new. */
+        if (n >= 1 && (rbuf[0] == MH_TYPE || rbuf[0] == MH_LEGACY_TYPE)) {
             handle_hello(c, rbuf, (size_t)n);
-            if (c->peer_set || c->tcp_sock) send_hello(c);
             continue;
         }
 
-        /* Stats packet: RTT ping/pong */
-        if (rbuf[0] == PKT_VER_STATS) {
+        /* Media: SID -> candidate keys -> AEAD -> replay window, in that
+           order and no other (see decrypt_media). */
+        uint8_t ptype = 0;
+        size_t plain_len = 0;
+        if (decrypt_media(c, rbuf, (size_t)n, plain, sizeof plain,
+                          &plain_len, &ptype) < 0) {
+            continue;
+        }
+
+        /* Stats packet: RTT ping/pong. The type byte is authenticated as
+           associated data, so it can no longer be flipped between audio and
+           stats to route a plaintext to the wrong parser. */
+        if (ptype == PKT_VER_STATS) {
             AudioStatsPayload sp;
-            if (decrypt_stats(c, rbuf, (size_t)n, &sp) == 0) {
-                /* Authenticated: now reject replays. Stale RTT/loss figures
-                 * would otherwise let an on-path attacker steer the quality
-                 * controller by re-sending old measurements. */
-                uint64_t be_seq_s;
-                memcpy(&be_seq_s, rbuf + 1, 8);
-                if (replay_accept(&c->rx_stats, ntohll_u64(be_seq_s)) != 0) continue;
-                if (sp.pong_ts != 0) {
-                    uint32_t now32 = (uint32_t)(audio_time_ms() & 0xFFFFFFFF);
-                    c->measured_rtt_ms = now32 - sp.pong_ts;
-                }
-                c->last_peer_ping_ts = sp.ping_ts;
-                c->peer_ping_recv_time = audio_time_ms();
+            if (plain_len < sizeof sp) continue;
+            memcpy(&sp, plain, sizeof sp);
+            if (sp.pong_ts != 0) {
+                uint32_t now32 = (uint32_t)(audio_time_ms() & 0xFFFFFFFF);
+                c->measured_rtt_ms = now32 - sp.pong_ts;
             }
+            c->last_peer_ping_ts = sp.ping_ts;
+            c->peer_ping_recv_time = audio_time_ms();
             continue;
         }
+        if (ptype != PKT_VER_AUDIO) continue;
 
-        size_t opus_len = 0;
-        if (decrypt_opus(c, rbuf, (size_t)n, opus, sizeof opus, &opus_len) != 0) {
-            continue;
-        }
-
-        /* Authenticated: drop replayed or stale audio frames. */
-        {
-            uint64_t be_seq_a;
-            memcpy(&be_seq_a, rbuf + 1, 8);
-            if (replay_accept(&c->rx_audio, ntohll_u64(be_seq_a)) != 0) continue;
-        }
-
-        int dec_samples = opus_decode(c->dec, opus, (opus_int32)opus_len,
+        int dec_samples = opus_decode(c->dec, plain, (opus_int32)plain_len,
                                       pcm, AC_FRAME_SAMPLES, 0);
         if (dec_samples <= 0) continue;
         if (dec_samples < AC_FRAME_SAMPLES) {
@@ -1044,6 +1119,33 @@ void audio_call_stop(AudioCall *c) {
 #endif
 
     pcmring_free(&c->out_ring);
+
+    /* Wipe every secret before the memory goes back to the allocator: the
+       call key, the derived send key, the HELLO key, our salt, the identity
+       secret key and every per-sender key in the table. The pre-group code
+       wiped none of them. */
+    /* One line per participant we installed, with how many of their packets
+     * actually decrypted. A peer that was installed but never decrypted is
+     * the exact symptom of a key that both ends derived differently, which
+     * is invisible from either side alone. */
+    for (int i = 0; i < MS_MAX_SLOTS; i++) {
+        if (!c->senders.slots[i].used) continue;
+        const uint8_t *sid = c->senders.slots[i].sid;
+        printf("[MEDIA] peer %02x%02x%02x decrypted %llu\n",
+               sid[0], sid[1], sid[2],
+               (unsigned long long)c->rx_count[i]);
+    }
+    fflush(stdout);
+
+    ms_clear(&c->senders);
+    sodium_memzero(c, sizeof *c);
+    free(c);
+}
+
+/** Drop a half-built call object, wiping its key material first. */
+static void ac_free_wiped(AudioCall *c) {
+    if (!c) return;
+    sodium_memzero(c, sizeof *c);
     free(c);
 }
 
@@ -1052,6 +1154,7 @@ int audio_call_start(AudioCall **out_call,
                      uint16_t bind_port,
                      int is_caller,
                      const uint8_t key[AES_GCM_KEY_LEN],
+                     const uint8_t call_id[MK_CALLID_BYTES],
                      int input_device_id,
                      int output_device_id,
                      const uint8_t *id_pk,
@@ -1060,31 +1163,62 @@ int audio_call_start(AudioCall **out_call,
                      const char *relay_room,
                      const char *relay_name)
 {
-    if (!out_call || !key) return -1;
+    if (!out_call || !key || !call_id) return -1;
     if (net_init_once() != 0) return -1;
     if (sodium_init() < 0) {
         fprintf(stderr, "libsodium init failed\n");
         return -1;
     }
+    /* Refuse rather than fall back to zeros. An all-zero call_id is what a
+       path that forgot to plumb the field through would produce, and taking
+       it would silently drop the cross-call replay barrier while still
+       appearing to work. */
+    if (sodium_is_zero(call_id, MK_CALLID_BYTES)) {
+        fprintf(stderr, "Error: a call id is required to start a call\n");
+        return -1;
+    }
 
     AudioCall *c = (AudioCall*)calloc(1, sizeof(AudioCall));
     if (!c) return -1;
-    memcpy(c->key, key, AES_GCM_KEY_LEN);
-    randombytes_buf(c->local_nonce_prefix, NONCE_PREFIX_LEN);
-    atomic_store(&c->remote_prefix_ready, 0);
+    memcpy(c->master_key, key, MK_KEY_BYTES);
+    memcpy(c->call_id, call_id, MK_CALLID_BYTES);
+    atomic_store(&c->have_peer, 0);
     atomic_store(&c->seq_tx, 0);
     atomic_store(&c->running, 1);
 
-    /* Initialize identity */
+    /* Initialize identity. This has to happen before the keys are derived:
+       when we have an identity, our public key is bound into them. */
     if (id_pk && id_sk) {
         c->has_identity = 1;
         memcpy(c->identity_pk, id_pk, IDENTITY_PK_BYTES);
         memcpy(c->identity_sk, id_sk, IDENTITY_SK_BYTES);
+        memcpy(c->idbind, id_pk, MK_IDBIND_BYTES);
     } else {
         c->has_identity = 0;
+        memset(c->idbind, 0, MK_IDBIND_BYTES);   /* unsigned call: 32 zero bytes */
     }
     c->peer_verified = 0;
     identity_default_known_keys_path(c->known_keys_path, sizeof(c->known_keys_path));
+
+    /* Our salt is drawn exactly once, here, before any thread exists, and is
+       never re-drawn mid-call: our tag and every key we send under hang off
+       it, so replacing it would restart our counter under a fresh key. */
+    randombytes_buf(c->own_salt, MK_SALT_BYTES);
+    if (mk_sender_id(c->master_key, c->call_id, c->own_salt, c->idbind,
+                     c->own_sid) != 0 ||
+        mk_derive_sender(c->master_key, MK_STREAM_AUDIO, AC_KEY_VERSION,
+                         c->call_id, c->own_salt, c->idbind,
+                         c->send_key_audio) != 0 ||
+        mk_hello_key(c->master_key, c->call_id, c->hello_key) != 0 ||
+        ms_init(&c->senders, c->master_key, c->call_id, c->own_salt) != MS_OK) {
+        fprintf(stderr, "media key derivation failed\n");
+        ac_free_wiped(c);
+        return -1;
+    }
+    printf("[MEDIA] self %02x%02x%02x\n",
+           c->own_sid[0], c->own_sid[1], c->own_sid[2]);
+    printf("Media keys ready; our sender tag is %02x%02x%02x\n",
+           c->own_sid[0], c->own_sid[1], c->own_sid[2]);
 
     /* Relay mode setup */
     c->relay_mode = relay_mode;
@@ -1100,7 +1234,7 @@ int audio_call_start(AudioCall **out_call,
     }
 
     if (pcmring_init(&c->out_ring, 128) != 0) {
-        free(c);
+        ac_free_wiped(c);
         return -1;
     }
 
@@ -1108,8 +1242,29 @@ int audio_call_start(AudioCall **out_call,
     if (c->sock == (socket_t)SOCK_ERR) {
         fprintf(stderr, "socket() failed\n");
         pcmring_free(&c->out_ring);
-        free(c);
+        ac_free_wiped(c);
         return -1;
+    }
+
+    /* Bound how long recvfrom may block, so the receive thread notices
+     * c->running going to zero.
+     *
+     * Without this the thread sits in recvfrom forever, audio_call_stop
+     * blocks in pthread_join, and Ctrl+C never completes: the process has
+     * to be killed. That also means none of the teardown ever ran - not the
+     * key wiping, not the socket close. The defect predates the group-call
+     * work, but the wiping added with it is worthless while it stands. */
+    {
+#ifdef _WIN32
+        DWORD rcv_to = 200;
+        setsockopt(c->sock, SOL_SOCKET, SO_RCVTIMEO,
+                   (const char *)&rcv_to, sizeof rcv_to);
+#else
+        struct timeval rcv_to;
+        rcv_to.tv_sec = 0;
+        rcv_to.tv_usec = 200000;
+        setsockopt(c->sock, SOL_SOCKET, SO_RCVTIMEO, &rcv_to, sizeof rcv_to);
+#endif
     }
 
     struct sockaddr_in local;
@@ -1121,7 +1276,7 @@ int audio_call_start(AudioCall **out_call,
         fprintf(stderr, "bind() failed (port %u)\n", bind_port);
         CLOSESOCK(c->sock);
         pcmring_free(&c->out_ring);
-        free(c);
+        ac_free_wiped(c);
         return -1;
     }
 
@@ -1134,7 +1289,7 @@ int audio_call_start(AudioCall **out_call,
             fprintf(stderr, "cannot resolve host %s\n", remote_ip);
             CLOSESOCK(c->sock);
             pcmring_free(&c->out_ring);
-            free(c);
+            ac_free_wiped(c);
             return -1;
         }
         c->peer_set = 1;
@@ -1143,14 +1298,14 @@ int audio_call_start(AudioCall **out_call,
     if (audio_init_ports(c, input_device_id, output_device_id) != 0) {
         CLOSESOCK(c->sock);
         pcmring_free(&c->out_ring);
-        free(c);
+        ac_free_wiped(c);
         return -1;
     }
     if (audio_init_codec(c) != 0) {
         Pa_Terminate();
         CLOSESOCK(c->sock);
         pcmring_free(&c->out_ring);
-        free(c);
+        ac_free_wiped(c);
         return -1;
     }
 
@@ -1163,13 +1318,13 @@ int audio_call_start(AudioCall **out_call,
 #endif
         if (tcp_relay_connect(c, remote_ip, remote_port) != 0) {
             Pa_Terminate(); CLOSESOCK(c->sock);
-            pcmring_free(&c->out_ring); free(c);
+            pcmring_free(&c->out_ring); ac_free_wiped(c);
             return -1;
         }
         if (tcp_relay_register(c) != 0) {
             fprintf(stderr, "TCP relay registration failed\n");
             CLOSESOCK(c->tcp_sock); Pa_Terminate(); CLOSESOCK(c->sock);
-            pcmring_free(&c->out_ring); free(c);
+            pcmring_free(&c->out_ring); ac_free_wiped(c);
             return -1;
         }
         c->peer_set = 1; /* so send guards pass */
@@ -1195,7 +1350,7 @@ int audio_call_start(AudioCall **out_call,
         Pa_Terminate();
         CLOSESOCK(c->sock);
         pcmring_free(&c->out_ring);
-        free(c);
+        ac_free_wiped(c);
         return -1;
     }
     a1->c = c; a2->c = c;
@@ -1345,13 +1500,16 @@ int main(int argc, char **argv) {
                 "Usage:\n"
                 "  %s genkey\n"
                 "  %s listdevices\n"
-                "  %s call <remote_ip> <remote_port> [--key-file FILE] [local_bind_port] [input_dev] [output_dev]\n"
-                "  %s listen <local_bind_port> [--key-file FILE] [input_dev] [output_dev]\n"
+                "  %s call <remote_ip> <remote_port> --call-id HEX [--key-file FILE] [local_bind_port] [input_dev] [output_dev]\n"
+                "  %s listen <local_bind_port> --call-id HEX [--key-file FILE] [input_dev] [output_dev]\n"
                 "  %s hub <bind_port>\n"
+                "\n"
+                "  --call-id HEX         REQUIRED. 32 hex chars identifying this call, from\n"
+                "                        the invite. Every participant must pass the same\n"
+                "                        value or their media keys will not match.\n"
                 "\n"
                 "Key input methods (in order of priority):\n"
                 "  1. --key-file FILE    Read key from file (recommended for scripts)\n"
-                "  --call-id HEX         32 hex chars identifying this call (from the invite)\n"
                 "  2. stdin              Read key from standard input (interactive or piped)\n"
                 "  3. <hexkey32>         Direct key argument (DEPRECATED - insecure, visible in process list)\n",
                 argv[0], argv[0], argv[0], argv[0], argv[0]);
@@ -1371,6 +1529,7 @@ int main(int argc, char **argv) {
         }
         printf("\n");
 
+        sodium_memzero(key, sizeof key);
         fprintf(stderr, "Audio call key generated successfully.\n");
         fprintf(stderr, "IMPORTANT: Copy the key above to clipboard and share it securely.\n");
         fprintf(stderr, "           The key is NOT saved to disk for security reasons.\n");
@@ -1427,7 +1586,7 @@ int main(int argc, char **argv) {
 
     if (strcmp(argv[1], "call") == 0) {
         if (argc < 4) {
-            fprintf(stderr, "Usage: %s call <remote_ip> <remote_port> [--key-file FILE] [--identity-file FILE] [--no-sign] [local_bind_port] [input_dev] [output_dev]\n", argv[0]);
+            fprintf(stderr, "Usage: %s call <remote_ip> <remote_port> --call-id HEX [--key-file FILE] [--identity-file FILE] [--no-sign] [local_bind_port] [input_dev] [output_dev]\n", argv[0]);
             return 1;
         }
         const char *ip = argv[2];
@@ -1483,6 +1642,15 @@ int main(int argc, char **argv) {
             }
         }
 
+        /* The call id is mandatory: it is mixed into every media key, so
+           without it two calls under one room key would produce the same key
+           stream and a recording of one could be replayed into the other. */
+        if (!g_have_call_id) {
+            fprintf(stderr, "Error: --call-id is required (32 hex chars from the call invite).\n");
+            fprintf(stderr, "       Every participant must pass the same value.\n");
+            return 1;
+        }
+
         // Buffer for key storage
         static char key_buffer[256];
         memset(key_buffer, 0, sizeof(key_buffer));
@@ -1539,15 +1707,21 @@ int main(int argc, char **argv) {
         }
 
         AudioCall *call = NULL;
-        if (audio_call_start(&call, ip, rport, lport, 1, key, input_dev, output_dev,
+        if (audio_call_start(&call, ip, rport, lport, 1, key, g_call_id, input_dev, output_dev,
                              has_identity ? id_pk : NULL,
                              has_identity ? id_sk : NULL,
                              0, NULL, NULL) != 0) {
             fprintf(stderr, "Failed to start call\n");
             if (has_identity) sodium_memzero(id_sk, sizeof(id_sk));
+            sodium_memzero(key, sizeof key);
+            sodium_memzero(key_buffer, sizeof key_buffer);
             return 1;
         }
         if (has_identity) sodium_memzero(id_sk, sizeof(id_sk));
+        /* The room key lives inside the call object now; nothing out here
+           needs it any more. */
+        sodium_memzero(key, sizeof key);
+        sodium_memzero(key_buffer, sizeof key_buffer);
 
         setup_signal();
         printf("Calling %s:%u (press Ctrl+C to stop)\n", ip, rport);
@@ -1561,7 +1735,7 @@ int main(int argc, char **argv) {
 
     if (strcmp(argv[1], "listen") == 0) {
         if (argc < 3) {
-            fprintf(stderr, "Usage: %s listen <local_bind_port> [--key-file FILE] [--identity-file FILE] [--no-sign] [input_dev] [output_dev]\n", argv[0]);
+            fprintf(stderr, "Usage: %s listen <local_bind_port> --call-id HEX [--key-file FILE] [--identity-file FILE] [--no-sign] [input_dev] [output_dev]\n", argv[0]);
             return 1;
         }
         uint16_t lport = (uint16_t)atoi(argv[2]);
@@ -1612,6 +1786,15 @@ int main(int argc, char **argv) {
             }
         }
 
+        /* The call id is mandatory: it is mixed into every media key, so
+           without it two calls under one room key would produce the same key
+           stream and a recording of one could be replayed into the other. */
+        if (!g_have_call_id) {
+            fprintf(stderr, "Error: --call-id is required (32 hex chars from the call invite).\n");
+            fprintf(stderr, "       Every participant must pass the same value.\n");
+            return 1;
+        }
+
         // Buffer for key storage
         static char key_buffer[256];
         memset(key_buffer, 0, sizeof(key_buffer));
@@ -1668,15 +1851,21 @@ int main(int argc, char **argv) {
         }
 
         AudioCall *call = NULL;
-        if (audio_call_start(&call, NULL, 0, lport, 0, key, input_dev, output_dev,
+        if (audio_call_start(&call, NULL, 0, lport, 0, key, g_call_id, input_dev, output_dev,
                              has_identity ? id_pk : NULL,
                              has_identity ? id_sk : NULL,
                              0, NULL, NULL) != 0) {
             fprintf(stderr, "Failed to start listener\n");
             if (has_identity) sodium_memzero(id_sk, sizeof(id_sk));
+            sodium_memzero(key, sizeof key);
+            sodium_memzero(key_buffer, sizeof key_buffer);
             return 1;
         }
         if (has_identity) sodium_memzero(id_sk, sizeof(id_sk));
+        /* The room key lives inside the call object now; nothing out here
+           needs it any more. */
+        sodium_memzero(key, sizeof key);
+        sodium_memzero(key_buffer, sizeof key_buffer);
 
         setup_signal();
         printf("Listening on *:%u (press Ctrl+C to stop)\n", lport);
@@ -1690,7 +1879,7 @@ int main(int argc, char **argv) {
 
     if (strcmp(argv[1], "relay") == 0) {
         if (argc < 4) {
-            fprintf(stderr, "Usage: %s relay <server_ip> <server_port> --room ROOM --name NAME [--key-file FILE] [--identity-file FILE] [--no-sign] [input_dev] [output_dev]\n", argv[0]);
+            fprintf(stderr, "Usage: %s relay <server_ip> <server_port> --room ROOM --name NAME --call-id HEX [--key-file FILE] [--identity-file FILE] [--no-sign] [input_dev] [output_dev]\n", argv[0]);
             return 1;
         }
         const char *ip = argv[2];
@@ -1736,6 +1925,15 @@ int main(int argc, char **argv) {
             return 1;
         }
 
+        /* The call id is mandatory: it is mixed into every media key, so
+           without it two calls under one room key would produce the same key
+           stream and a recording of one could be replayed into the other. */
+        if (!g_have_call_id) {
+            fprintf(stderr, "Error: --call-id is required (32 hex chars from the call invite).\n");
+            fprintf(stderr, "       Every participant must pass the same value.\n");
+            return 1;
+        }
+
         static char key_buffer[256];
         memset(key_buffer, 0, sizeof(key_buffer));
         const char *hexkey = NULL;
@@ -1773,15 +1971,21 @@ int main(int argc, char **argv) {
         }
 
         AudioCall *call = NULL;
-        if (audio_call_start(&call, ip, rport, 0, 1, key, input_dev, output_dev,
+        if (audio_call_start(&call, ip, rport, 0, 1, key, g_call_id, input_dev, output_dev,
                              has_identity ? id_pk : NULL,
                              has_identity ? id_sk : NULL,
                              1, relay_room, relay_name) != 0) {
             fprintf(stderr, "Failed to start relay call\n");
             if (has_identity) sodium_memzero(id_sk, sizeof(id_sk));
+            sodium_memzero(key, sizeof key);
+            sodium_memzero(key_buffer, sizeof key_buffer);
             return 1;
         }
         if (has_identity) sodium_memzero(id_sk, sizeof(id_sk));
+        /* The room key lives inside the call object now; nothing out here
+           needs it any more. */
+        sodium_memzero(key, sizeof key);
+        sodium_memzero(key_buffer, sizeof key_buffer);
 
         setup_signal();
         printf("Relay call via %s:%u (room=%s, name=%s, press Ctrl+C to stop)\n",

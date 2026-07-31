@@ -2,15 +2,18 @@
  * Media packet framing: layout, the authenticated header, and the counter
  * range.
  *
- * The expected ciphertext is not pinned here - AES-GCM under a key this
- * test derives is not an independent check of anything. What is worth
- * pinning is the framing and the properties, so those are asserted
- * directly, and the Kotlin port asserts the same ones.
+ * The expected packets are pinned, and they come from an independent
+ * implementation: Python's `cryptography` AESGCM over the same nonce and
+ * associated data, not from libsodium and not from this code. That is what
+ * makes them worth asserting - the Kotlin port pins the identical bytes
+ * through a third implementation again (the JCE), so a framing mistake
+ * cannot hide behind one library agreeing with itself.
  */
 #include "media_packet.h"
 #include "test_util.h"
 
 #include <sodium.h>
+#include <stdlib.h>
 #include <string.h>
 
 int main(void) {
@@ -66,6 +69,42 @@ int main(void) {
      * repeat a counter under the same key. */
     CHECK(mp_encrypt(0x01, sid, MP_MAX_COUNTER + 1, key, payload, sizeof payload,
                      pkt, sizeof pkt, &pkt_len) == -1);
+
+    /* --- frozen packets, from an independent AES-GCM ------------------------- */
+    /* K_call = 00..1f, call_id = 10..1f, salt = a0..af, unsigned sender, so
+     * the key is 0bc7ef4f... and the tag is 0f2cee - the same values the
+     * media-key vectors pin. */
+    {
+        char pkt_hex[2 * 128 + 1];
+        struct { uint64_t ctr; const char *plain_hex; size_t plain_len; const char *want; } pv[] = {
+            { 0, "68656c6c6f", 5,
+              "010f2cee00000000005f5197e880b22213154f7aa71c525e79ba489b0569" },
+            { 0x0102030405ULL, "68656c6c6f", 5,
+              "010f2cee0102030405543721e24f1bcf13d6e7139ea7e56a2ab4dc9f352f" },
+            { 7, "000102030405060708090a0b0c0d0e0f10111213", 20,
+              "010f2cee0000000007ea70f1d8ef7d4158c07dd4435ae0ba3b1cc6c33f7b"
+              "2844f534dfae38ec011e40ba3f4c65" },
+        };
+        for (size_t v = 0; v < sizeof pv / sizeof pv[0]; v++) {
+            uint8_t pl[64];
+            for (size_t i = 0; i < pv[v].plain_len; i++) {
+                char b[3] = { pv[v].plain_hex[2 * i], pv[v].plain_hex[2 * i + 1], 0 };
+                pl[i] = (uint8_t)strtoul(b, NULL, 16);
+            }
+            CHECK(mp_encrypt(0x01, sid, pv[v].ctr, key, pl, pv[v].plain_len,
+                             pkt, sizeof pkt, &pkt_len) == 0);
+            for (size_t i = 0; i < pkt_len; i++) {
+                static const char *d = "0123456789abcdef";
+                pkt_hex[2 * i]     = d[pkt[i] >> 4];
+                pkt_hex[2 * i + 1] = d[pkt[i] & 0x0F];
+            }
+            pkt_hex[2 * pkt_len] = '\0';
+            if (strcmp(pkt_hex, pv[v].want) != 0)
+                fprintf(stderr, "packet vector %zu:\n want %s\n got  %s\n",
+                        v, pv[v].want, pkt_hex);
+            CHECK(strcmp(pkt_hex, pv[v].want) == 0);
+        }
+    }
 
     /* --- the header is authenticated ----------------------------------------- */
     CHECK(mp_encrypt(0x01, sid, 7, key, payload, sizeof payload,

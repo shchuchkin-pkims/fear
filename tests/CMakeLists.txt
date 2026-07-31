@@ -49,6 +49,13 @@ add_test(NAME integration_smoke
          COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/smoke_chat.sh $<TARGET_FILE:fear>)
 set_tests_properties(integration_smoke PROPERTIES TIMEOUT 60)
 
+# Трёхсторонний медиа-loopback: три процесса через hub, каждый расшифровывает
+# двух других. Единственный тест, способный поймать инверсию ролей или
+# несогласованную соль - модульные тесты живут внутри одного процесса.
+add_test(NAME media_loopback
+         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/media_loopback.sh $<TARGET_FILE:audio_call>)
+set_tests_properties(media_loopback PROPERTIES TIMEOUT 120)
+
 # Протокольный тест M10: BLOB_GET доступен только владельцу pk (подписанный
 # challenge). Бинарь ходит на живой сервер через реальные sp_*-функции;
 # сервер поднимает обёртка blob_auth.sh.
