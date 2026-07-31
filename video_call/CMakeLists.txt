@@ -23,6 +23,9 @@ set(SOURCES
     ${CMAKE_SOURCE_DIR}/audio_call/src/audio_hub.c
     # Identity module
     ${CMAKE_SOURCE_DIR}/identity/identity.c
+    ${CMAKE_SOURCE_DIR}/identity/media_keys.c
+    ${CMAKE_SOURCE_DIR}/identity/media_hello.c
+    ${CMAKE_SOURCE_DIR}/identity/media_senders.c
 )
 
 add_executable(video_call ${SOURCES})

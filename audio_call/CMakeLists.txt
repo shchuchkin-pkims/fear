@@ -16,6 +16,9 @@ set(SOURCES
     src/audio_crypto.c
     src/audio_hub.c
     ${CMAKE_SOURCE_DIR}/identity/identity.c
+    ${CMAKE_SOURCE_DIR}/identity/media_keys.c
+    ${CMAKE_SOURCE_DIR}/identity/media_hello.c
+    ${CMAKE_SOURCE_DIR}/identity/media_senders.c
 )
 
 # Создание исполняемого файла
