@@ -29,6 +29,8 @@ set(SOURCES
     ${SRC_DIR}/server.c
     ${SRC_DIR}/server_db.c
     ${CMAKE_SOURCE_DIR}/identity/identity.c
+    ${CMAKE_SOURCE_DIR}/identity/call_invite.c
+    ${CMAKE_SOURCE_DIR}/identity/media_keys.c
 )
 
 # Создание исполняемого файла

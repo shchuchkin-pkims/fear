@@ -128,6 +128,17 @@ typedef enum {
                                           last_seen and does not reply. Sent ~every 60s when
                                           the client is otherwise silent so the server's idle
                                           scan doesn't kick the connection. */
+    /* ===== Phase C: call signalling ===== */
+    MSG_TYPE_CALL_INVITE      = 32, /**< Room member -> room: I am starting a call.
+                                          Encrypted like any chat message, so the relay can
+                                          neither read nor forge one, and every member of the
+                                          room receives it - which is what makes this work for
+                                          group calls rather than only for two parties.
+                                          Payload: see identity/call_invite.h. Carries the
+                                          call_id every media key is bound to; without it two
+                                          peers have no way to agree on one, and deriving it
+                                          from the room key would make it identical for every
+                                          call in that room. */
     /* ===== M10 (audit 2026-07): authorized blob reads ===== */
     MSG_TYPE_BLOB_GET_CHALLENGE = 30, /**< Client → Server: request a one-shot nonce that
                                           authorizes a single BLOB_GET on this connection.

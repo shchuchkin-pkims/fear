@@ -19,6 +19,7 @@
 #include "client.h"
 #include "network.h"
 #include "identity.h"
+#include "call_invite.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -917,8 +918,79 @@ void handle_file_message(const uint8_t *plain, size_t plen, message_type_t type,
     }
 }
 
-int send_ciphertext(sock_t s, const char *room, const char *name, const uint8_t *key,
-                   const uint8_t *plaintext, size_t plen) {
+/* Defined below; declared here because the invite helper needs it. */
+int send_ciphertext_typed(sock_t s, const char *room, const char *name,
+                          const uint8_t *key, const uint8_t *plaintext,
+                          size_t plen, uint8_t msg_type);
+
+/**
+ * Announce a call to the room.
+ *
+ * The initiator draws the call_id here. Every media key is bound to it, so
+ * it has to be fresh per call: a value derived from the room key would be
+ * the same for every call in that room and a recording of one would replay
+ * into the next. It is printed on stdout because the caller - a person or
+ * the GUI - has to hand it to the media binary as --call-id.
+ *
+ * `arg` is "[host] [port] [video]", all optional. Without a host the invite
+ * carries no direct hint and the call goes through the relay, which is also
+ * the group case.
+ */
+static void handle_invite_command(const char *arg, sock_t s,
+                                  const char *room, const char *name,
+                                  const uint8_t *key) {
+    ci_invite_t inv;
+    memset(&inv, 0, sizeof inv);
+    inv.flags = CI_FLAG_AUDIO;
+
+    char host[CI_MAX_HOST + 1] = {0};
+    unsigned port = 0;
+    char extra[16] = {0};
+    if (arg && *arg) {
+        int n = sscanf(arg, "%255s %u %15s", host, &port, extra);
+        if (n >= 1 && strcmp(host, "video") == 0) {
+            inv.flags |= CI_FLAG_VIDEO;
+            host[0] = '\0';
+        }
+        if (strcmp(extra, "video") == 0) inv.flags |= CI_FLAG_VIDEO;
+        if (port > 65535) {
+            printf("[invite] port out of range\n");
+            fflush(stdout);
+            return;
+        }
+    }
+    inv.port = (uint16_t)port;
+    snprintf(inv.host, sizeof inv.host, "%s", host);
+
+    randombytes_buf(inv.call_id, sizeof inv.call_id);
+
+    uint8_t payload[CI_MAX_BYTES];
+    size_t plen = 0;
+    ci_status_t st = ci_build(&inv, payload, sizeof payload, &plen);
+    if (st != CI_OK) {
+        printf("[invite] cannot build invite: %s\n", ci_strerror(st));
+        fflush(stdout);
+        return;
+    }
+
+    if (send_ciphertext_typed(s, room, name, key, payload, plen,
+                              (uint8_t)MSG_TYPE_CALL_INVITE) < 0) {
+        printf("[invite] send failed\n");
+        fflush(stdout);
+        return;
+    }
+
+    char hex[2 * MK_CALLID_BYTES + 1];
+    for (size_t i = 0; i < MK_CALLID_BYTES; i++)
+        snprintf(hex + 2 * i, 3, "%02x", inv.call_id[i]);
+    printf("[CALL_INVITE_SENT] %s %s %u %s\n", hex,
+           inv.host[0] ? inv.host : "-", inv.port,
+           (inv.flags & CI_FLAG_VIDEO) ? "video" : "audio");
+    fflush(stdout);
+}
+
+int send_ciphertext_typed(sock_t s, const char *room, const char *name, const uint8_t *key,
+                   const uint8_t *plaintext, size_t plen, uint8_t msg_type) {
     uint16_t room_len = (uint16_t)strlen(room);
     uint16_t name_len = (uint16_t)strlen(name);
     uint8_t nonce[CRYPTO_NPUBBYTES];
@@ -950,7 +1022,7 @@ int send_ciphertext(sock_t s, const char *room, const char *name, const uint8_t 
     wr_u16(w, (uint16_t)CRYPTO_NPUBBYTES); w += 2;
     memcpy(w, nonce, CRYPTO_NPUBBYTES); w += CRYPTO_NPUBBYTES;
 
-    *w++ = (uint8_t)MSG_TYPE_TEXT;
+    *w++ = msg_type;
 
     wr_u32(w, (uint32_t)clen); w += 4;
     memcpy(w, cipher, clen);
@@ -961,6 +1033,13 @@ int send_ciphertext(sock_t s, const char *room, const char *name, const uint8_t 
     free(cipher);
     free(frame);
     return rc;
+}
+
+/** Ordinary chat text. Kept so the call sites that predate typed sends do
+ *  not have to name a type they never vary. */
+int send_ciphertext(sock_t s, const char *room, const char *name, const uint8_t *key,
+                    const uint8_t *plaintext, size_t plen) {
+    return send_ciphertext_typed(s, room, name, key, plaintext, plen, (uint8_t)MSG_TYPE_TEXT);
 }
 
 /**
@@ -1287,6 +1366,28 @@ int recv_and_decrypt(sock_t s, const char *room, const uint8_t *key, const char 
      * AEAD check (which authenticates the raw name) is already done. */
     sanitize_display_inplace(name, strlen(name));
 
+    if (msg_type == MSG_TYPE_CALL_INVITE) {
+        /* Already authenticated: this arrived inside the room AEAD, so only
+         * a room member could have produced it and the relay cannot forge
+         * one. What is still untrusted is the content, which ci_parse
+         * checks - in particular the host, which would otherwise reach a
+         * connect call straight from another party. */
+        ci_invite_t inv;
+        ci_status_t st = ci_parse(plain, (size_t)plen, &inv);
+        if (st != CI_OK) {
+            printf("[invite] dropped an invite from %s: %s\n", name, ci_strerror(st));
+        } else {
+            char hex[2 * MK_CALLID_BYTES + 1];
+            for (size_t i = 0; i < MK_CALLID_BYTES; i++)
+                snprintf(hex + 2 * i, 3, "%02x", inv.call_id[i]);
+            printf("[CALL_INVITE] %s %s %s %u %s\n", name, hex,
+                   inv.host[0] ? inv.host : "-", inv.port,
+                   (inv.flags & CI_FLAG_VIDEO) ? "video" : "audio");
+        }
+        fflush(stdout);
+        return;
+    }
+
     if (msg_type == MSG_TYPE_TEXT) {
         // Пропускаем пустые сообщения (регистрационные)
         if (plen > 0) {
@@ -1472,6 +1573,11 @@ DWORD WINAPI input_thread(LPVOID param) {
         if (strncmp(line, "/accept", 7) == 0) {
             const char *arg = (strlen(line) > 8) ? line + 8 : NULL;
             handle_accept_command(arg);
+            continue;
+        }
+        if (strncmp(line, "/invite", 7) == 0) {
+            const char *arg = (strlen(line) > 8) ? line + 8 : NULL;
+            handle_invite_command(arg, ctx->s, ctx->room, ctx->name, ctx->key);
             continue;
         }
         if (strcmp(line, "/reject") == 0) {
@@ -1739,6 +1845,11 @@ void run_client(const char *host, uint16_t port, const char *room, const char *n
             if (strncmp(line, "/sendfile ", 10) == 0) {
                 handle_file_transfer(line + 10, active_key, room, name, s);
                 free(line);
+                continue;
+            }
+            if (strncmp(line, "/invite", 7) == 0) {
+                const char *arg = (strlen(line) > 8) ? line + 8 : NULL;
+                handle_invite_command(arg, s, room, name, active_key);
                 continue;
             }
             if (strncmp(line, "/accept", 7) == 0) {
