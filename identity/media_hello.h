@@ -6,12 +6,12 @@
  * the call we are in, the K_room generation, our own random salt and,
  * optionally, our identity. Receivers need nothing from us beyond this.
  *
- * Layout, type 0x7E version 0x03, all multi-byte integers big-endian:
+ * Layout, type 0x7E version 0x04, all multi-byte integers big-endian:
  *
  *    off size field
  *      0    1  0x7E
- *      1    1  0x03
- *      2    2  total length: 62 unsigned, 158 signed
+ *      1    1  0x04
+ *      2    2  total length: 78 unsigned, 174 signed
  *      4    1  flags: VIDEO 0x01, AUDIO 0x02, IDENTITY 0x04,
  *              0x08 reserved (sender-key wrapping), 0x10..0x80 reserved
  *      5    1  reserved, must be zero
@@ -22,9 +22,22 @@
  *     42    2  height  (zero unless VIDEO)
  *     44    1  fps     (zero unless VIDEO)
  *     45    1  reserved, must be zero
- *     46   32  Ed25519 public key      only when IDENTITY
- *     78   64  Ed25519 signature over [0,78)  only when IDENTITY
+ *     46   16  display name, NUL-padded, may be entirely NUL
+ *     62   32  Ed25519 public key      only when IDENTITY
+ *     94   64  Ed25519 signature over [0,94)  only when IDENTITY
  *  len-16   16  MAC over [0, len-16)
+ *
+ * The display name says who the sender calls themselves, so a call can put a
+ * person's name under their picture instead of six hex digits of their SID.
+ * It is a label and not an identity: the MAC only proves a room member sent
+ * it, and any room member can forge another member's unsigned announcement -
+ * that is a property of the shared call key, not of this field. Where it
+ * matters, the fingerprint printed on a signed HELLO is what identifies a
+ * participant, and the name inside a signed one is covered by the signature.
+ *
+ * Control characters are refused rather than sanitised. The name reaches
+ * terminals and text renderers, and a parser that quietly rewrites its input
+ * is harder to reason about than one that rejects it.
  *
  * The video parameters are always present and zeroed for audio-only calls,
  * so a receiver dispatches on flags and never on length. The old wire had
@@ -56,13 +69,16 @@ extern "C" {
 #endif
 
 #define MH_TYPE            0x7E
-#define MH_VERSION         0x03
+#define MH_VERSION         0x04
 
 /** The packet type of the pre-group HELLO, kept only to recognise old peers. */
 #define MH_LEGACY_TYPE     0x7F
 
-#define MH_SIZE_BASE       62
-#define MH_SIZE_SIGNED     158
+#define MH_SIZE_BASE       78
+#define MH_SIZE_SIGNED     174
+
+/** Display name field width. Not NUL-terminated when it is exactly full. */
+#define MH_NAME_BYTES      16
 
 #define MH_FLAG_VIDEO      0x01
 #define MH_FLAG_AUDIO      0x02
@@ -84,7 +100,8 @@ typedef enum {
     MH_ERR_VERSION,
     MH_ERR_LENGTH,        /**< length field or packet size disagrees with flags */
     MH_ERR_RESERVED,      /**< a reserved bit or byte was set */
-    MH_ERR_CALLID,        /**< all-zero call_id */
+    MH_ERR_CALLID,
+    MH_ERR_NAME,          /**< display name has control characters or bad padding */        /**< all-zero call_id */
     MH_ERR_SIGNATURE      /**< IDENTITY set but the signature does not verify */
 } mh_status_t;
 
@@ -97,6 +114,12 @@ typedef struct {
     uint16_t width;
     uint16_t height;
     uint8_t  fps;
+    /**
+     * What the sender calls themselves, NUL-padded and always
+     * NUL-terminated here even when the wire field is full. Empty when the
+     * sender announced none.
+     */
+    char     name[MH_NAME_BYTES + 1];
     /** Valid only when flags & MH_FLAG_IDENTITY. */
     uint8_t  pk[MH_PK_BYTES];
 } mh_hello_t;

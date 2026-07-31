@@ -20,10 +20,11 @@
 #define OFF_HEIGHT     42
 #define OFF_FPS        44
 #define OFF_RSVD2      45
-#define OFF_PK         46
-#define OFF_SIG        78
-/** The signature covers everything before it. */
-#define SIGNED_RANGE   78
+#define OFF_NAME       46
+#define OFF_PK         62
+#define OFF_SIG        94
+/** The signature covers everything before it, the name included. */
+#define SIGNED_RANGE   94
 
 static void wr_be16(uint8_t *p, uint16_t v) {
     p[0] = (uint8_t)((v >> 8) & 0xFF);
@@ -50,6 +51,7 @@ const char *mh_strerror(mh_status_t st) {
         case MH_ERR_LENGTH:      return "length disagrees with flags";
         case MH_ERR_RESERVED:    return "reserved bits set";
         case MH_ERR_CALLID:      return "call_id is all zero";
+        case MH_ERR_NAME:        return "display name is malformed";
         case MH_ERR_SIGNATURE:   return "identity signature failed";
     }
     return "unknown";
@@ -75,6 +77,15 @@ mh_status_t mh_build(const mh_hello_t *in,
     wr_be16(out + OFF_KEYVER, in->key_version);
     memcpy(out + OFF_CALLID, in->call_id, MK_CALLID_BYTES);
     memcpy(out + OFF_SALT, in->sender_salt, MK_SALT_BYTES);
+
+    /* Truncated rather than refused: a long name is a display problem, and
+     * failing to announce ourselves at all over one would be worse. The
+     * buffer is already zeroed, so short names are NUL-padded. */
+    {
+        size_t n = 0;
+        while (n < MH_NAME_BYTES && in->name[n] != '\0') n++;
+        memcpy(out + OFF_NAME, in->name, n);
+    }
 
     /* Video parameters are structurally present but meaningless without the
      * flag, so they are zeroed rather than sent as stale values. */
@@ -139,6 +150,24 @@ mh_status_t mh_parse(const uint8_t *buf, size_t len,
 
     if (sodium_is_zero(buf + OFF_CALLID, MK_CALLID_BYTES)) return MH_ERR_CALLID;
 
+    /* The name ends up in terminals and text renderers, so control
+     * characters are refused rather than stripped, and everything after the
+     * first NUL has to be NUL: padding is not a place to hide bytes that a
+     * careless consumer might read past the terminator. UTF-8 is allowed
+     * through - a name is not required to be English. */
+    {
+        int ended = 0;
+        for (size_t i = 0; i < MH_NAME_BYTES; i++) {
+            uint8_t ch = buf[OFF_NAME + i];
+            if (ended) {
+                if (ch != 0) return MH_ERR_NAME;
+                continue;
+            }
+            if (ch == 0) { ended = 1; continue; }
+            if (ch < 0x20 || ch == 0x7F) return MH_ERR_NAME;
+        }
+    }
+
     if (flags & MH_FLAG_IDENTITY) {
         if (crypto_sign_verify_detached(buf + OFF_SIG, buf, SIGNED_RANGE,
                                         buf + OFF_PK) != 0) {
@@ -151,6 +180,8 @@ mh_status_t mh_parse(const uint8_t *buf, size_t len,
     out->key_version = rd_be16(buf + OFF_KEYVER);
     memcpy(out->call_id, buf + OFF_CALLID, MK_CALLID_BYTES);
     memcpy(out->sender_salt, buf + OFF_SALT, MK_SALT_BYTES);
+    memcpy(out->name, buf + OFF_NAME, MH_NAME_BYTES);
+    out->name[MH_NAME_BYTES] = '\0';
     if (flags & MH_FLAG_VIDEO) {
         out->width  = rd_be16(buf + OFF_WIDTH);
         out->height = rd_be16(buf + OFF_HEIGHT);

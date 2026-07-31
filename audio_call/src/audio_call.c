@@ -303,6 +303,11 @@ static int send_hello(AudioCall *c) {
     h.flags = MH_FLAG_AUDIO;
     if (c->has_identity) h.flags |= MH_FLAG_IDENTITY;
     h.key_version = AC_KEY_VERSION;
+
+    /* Same label the video path announces: a name under a voice is worth as
+     * much as a name under a picture. */
+    snprintf(h.name, sizeof h.name, "%.*s",
+             (int)(sizeof h.name - 1), c->relay_name);
     memcpy(h.call_id, c->call_id, MK_CALLID_BYTES);
     memcpy(h.sender_salt, c->own_salt, MK_SALT_BYTES);
 

@@ -6,7 +6,7 @@
 # the mixer, not the VP8 or display changes.
 #
 # Asserts the same contract as tests/media_loopback.sh:
-#   [MEDIA] peer <sid> decrypted N mixed M
+#   [MEDIA] peer <sid> (<name>) decrypted N mixed M
 # with N > 0 and M > 0 for both of the other two participants.
 
 set -u
@@ -57,7 +57,7 @@ done
 
 RC=0
 for i in 1 2 3; do
-    n=$(grep -cE '^\[MEDIA\] peer [0-9a-f]{6} decrypted [0-9]+ mixed [0-9]+$' "$WORK/p$i.log")
+    n=$(grep -cE '^\[MEDIA\] peer [0-9a-f]{6} \(.*\) decrypted [0-9]+ mixed [0-9]+$' "$WORK/p$i.log")
     [ "$n" -eq 2 ] || { echo "FAIL: p$i has $n [MEDIA] peer lines, expected 2"; RC=1; }
     while read -r d m; do
         [ "${d:-0}" -gt 0 ] || { echo "FAIL: p$i decrypted 0 from a peer"; RC=1; }

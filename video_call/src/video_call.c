@@ -194,7 +194,8 @@ typedef struct {
     int           h;
     uint64_t      pic_ms;    /**< when that picture was decoded */
     uint64_t      shown_ms;  /**< pic_ms of the last picture counted as shown */
-    char          label[8];  /**< sender tag, captioned in the cell */
+    /** Caption: the name this participant announced, or its SID if none. */
+    char          label[MH_NAME_BYTES + 1];
 } VidSlot;
 
 typedef struct VideoCall {
@@ -336,6 +337,12 @@ typedef struct VideoCall {
      * decode us until we emit a keyframe, and the receive thread must not
      * touch the encoder. */
     atomic_int want_keyframe;
+
+    /* What each sender calls itself, from its HELLO. Receive thread only;
+     * the display side reads the copy in VidSlot.label under disp_lock.
+     * A label is not an identity - see the note in media_hello.h - the
+     * fingerprint on a signed HELLO is what identifies a participant. */
+    char peer_name[MS_MAX_SLOTS][MH_NAME_BYTES + 1];
 
     /* Geometry of the most recent picture from anyone, kept only so the
      * peer-timeout path can size its black frame. */
@@ -609,6 +616,9 @@ static int vc_setup_media_keys(VideoCall *vc) {
     return 0;
 }
 
+/** Defined with vid_acquire below; the HELLO handler needs it first. */
+static void vc_slot_label(const VideoCall *vc, int slot, char *out, size_t cap);
+
 /* ===== HELLO2 handshake ===== */
 
 /**
@@ -631,6 +641,11 @@ static int send_hello(VideoCall *vc) {
     h.key_version = VC_KEY_VERSION;
     memcpy(h.call_id, vc->call_id, MK_CALLID_BYTES);
     memcpy(h.sender_salt, vc->own_salt, MK_SALT_BYTES);
+
+    /* The name we registered with, so the far end can caption our picture
+     * with something a person recognises instead of six hex digits. */
+    snprintf(h.name, sizeof h.name, "%.*s",
+             (int)(sizeof h.name - 1), vc->relay_name);
 
     /* Video parameters are meaningful only with the flag; mh_build zeroes them
      * otherwise, so a receiver never dispatches on length. */
@@ -691,7 +706,6 @@ static void handle_hello(VideoCall *vc, const uint8_t *buf, size_t len) {
     int idx = -1;
     ms_status_t ins = ms_install(&vc->senders, h.sender_salt, idbind,
                                  h.key_version, &idx);
-    (void)idx;
     if (ins != MS_OK) {
         /* MS_ERR_SELF is our own announcement coming back off the relay, and
          * a full or SID-capped table is a standing condition, so neither is
@@ -706,6 +720,17 @@ static void handle_hello(VideoCall *vc, const uint8_t *buf, size_t len) {
 
     atomic_store(&vc->last_recv_time, video_time_ms());
     atomic_store(&vc->peer_connected, 1);
+
+    /* Follows every verified announcement rather than only the first, so a
+     * participant who reconnects under a different name is not captioned
+     * with the old one. */
+    if (idx >= 0 && idx < MS_MAX_SLOTS) {
+        snprintf(vc->peer_name[idx], sizeof vc->peer_name[idx], "%s", h.name);
+        for (int i = 0; i < VC_MAX_VIDEO; i++) {
+            if (vc->vid[i].slot != idx) continue;
+            vc_slot_label(vc, idx, vc->vid[i].label, sizeof vc->vid[i].label);
+        }
+    }
 
     /* Peer media parameters are display information, not replay state, so they
      * follow every verified announcement. Log only when they change. */
@@ -964,6 +989,22 @@ static void vid_teardown(VideoCall *vc) {
  *
  * Returns NULL only if a decoder cannot be created at all.
  */
+/**
+ * Caption for a participant: the name it announced, or its SID when it
+ * announced none. Never empty, because an unlabelled cell in a grid of four
+ * is worse than a hex tag.
+ */
+static void vc_slot_label(const VideoCall *vc, int slot, char *out, size_t cap) {
+    if (!out || cap == 0) return;
+    if (slot >= 0 && slot < MS_MAX_SLOTS && vc->peer_name[slot][0] != '\0') {
+        snprintf(out, cap, "%s", vc->peer_name[slot]);
+        return;
+    }
+    uint8_t sid[MK_SID_BYTES];
+    vc_sid_of(vc, slot, sid);
+    snprintf(out, cap, "%02x%02x%02x", sid[0], sid[1], sid[2]);
+}
+
 static VidSlot *vid_acquire(VideoCall *vc, int slot) {
     VidSlot *chosen = NULL;
 
@@ -1017,14 +1058,9 @@ static VidSlot *vid_acquire(VideoCall *vc, int slot) {
     chosen->slot = slot;
     chosen->frames = 0;
     chosen->shown = 0;
-    {
-        /* Resolved here, on the thread that owns the sender table, so the
-         * display side never reads it. */
-        uint8_t sid[MK_SID_BYTES];
-        vc_sid_of(vc, slot, sid);
-        snprintf(chosen->label, sizeof chosen->label, "%02x%02x%02x",
-                 sid[0], sid[1], sid[2]);
-    }
+    /* Resolved here, on the thread that owns the sender table and the name
+     * table, so the display side only ever reads the copy. */
+    vc_slot_label(vc, slot, chosen->label, sizeof chosen->label);
     return chosen;
 }
 
@@ -1919,8 +1955,10 @@ static void video_call_stop(VideoCall *vc) {
                 break;
             }
         }
-        printf("[MEDIA] peer %02x%02x%02x decrypted %llu mixed %llu\n",
-               sid[0], sid[1], sid[2],
+        char who[MH_NAME_BYTES + 1];
+        vc_slot_label(vc, i, who, sizeof who);
+        printf("[MEDIA] peer %02x%02x%02x (%s) decrypted %llu mixed %llu\n",
+               sid[0], sid[1], sid[2], who,
                (unsigned long long)vc->rx_audio[i], (unsigned long long)mixed);
         printf("[VIDEO] peer %02x%02x%02x decrypted %llu decoded %llu shown %llu\n",
                sid[0], sid[1], sid[2],

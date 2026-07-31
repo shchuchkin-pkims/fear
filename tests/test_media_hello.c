@@ -23,18 +23,29 @@ static void bin2hex(const uint8_t *bin, size_t len, char *out) {
     out[2 * len] = '\0';
 }
 
+/* Recomputed for wire version 0x04, which carries a display name. Produced
+ * by an implementation that shares no code with this one - hashlib for
+ * BLAKE2b, PyNaCl for Ed25519 - so agreement here is agreement between two
+ * implementations rather than with ourselves. */
 static const char kUnsignedHex[] =
-    "7e03003e02000000101112131415161718191a1b1c1d1e1f"
-    "a0a1a2a3a4a5a6a7a8a9aaabacadaeaf000000000000"
-    "aa0038d7725c725308478760018f5ff7";
+    "7e04004e02000000101112131415161718191a1b1c1d1e1fa0a1a2a3a4a5a6a7"
+    "a8a9aaabacadaeaf000000000000000000000000000000000000000000000794"
+    "d5b3c364fe3cc20e1dcbc2445157";
 
 static const char kSignedHex[] =
-    "7e03009e07000007101112131415161718191a1b1c1d1e1f"
-    "a0a1a2a3a4a5a6a7a8a9aaabacadaeaf028001e01900"
-    "d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737"
-    "2b9b4a45c4c2ad7d835677dc6260ee0e27bf2946ef62d0b7cc0f523f30ace05c"
-    "05b6c4f80cb90ca59da76b41cdaeec7f45833f1eb7ebba16cbad2577d9bc9505"
-    "fdab26ee8e43dcce31a1bd07ae56e7da";
+    "7e0400ae07000007101112131415161718191a1b1c1d1e1fa0a1a2a3a4a5a6a7"
+    "a8a9aaabacadaeaf028001e0190000000000000000000000000000000000d04a"
+    "b232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737338c"
+    "8397cbc659b5374df33a226fa1b0e265a37f4fcfd1e9b7107e7062369160bb93"
+    "35319895612cfc74b5142622ed8989889be0a06240e44d6879ab293c0f0e2052"
+    "8d48f4b542818915b5c5b083f9b4";
+
+/* Same as the unsigned vector but announcing a name, so the field is pinned
+ * at its offset and not merely round-tripped through our own parser. */
+static const char kNamedHex[] =
+    "7e04004e02000000101112131415161718191a1b1c1d1e1fa0a1a2a3a4a5a6a7"
+    "a8a9aaabacadaeaf0000000000006c6170746f70000000000000000000006584"
+    "adb136a9d7e0515a176863568a76";
 
 int main(void) {
     CHECK(sodium_init() >= 0);
@@ -77,14 +88,16 @@ int main(void) {
     /* Per-offset assertions, so a mistake points at the field. */
     CHECK(pkt[0] == MH_TYPE);
     CHECK(pkt[1] == MH_VERSION);
-    CHECK(pkt[2] == 0x00 && pkt[3] == 0x3E);            /* length, big endian */
+    CHECK(pkt[2] == 0x00 && pkt[3] == 0x4E);            /* length, big endian */
     CHECK(pkt[4] == MH_FLAG_AUDIO);
     CHECK(pkt[5] == 0);
     CHECK(pkt[6] == 0 && pkt[7] == 0);                  /* key_version */
     CHECK(memcmp(pkt + 8, call_id, MK_CALLID_BYTES) == 0);
     CHECK(memcmp(pkt + 24, salt, MK_SALT_BYTES) == 0);
-    /* Video parameters zeroed when the flag is clear. */
+    /* Video parameters zeroed when the flag is clear, and an unannounced
+     * name is all NUL rather than whatever was in the caller's struct. */
     for (size_t i = 40; i < 46; i++) CHECK(pkt[i] == 0);
+    for (size_t i = 46; i < 62; i++) CHECK(pkt[i] == 0);
 
     mh_hello_t got;
     CHECK(mh_parse(pkt, pkt_len, hello_key, &got) == MH_OK);
@@ -93,6 +106,41 @@ int main(void) {
     CHECK(memcmp(got.call_id, call_id, MK_CALLID_BYTES) == 0);
     CHECK(memcmp(got.sender_salt, salt, MK_SALT_BYTES) == 0);
     CHECK(got.width == 0 && got.height == 0 && got.fps == 0);
+    CHECK(got.name[0] == '\0');
+
+    /* --- a name on the wire -------------------------------------------------- */
+    {
+        mh_hello_t named;
+        memset(&named, 0, sizeof named);
+        named.flags = MH_FLAG_AUDIO;
+        memcpy(named.call_id, call_id, sizeof call_id);
+        memcpy(named.sender_salt, salt, sizeof salt);
+        snprintf(named.name, sizeof named.name, "laptop");
+
+        CHECK(mh_build(&named, hello_key, NULL, pkt, sizeof pkt, &pkt_len) == MH_OK);
+        CHECK(pkt_len == MH_SIZE_BASE);
+        bin2hex(pkt, pkt_len, hex);
+        if (strcmp(hex, kNamedHex) != 0)
+            fprintf(stderr, "named:\n want %s\n got  %s\n", kNamedHex, hex);
+        CHECK(strcmp(hex, kNamedHex) == 0);
+
+        mh_hello_t back;
+        CHECK(mh_parse(pkt, pkt_len, hello_key, &back) == MH_OK);
+        CHECK(strcmp(back.name, "laptop") == 0);
+
+        /* Longer than the field: truncated, never overflowed, and still a
+         * valid announcement. Announcing nothing because a name is long
+         * would be a worse trade than a clipped caption. */
+        mh_hello_t long_name;
+        memset(&long_name, 0, sizeof long_name);
+        long_name.flags = MH_FLAG_AUDIO;
+        memcpy(long_name.call_id, call_id, sizeof call_id);
+        memcpy(long_name.sender_salt, salt, sizeof salt);
+        snprintf(long_name.name, sizeof long_name.name, "abcdefghijklmnop");
+        CHECK(mh_build(&long_name, hello_key, NULL, pkt, sizeof pkt, &pkt_len) == MH_OK);
+        CHECK(mh_parse(pkt, pkt_len, hello_key, &back) == MH_OK);
+        CHECK(strcmp(back.name, "abcdefghijklmnop") == 0);
+    }
 
     /* --- signed, audio + video ----------------------------------------------- */
     memset(&in, 0, sizeof in);
@@ -109,12 +157,12 @@ int main(void) {
         fprintf(stderr, "signed:\n want %s\n got  %s\n", kSignedHex, hex);
     CHECK(strcmp(hex, kSignedHex) == 0);
 
-    CHECK(pkt[2] == 0x00 && pkt[3] == 0x9E);
+    CHECK(pkt[2] == 0x00 && pkt[3] == 0xAE);
     CHECK(pkt[6] == 0x00 && pkt[7] == 0x07);
     CHECK(pkt[40] == 0x02 && pkt[41] == 0x80);          /* width 640 */
     CHECK(pkt[42] == 0x01 && pkt[43] == 0xE0);          /* height 480 */
     CHECK(pkt[44] == 25);
-    CHECK(memcmp(pkt + 46, pk, 32) == 0);
+    CHECK(memcmp(pkt + 62, pk, 32) == 0);
 
     CHECK(mh_parse(pkt, pkt_len, hello_key, &got) == MH_OK);
     CHECK(got.key_version == 7);
