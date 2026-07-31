@@ -56,6 +56,13 @@ add_test(NAME media_loopback
          COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/media_loopback.sh $<TARGET_FILE:audio_call>)
 set_tests_properties(media_loopback PROPERTIES TIMEOUT 120)
 
+# То же для video_call: три процесса, аудио-тракт через пер-отправительские
+# декодеры и микшер. Видео здесь не проверяется - на машине без камеры и
+# дисплея VP8 не кодируется вовсе, и тест об этом честно молчит.
+add_test(NAME video_loopback
+         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/video_loopback.sh $<TARGET_FILE:video_call>)
+set_tests_properties(video_loopback PROPERTIES TIMEOUT 120)
+
 # Протокольный тест M10: BLOB_GET доступен только владельцу pk (подписанный
 # challenge). Бинарь ходит на живой сервер через реальные sp_*-функции;
 # сервер поднимает обёртка blob_auth.sh.

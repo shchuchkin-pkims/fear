@@ -105,6 +105,33 @@ static int g_have_call_id = 0;
 #define VC_MAX_VP8_FRAME     (256 * 1024) /* 256 KB max VP8 frame */
 #define VC_MAX_YUV_FRAME     (1920 * 1080 * 3 / 2) /* Max YUV420P frame */
 
+/* Deepest a sender's jitter buffer may get before old frames are dropped.
+ * A relay burst must not turn into half a second of delay that never drains. */
+#define MAX_PLAYOUT_FRAMES   20
+
+/* How many participants are rendered at once.
+ *
+ * The sender table holds MS_MAX_SLOTS (32) because the transport does, but
+ * decoding 32 streams is not something a laptop will do, and a room where
+ * eight people talk at once is unusable for human reasons long before that.
+ * Senders past these limits are still authenticated and still tracked - they
+ * are simply not rendered, and the one heard longest ago gives up its decoder
+ * when somebody new arrives. Its key and replay window stay in the sender
+ * table, so it comes back the moment it speaks again.
+ *
+ * Video is a quarter of audio deliberately: a VP8 decoder costs orders of
+ * magnitude more than an Opus one, and only one participant is on screen. */
+#define VC_MAX_MIX     8
+#define VC_MAX_VIDEO   4
+
+/* Active-speaker hysteresis. One window, several senders, so somebody has to
+ * be chosen; the rules and why they are these rules are on
+ * vc_speaker_should_switch below. */
+#define VC_SPEAKER_QUIET_MS      700   /* holder silent this long: up for grabs */
+#define VC_SPEAKER_TAKE_FRAMES   2     /* challenger must deliver this many */
+#define VC_SPEAKER_DWELL_MS      1200  /* minimum time between two switches */
+#define VC_SPEAKER_STALE_MS      400   /* a challenger quiet this long is dropped */
+
 /* AES-GCM constants */
 #define AES_GCM_KEY_LEN   crypto_aead_aes256gcm_KEYBYTES
 #define AES_GCM_NONCE_LEN crypto_aead_aes256gcm_NPUBBYTES
@@ -116,6 +143,41 @@ static int g_have_call_id = 0;
  * survive a second sender, and it accepted arbitrarily large forward jumps. */
 
 /* ===== VideoCall state ===== */
+
+/**
+ * One rendered participant on the audio path: its Opus decoder, its jitter
+ * buffer, and enough bookkeeping to decide who gives up a decoder when a new
+ * voice arrives. Mirrors MixSlot in audio_call.c deliberately - the two files
+ * have the same defect and should keep the same fix.
+ */
+typedef struct {
+    int          slot;       /**< sender-table slot, or -1 when free */
+    OpusDecoder *dec;
+    PcmRing      ring;
+    uint64_t     last_ms;    /**< when we last decoded a frame from it */
+    int          prefilled;  /**< jitter buffer has reached the play-out depth */
+    uint64_t     frames;     /**< frames actually mixed, for the teardown report */
+} MixSlot;
+
+/**
+ * One rendered participant on the video path.
+ *
+ * The reassembler is per sender because the fragment header carries only a
+ * frame id, and every sender's frame ids start at 0: one shared FragReceiver
+ * splices two senders' fragments into a single corrupt frame whenever their
+ * ids coincide, and its last_completed_frame_id makes whichever sender is
+ * numerically behind look permanently stale. The decoder is per sender for
+ * the same reason the Opus decoder is - VP8 predicts from previous frames,
+ * so interleaving two streams through one decoder ruins both.
+ */
+typedef struct {
+    int           slot;      /**< sender-table slot, or -1 when free */
+    VideoDecoder *dec;
+    FragReceiver  frag;
+    uint64_t      last_ms;   /**< last fragment accepted from it */
+    uint64_t      frames;    /**< pictures decoded, for the teardown report */
+    uint64_t      shown;     /**< ...of which reached the window */
+} VidSlot;
 
 typedef struct VideoCall {
     socket_t sock;
@@ -144,6 +206,15 @@ typedef struct VideoCall {
     int legacy_warned;
     /** Likewise for a table that cannot take another sender. */
     int install_warned;
+    /** Likewise for a VP8 decoder that cannot be created. */
+    int vid_warned;
+
+    /* Packets successfully decrypted from each slot, per media type. Only the
+     * teardown report reads these, and that report is what tells "installed a
+     * peer" apart from "actually heard and rendered that peer" - the two look
+     * identical from inside a call whose keys all agree. */
+    uint64_t rx_audio[MS_MAX_SLOTS];
+    uint64_t rx_video[MS_MAX_SLOTS];
 
     /* Transmit counters, one per counter domain. Audio packets use the audio
      * counter; video fragments AND stats share the video counter, which is
@@ -155,16 +226,42 @@ typedef struct VideoCall {
     PaStream *in_stream;
     PaStream *out_stream;
     OpusEncoder *enc;
-    OpusDecoder *dec;
-    PcmRing out_ring;
+
+    /* One decoder and one jitter buffer per rendered participant, created
+     * when a voice is first heard rather than up front.
+     *
+     * A single decoder cannot serve several senders: Opus carries state
+     * across frames, so interleaving two streams through one decoder makes
+     * both unintelligible - and a single output ring would have them
+     * overwrite each other rather than mix. That is why per-sender keys are
+     * only half of a working group call; this is the other half. */
+    MixSlot mix[VC_MAX_MIX];
+    int mix_ready;   /**< rings and lock exist; teardown is a no-op without it */
+#ifdef _WIN32
+    CRITICAL_SECTION mix_lock;
+#else
+    pthread_mutex_t mix_lock;
+#endif
 
     /* Video */
     VideoCapture *capture;
     VideoEncoder *v_enc;
-    VideoDecoder *v_dec;
     VideoDisplay *display;
-    FragReceiver frag_recv;
     QualityController quality;
+
+    /* One VP8 decoder and one reassembler per rendered participant. Touched
+     * only by the receive thread, so no lock: the display side reads the
+     * single YUV buffer below, under disp_lock, exactly as before. */
+    VidSlot vid[VC_MAX_VIDEO];
+
+    /* Active speaker: which sender owns the one window, and the state that
+     * keeps a stray packet from taking it. Receive thread only. */
+    int      disp_slot;        /**< sender slot on screen, or -1 */
+    uint64_t disp_last_ms;     /**< last picture from the slot on screen */
+    uint64_t disp_switch_ms;   /**< when the window last changed hands */
+    int      cand_slot;        /**< challenger, or -1 */
+    uint64_t cand_last_ms;     /**< its most recent picture */
+    uint64_t cand_frames;      /**< pictures it has delivered as challenger */
 
     /* Configuration */
     int video_enabled;
@@ -213,11 +310,13 @@ typedef struct VideoCall {
     HANDLE th_vsend;
     HANDLE th_asend;
     HANDLE th_recv;
+    HANDLE th_play;
     HANDLE th_disp;
 #else
     pthread_t th_vsend;
     pthread_t th_asend;
     pthread_t th_recv;
+    pthread_t th_play;
     pthread_t th_disp;
 #endif
     atomic_int running;
@@ -640,36 +739,13 @@ static void handle_hello(VideoCall *vc, const uint8_t *buf, size_t len) {
         fflush(stdout);
     }
 
-    /* A peer that restarts draws a fresh salt and therefore arrives as a new
-     * sender: its replay window starts clean in its own slot, but the
-     * reassembler and the decoder still hold the previous session's leftovers,
-     * whose frame ids restart at 0. Not on the very first announcement, when
-     * there is nothing to clear. */
-    if (before > 0) {
-        printf("New participant, resetting reassembly and decoder\n");
-        video_frag_receiver_free(&vc->frag_recv);
-        video_frag_receiver_init(&vc->frag_recv);
-        if (vc->v_dec) {
-            video_decoder_close(vc->v_dec);
-            vc->v_dec = NULL;
-            video_decoder_open(&vc->v_dec);
-        }
-#ifdef _WIN32
-        EnterCriticalSection(&vc->disp_lock);
-#else
-        pthread_mutex_lock(&vc->disp_lock);
-#endif
-        free(vc->disp_yuv);
-        vc->disp_yuv = NULL;
-        vc->disp_width = 0;
-        vc->disp_height = 0;
-        atomic_store(&vc->disp_new_frame, 0);
-#ifdef _WIN32
-        LeaveCriticalSection(&vc->disp_lock);
-#else
-        pthread_mutex_unlock(&vc->disp_lock);
-#endif
-    }
+    /* Nothing global is reset here any more. A peer that restarts draws a
+     * fresh salt and arrives as a new sender, and reassembly and decoding are
+     * now per sender, so its leftovers sit in its own retired slot and are
+     * cleared when that slot is reassigned. The old global reset wiped every
+     * other participant's half-assembled frame and reference frames as well,
+     * which in a group call means one person rejoining freezes everybody
+     * else's picture until their next keyframe. */
 
     /* Exactly one reply, so the new participant learns our salt. Repetition is
      * the announce loop's job, not this path's. */
@@ -743,6 +819,228 @@ static int decrypt_from_sender(VideoCall *vc, const uint8_t *pkt, size_t pkt_len
         return cand[i];
     }
     return -1;
+}
+
+/* ===== Rendered-participant pools =====
+ *
+ * Both pools follow the same shape as audio_call.c: bounded, filled on first
+ * use, and reclaimed least-recently-heard-first. Nothing is evicted from the
+ * sender table itself - keys and replay windows outlive a decoder, so a
+ * participant that lost its decoder is back the instant it speaks again.
+ */
+
+static void mix_lock_take(VideoCall *vc) {
+#ifdef _WIN32
+    EnterCriticalSection(&vc->mix_lock);
+#else
+    pthread_mutex_lock(&vc->mix_lock);
+#endif
+}
+
+static void mix_lock_drop(VideoCall *vc) {
+#ifdef _WIN32
+    LeaveCriticalSection(&vc->mix_lock);
+#else
+    pthread_mutex_unlock(&vc->mix_lock);
+#endif
+}
+
+/**
+ * Release every Opus decoder, jitter buffer and the lock. Safe on a half-built
+ * call: the object is calloc'd, so mix_ready is what says whether any of this
+ * was ever set up.
+ */
+static void mix_teardown(VideoCall *vc) {
+    if (!vc->mix_ready) return;
+    for (int i = 0; i < VC_MAX_MIX; i++) {
+        if (vc->mix[i].dec) {
+            opus_decoder_destroy(vc->mix[i].dec);
+            vc->mix[i].dec = NULL;
+        }
+        pcmring_free(&vc->mix[i].ring);
+        vc->mix[i].slot = -1;
+    }
+#ifdef _WIN32
+    DeleteCriticalSection(&vc->mix_lock);
+#else
+    pthread_mutex_destroy(&vc->mix_lock);
+#endif
+    vc->mix_ready = 0;
+}
+
+/**
+ * The decoder and jitter buffer for a sender, creating or reassigning one if
+ * this is a voice we are not currently rendering. Call with mix_lock held.
+ *
+ * Reassignment resets the Opus state, which would otherwise decode the
+ * previous stream's history as noise. Returns NULL only if a decoder cannot
+ * be created at all.
+ */
+static MixSlot *mix_acquire(VideoCall *vc, int slot) {
+    MixSlot *chosen = NULL;
+
+    if (!vc->mix_ready) return NULL;
+    for (int i = 0; i < VC_MAX_MIX; i++) {
+        if (vc->mix[i].slot == slot) return &vc->mix[i];
+    }
+    for (int i = 0; i < VC_MAX_MIX; i++) {
+        if (vc->mix[i].slot < 0) { chosen = &vc->mix[i]; break; }
+    }
+    if (!chosen) {
+        chosen = &vc->mix[0];
+        for (int i = 1; i < VC_MAX_MIX; i++) {
+            if (vc->mix[i].last_ms < chosen->last_ms) chosen = &vc->mix[i];
+        }
+        int16_t discard[VC_FRAME_SAMPLES * VC_CHANNELS];
+        while (pcmring_pop(&chosen->ring, discard) == 0) { }
+        if (chosen->dec) opus_decoder_ctl(chosen->dec, OPUS_RESET_STATE);
+    }
+
+    if (!chosen->dec) {
+        int err = 0;
+        chosen->dec = opus_decoder_create(VC_SAMPLE_RATE, VC_CHANNELS, &err);
+        if (!chosen->dec || err != OPUS_OK) {
+            chosen->dec = NULL;
+            return NULL;
+        }
+    }
+    chosen->slot = slot;
+    chosen->prefilled = 0;
+    chosen->frames = 0;
+    return chosen;
+}
+
+/** The three sid bytes a participant is known by in the logs. */
+static void vc_sid_of(const VideoCall *vc, int slot, uint8_t out[MK_SID_BYTES]) {
+    memset(out, 0, MK_SID_BYTES);
+    if (slot >= 0 && slot < MS_MAX_SLOTS && vc->senders.slots[slot].used) {
+        memcpy(out, vc->senders.slots[slot].sid, MK_SID_BYTES);
+    }
+}
+
+/** Release every VP8 decoder and reassembler. Safe on a zeroed pool. */
+static void vid_teardown(VideoCall *vc) {
+    for (int i = 0; i < VC_MAX_VIDEO; i++) {
+        if (vc->vid[i].dec) {
+            video_decoder_close(vc->vid[i].dec);
+            vc->vid[i].dec = NULL;
+        }
+        video_frag_receiver_free(&vc->vid[i].frag);
+        vc->vid[i].slot = -1;
+    }
+}
+
+/**
+ * The reassembler and VP8 decoder for a sender, creating or reassigning one
+ * if this is a picture we are not currently rendering. Receive thread only.
+ *
+ * Reassignment throws away both: half-assembled frames belong to the previous
+ * stream and its frame ids, and a VP8 decoder holds reference frames that
+ * would be predicted from. The cost is that a freshly assigned slot shows
+ * nothing until that sender's next keyframe, which the encoder emits every
+ * two seconds.
+ *
+ * Returns NULL only if a decoder cannot be created at all.
+ */
+static VidSlot *vid_acquire(VideoCall *vc, int slot) {
+    VidSlot *chosen = NULL;
+
+    for (int i = 0; i < VC_MAX_VIDEO; i++) {
+        if (vc->vid[i].slot == slot) return &vc->vid[i];
+    }
+    for (int i = 0; i < VC_MAX_VIDEO; i++) {
+        if (vc->vid[i].slot < 0) { chosen = &vc->vid[i]; break; }
+    }
+    if (!chosen) {
+        chosen = &vc->vid[0];
+        for (int i = 1; i < VC_MAX_VIDEO; i++) {
+            if (vc->vid[i].last_ms < chosen->last_ms) chosen = &vc->vid[i];
+        }
+        video_frag_receiver_free(&chosen->frag);
+        video_frag_receiver_init(&chosen->frag);
+        if (chosen->dec) {
+            video_decoder_close(chosen->dec);
+            chosen->dec = NULL;
+        }
+        /* The window cannot stay pointed at a participant we no longer
+         * decode, and a challenger that just lost its decoder is not a
+         * challenger any more. */
+        if (vc->disp_slot == chosen->slot) vc->disp_slot = -1;
+        if (vc->cand_slot == chosen->slot) {
+            vc->cand_slot = -1;
+            vc->cand_frames = 0;
+        }
+    }
+
+    if (!chosen->dec) {
+        if (video_decoder_open(&chosen->dec) != 0 || !chosen->dec) {
+            chosen->dec = NULL;
+            if (!vc->vid_warned) {
+                vc->vid_warned = 1;
+                fprintf(stderr, "Warning: VP8 decoder unavailable; "
+                                "video from this participant cannot be shown\n");
+            }
+            return NULL;
+        }
+    }
+    chosen->slot = slot;
+    chosen->frames = 0;
+    chosen->shown = 0;
+    return chosen;
+}
+
+/**
+ * Active-speaker policy: whether `slot` should take over the one window.
+ *
+ * There is a single SDL window and no tiling, so one participant has to be
+ * chosen. The behaviour this replaces was "render whichever picture decoded
+ * last", which with three senders repaints the window from a different person
+ * several times a second and is what makes three senders look broken.
+ *
+ * The policy is sticky: the participant holding the window keeps it while its
+ * pictures keep arriving, and hands over only after VC_SPEAKER_QUIET_MS with
+ * nothing from it, to a challenger that has delivered VC_SPEAKER_TAKE_FRAMES
+ * pictures of its own. VC_SPEAKER_DWELL_MS is a floor on how often the window
+ * may change hands at all, so a participant whose video keeps stalling and
+ * resuming cannot make it strobe.
+ *
+ * Sticky rather than most-recently-arrived, and this is the part worth
+ * arguing with: nothing in this build gates sending on speech, so every
+ * camera streams continuously and "whose picture arrived most recently"
+ * alternates at random between everyone present. Any rule built on it hands
+ * the window back and forth on a timer - measured, with two 30 fps senders it
+ * switched nine times in ten seconds. Video arrival simply is not a speaking
+ * signal here. A real active-speaker switch needs audio energy, which this
+ * build does not compute anywhere; until it does, holding one participant
+ * steady and naming them is the honest thing the available signal supports.
+ *
+ * Driven by decoded pictures rather than arriving fragments on purpose:
+ * handing the window to a participant whose decoder has not yet seen a
+ * keyframe would freeze it on the previous holder's last frame.
+ *
+ * Call once per decoded picture. Returns 1 when `slot` takes the window.
+ */
+static int vc_speaker_should_switch(VideoCall *vc, int slot, uint64_t now) {
+    if (vc->disp_slot < 0) return 1;
+    if (slot == vc->disp_slot) return 0;
+
+    /* One challenger at a time, and it keeps its candidacy while it keeps
+     * sending. A third participant interleaving its own pictures cannot reset
+     * the count - if it could, two senders arriving alternately would cancel
+     * each other out forever and the window would stay frozen on somebody who
+     * has already left the call. */
+    if (vc->cand_slot < 0 ||
+        (slot != vc->cand_slot && (now - vc->cand_last_ms) >= VC_SPEAKER_STALE_MS)) {
+        vc->cand_slot = slot;
+        vc->cand_frames = 0;
+    }
+    if (slot != vc->cand_slot) return 0;
+    vc->cand_last_ms = now;
+    vc->cand_frames++;
+
+    if ((now - vc->disp_last_ms) < VC_SPEAKER_QUIET_MS) return 0;
+    if ((now - vc->disp_switch_ms) < VC_SPEAKER_DWELL_MS) return 0;
+    return vc->cand_frames >= VC_SPEAKER_TAKE_FRAMES;
 }
 
 /* ===== Thread: Video Send ===== */
@@ -951,6 +1249,84 @@ static THREAD_RET th_asend_func(void *arg) {
 #endif
 }
 
+/* ===== Thread: Audio play-out ===== */
+
+/**
+ * Mix every rendered participant into one output stream.
+ *
+ * This is its own thread rather than a tail of the receive loop, because with
+ * several senders that loop fires several times per frame period and would
+ * push the device far faster than real time. Pa_WriteStream blocks until the
+ * device has room, so one frame per iteration is what paces this thread -
+ * including the silent frames, which keep the device fed while nobody speaks.
+ */
+static THREAD_RET th_play_func(void *arg) {
+    ThreadArgs *ta = (ThreadArgs *)arg;
+    VideoCall *vc = ta->vc;
+    free(ta);
+
+    if (!vc->audio_enabled || !vc->mix_ready) {
+#ifdef _WIN32
+        return 0;
+#else
+        return NULL;
+#endif
+    }
+
+    const size_t nsamp = VC_FRAME_SAMPLES * VC_CHANNELS;
+    int32_t acc[VC_FRAME_SAMPLES * VC_CHANNELS];
+    int16_t frame[VC_FRAME_SAMPLES * VC_CHANNELS];
+    int16_t play[VC_FRAME_SAMPLES * VC_CHANNELS];
+
+    while (atomic_load(&vc->running)) {
+        memset(acc, 0, sizeof acc);
+
+        mix_lock_take(vc);
+        for (int i = 0; i < VC_MAX_MIX; i++) {
+            MixSlot *m = &vc->mix[i];
+            if (m->slot < 0) continue;
+
+            /* Wait for a little depth before starting a voice, and go back to
+             * waiting if it runs dry: playing every frame the instant it
+             * arrives turns ordinary network jitter into chopped audio. */
+            if (!m->prefilled) {
+                if (atomic_load(&m->ring.count) < PLAYOUT_BUFFER_FRAMES) continue;
+                m->prefilled = 1;
+            }
+            if (pcmring_pop(&m->ring, frame) != 0) {
+                m->prefilled = 0;
+                continue;
+            }
+            for (size_t k = 0; k < nsamp; k++) acc[k] += frame[k];
+            m->frames++;
+        }
+        mix_lock_drop(vc);
+
+        if (!vc->out_stream) {
+            /* No output device: still drain at roughly real time so the jitter
+             * buffers cannot grow without bound. */
+            msleep(VC_FRAME_MS);
+            continue;
+        }
+
+        /* Saturate rather than wrap. Wrapping turns two loud speakers into a
+         * full-scale square wave, which is unpleasant in a way clipping is not. */
+        for (size_t k = 0; k < nsamp; k++) {
+            int32_t v = acc[k];
+            if (v > 32767) v = 32767;
+            else if (v < -32768) v = -32768;
+            play[k] = (int16_t)v;
+        }
+        Pa_WriteStream(vc->out_stream, play, VC_FRAME_SAMPLES);
+    }
+
+#ifdef _WIN32
+    return 0;
+#else
+    return NULL;
+#endif
+}
+
 /* ===== Thread: Receive ===== */
 
 static THREAD_RET th_recv_func(void *arg) {
@@ -964,9 +1340,14 @@ static THREAD_RET th_recv_func(void *arg) {
     uint8_t *yuv_buf = (uint8_t *)malloc(VC_MAX_VP8_FRAME);
     uint8_t *opus_buf = (uint8_t *)malloc(VC_MAX_OPUS_BYTES);
     int16_t *pcm = (int16_t *)malloc(VC_FRAME_SAMPLES * sizeof(int16_t));
+    /* Decoded picture scratch, allocated once. It used to be malloc'd and
+     * freed per completed frame, which with several senders is a 3 MB
+     * allocation several times per frame period. */
+    uint8_t *yuv_dec = (uint8_t *)malloc(VC_MAX_YUV_FRAME);
 
-    if (!rbuf || !dec_buf || !yuv_buf || !opus_buf || !pcm) {
+    if (!rbuf || !dec_buf || !yuv_buf || !opus_buf || !pcm || !yuv_dec) {
         free(rbuf); free(dec_buf); free(yuv_buf); free(opus_buf); free(pcm);
+        free(yuv_dec);
 #ifdef _WIN32
         return 0;
 #else
@@ -1033,35 +1414,37 @@ static THREAD_RET th_recv_func(void *arg) {
         if (pkt_type == PKT_TYPE_AUDIO && vc->audio_enabled) {
             size_t opus_len = 0;
             /* Picks the sender by SID and drops replays; both are inside. */
-            if (decrypt_from_sender(vc, rbuf, (size_t)n, MK_STREAM_AUDIO,
-                                    opus_buf, VC_MAX_OPUS_BYTES, &opus_len) < 0) {
-                continue;
-            }
+            int slot = decrypt_from_sender(vc, rbuf, (size_t)n, MK_STREAM_AUDIO,
+                                           opus_buf, VC_MAX_OPUS_BYTES, &opus_len);
+            if (slot < 0) continue;
+            if (slot < MS_MAX_SLOTS) vc->rx_audio[slot]++;
 
-            int dec_samples = opus_decode(vc->dec, opus_buf, (opus_int32)opus_len,
-                                           pcm, VC_FRAME_SAMPLES, 0);
-            if (dec_samples <= 0) continue;
-            if (dec_samples < VC_FRAME_SAMPLES) {
-                memset(pcm + dec_samples * VC_CHANNELS, 0,
-                       (VC_FRAME_SAMPLES - dec_samples) * VC_CHANNELS * sizeof(int16_t));
-            }
+            /* Into this sender's own decoder and its own jitter buffer. One
+             * shared decoder garbles every stream through it, and one shared
+             * ring has them overwrite each other instead of mixing - which is
+             * how a call whose packets all decrypt can still be silent noise. */
+            mix_lock_take(vc);
+            MixSlot *m = mix_acquire(vc, slot);
+            if (!m) { mix_lock_drop(vc); continue; }
 
-            pcmring_push(&vc->out_ring, pcm);
+            int dec_samples = opus_decode(m->dec, opus_buf, (opus_int32)opus_len,
+                                          pcm, VC_FRAME_SAMPLES, 0);
+            if (dec_samples > 0) {
+                if (dec_samples < VC_FRAME_SAMPLES) {
+                    memset(pcm + dec_samples * VC_CHANNELS, 0,
+                           (VC_FRAME_SAMPLES - dec_samples) * VC_CHANNELS * sizeof(int16_t));
+                }
+                pcmring_push(&m->ring, pcm);
+                m->last_ms = video_time_ms();
 
-            /* Latency control: drain old frames if buffer grows too large */
-            #define MAX_PLAYOUT_FRAMES 20
-            while (atomic_load(&vc->out_ring.count) > MAX_PLAYOUT_FRAMES) {
-                int16_t discard[VC_FRAME_SAMPLES];
-                pcmring_pop(&vc->out_ring, discard);
-            }
-
-            if (vc->out_stream &&
-                atomic_load(&vc->out_ring.count) >= PLAYOUT_BUFFER_FRAMES) {
-                int16_t play[VC_FRAME_SAMPLES];
-                if (pcmring_pop(&vc->out_ring, play) == 0) {
-                    Pa_WriteStream(vc->out_stream, play, VC_FRAME_SAMPLES);
+                /* Latency control per sender: a relay burst must not turn into
+                 * half a second of delay that never drains. */
+                while (atomic_load(&m->ring.count) > MAX_PLAYOUT_FRAMES) {
+                    int16_t discard[VC_FRAME_SAMPLES * VC_CHANNELS];
+                    pcmring_pop(&m->ring, discard);
                 }
             }
+            mix_lock_drop(vc);
             continue;
         }
 
@@ -1070,53 +1453,86 @@ static THREAD_RET th_recv_func(void *arg) {
             size_t frag_len = 0;
             /* Replays are dropped inside, before the reassembler ever sees the
              * fragment: a repeat there would corrupt a frame. */
-            if (decrypt_from_sender(vc, rbuf, (size_t)n, MK_STREAM_VIDEO,
-                                    dec_buf, VC_MAX_VP8_FRAME, &frag_len) < 0) {
-                continue;
-            }
+            int slot = decrypt_from_sender(vc, rbuf, (size_t)n, MK_STREAM_VIDEO,
+                                           dec_buf, VC_MAX_VP8_FRAME, &frag_len);
+            if (slot < 0) continue;
+            if (slot < MS_MAX_SLOTS) vc->rx_video[slot]++;
 
-            /* Expire old incomplete frames */
-            video_frag_receiver_expire(&vc->frag_recv, video_time_ms());
+            uint64_t now = video_time_ms();
+            VidSlot *v = vid_acquire(vc, slot);
+            if (!v) continue;
+            /* Recency for the pool is arrival, not successful decode: a sender
+             * still waiting for its first keyframe is being heard and must not
+             * be the one evicted. */
+            v->last_ms = now;
+
+            /* Reassembly is keyed by (this slot, frame id). Sharing one
+             * receiver across senders spliced fragments from two of them into
+             * a single corrupt frame whenever their ids coincided - and they
+             * do, every sender's ids start at 0 - while the shared
+             * last_completed_frame_id made whichever sender was numerically
+             * behind look permanently stale and dropped all of it. */
+            video_frag_receiver_expire(&v->frag, now);
 
             uint32_t completed_fid = 0;
-            int frame_size = video_frag_receiver_push(&vc->frag_recv,
-                                                       dec_buf, (int)frag_len,
-                                                       yuv_buf, VC_MAX_VP8_FRAME,
-                                                       &completed_fid);
-            if (frame_size > 0) {
-                /* Decode VP8 frame */
-                int dec_w = 0, dec_h = 0;
-                uint8_t *yuv_dec = (uint8_t *)malloc(VC_MAX_YUV_FRAME);
-                if (yuv_dec) {
-                    int yuv_size = video_decoder_decode(vc->v_dec, yuv_buf, frame_size,
-                                                        yuv_dec, VC_MAX_YUV_FRAME,
-                                                        &dec_w, &dec_h);
-                    if (yuv_size > 0 && dec_w > 0 && dec_h > 0) {
-                        /* Pass to display thread */
-#ifdef _WIN32
-                        EnterCriticalSection(&vc->disp_lock);
-#else
-                        pthread_mutex_lock(&vc->disp_lock);
-#endif
-                        if (!vc->disp_yuv || vc->disp_width != dec_w || vc->disp_height != dec_h) {
-                            free(vc->disp_yuv);
-                            vc->disp_yuv = (uint8_t *)malloc(yuv_size);
-                            vc->disp_width = dec_w;
-                            vc->disp_height = dec_h;
-                        }
-                        if (vc->disp_yuv) {
-                            memcpy(vc->disp_yuv, yuv_dec, yuv_size);
-                            atomic_store(&vc->disp_new_frame, 1);
-                        }
-#ifdef _WIN32
-                        LeaveCriticalSection(&vc->disp_lock);
-#else
-                        pthread_mutex_unlock(&vc->disp_lock);
-#endif
-                    }
-                    free(yuv_dec);
+            int frame_size = video_frag_receiver_push(&v->frag,
+                                                      dec_buf, (int)frag_len,
+                                                      yuv_buf, VC_MAX_VP8_FRAME,
+                                                      &completed_fid);
+            if (frame_size <= 0) continue;
+
+            int dec_w = 0, dec_h = 0;
+            int yuv_size = video_decoder_decode(v->dec, yuv_buf, frame_size,
+                                                yuv_dec, VC_MAX_YUV_FRAME,
+                                                &dec_w, &dec_h);
+            if (yuv_size <= 0 || dec_w <= 0 || dec_h <= 0) continue;
+            v->frames++;
+
+            /* One window, so one speaker. Without this the window shows
+             * whichever sender decoded most recently and flips several times
+             * a second with three people in the room. */
+            if (vc_speaker_should_switch(vc, slot, now)) {
+                uint8_t was[MK_SID_BYTES], is[MK_SID_BYTES];
+                vc_sid_of(vc, vc->disp_slot, was);
+                vc_sid_of(vc, slot, is);
+                if (vc->disp_slot >= 0) {
+                    printf("[VIDEO] active speaker %02x%02x%02x (was %02x%02x%02x)\n",
+                           is[0], is[1], is[2], was[0], was[1], was[2]);
+                } else {
+                    printf("[VIDEO] active speaker %02x%02x%02x\n",
+                           is[0], is[1], is[2]);
                 }
+                fflush(stdout);
+                vc->disp_slot = slot;
+                vc->disp_switch_ms = now;
+                vc->cand_slot = -1;
+                vc->cand_frames = 0;
             }
+            if (slot != vc->disp_slot) continue;
+            vc->disp_last_ms = now;
+            v->shown++;
+
+            /* Pass to the display side */
+#ifdef _WIN32
+            EnterCriticalSection(&vc->disp_lock);
+#else
+            pthread_mutex_lock(&vc->disp_lock);
+#endif
+            if (!vc->disp_yuv || vc->disp_width != dec_w || vc->disp_height != dec_h) {
+                free(vc->disp_yuv);
+                vc->disp_yuv = (uint8_t *)malloc(yuv_size);
+                vc->disp_width = dec_w;
+                vc->disp_height = dec_h;
+            }
+            if (vc->disp_yuv) {
+                memcpy(vc->disp_yuv, yuv_dec, yuv_size);
+                atomic_store(&vc->disp_new_frame, 1);
+            }
+#ifdef _WIN32
+            LeaveCriticalSection(&vc->disp_lock);
+#else
+            pthread_mutex_unlock(&vc->disp_lock);
+#endif
             continue;
         }
 
@@ -1154,6 +1570,7 @@ static THREAD_RET th_recv_func(void *arg) {
     }
 
     free(rbuf); free(dec_buf); free(yuv_buf); free(opus_buf); free(pcm);
+    free(yuv_dec);
 
 #ifdef _WIN32
     return 0;
@@ -1336,8 +1753,27 @@ static int audio_init_codec(VideoCall *vc) {
     opus_encoder_ctl(vc->enc, OPUS_SET_INBAND_FEC(1));
     opus_encoder_ctl(vc->enc, OPUS_SET_PACKET_LOSS_PERC(10));
 
-    vc->dec = opus_decoder_create(VC_SAMPLE_RATE, VC_CHANNELS, &err);
-    if (!vc->dec || err != OPUS_OK) return -1;
+    /* Decoders are created per participant when that participant is first
+     * heard, not here: one decoder cannot serve several senders. Only the
+     * rings and the lock exist up front. */
+    for (int i = 0; i < VC_MAX_MIX; i++) {
+        vc->mix[i].slot = -1;
+        vc->mix[i].dec = NULL;
+        vc->mix[i].last_ms = 0;
+        vc->mix[i].prefilled = 0;
+        vc->mix[i].frames = 0;
+        if (pcmring_init(&vc->mix[i].ring, 32) != 0) {
+            fprintf(stderr, "pcmring_init failed for mix slot %d\n", i);
+            for (int j = 0; j < i; j++) pcmring_free(&vc->mix[j].ring);
+            return -1;
+        }
+    }
+#ifdef _WIN32
+    InitializeCriticalSection(&vc->mix_lock);
+#else
+    pthread_mutex_init(&vc->mix_lock, NULL);
+#endif
+    vc->mix_ready = 1;
 
     return 0;
 }
@@ -1352,10 +1788,12 @@ static void video_call_stop(VideoCall *vc) {
     if (vc->th_vsend) { WaitForSingleObject(vc->th_vsend, 5000); CloseHandle(vc->th_vsend); }
     if (vc->th_asend) { WaitForSingleObject(vc->th_asend, 5000); CloseHandle(vc->th_asend); }
     if (vc->th_recv)  { WaitForSingleObject(vc->th_recv, 5000);  CloseHandle(vc->th_recv); }
+    if (vc->th_play)  { WaitForSingleObject(vc->th_play, 5000);  CloseHandle(vc->th_play); }
 #else
     if (vc->th_vsend) { pthread_join(vc->th_vsend, NULL); vc->th_vsend = 0; }
     if (vc->th_asend) { pthread_join(vc->th_asend, NULL); vc->th_asend = 0; }
     if (vc->th_recv)  { pthread_join(vc->th_recv, NULL);  vc->th_recv = 0; }
+    if (vc->th_play)  { pthread_join(vc->th_play, NULL);  vc->th_play = 0; }
 #endif
 
     if (vc->in_stream) { Pa_StopStream(vc->in_stream); Pa_CloseStream(vc->in_stream); }
@@ -1363,15 +1801,10 @@ static void video_call_stop(VideoCall *vc) {
     Pa_Terminate();
 
     if (vc->enc) opus_encoder_destroy(vc->enc);
-    if (vc->dec) opus_decoder_destroy(vc->dec);
 
     video_capture_close(vc->capture);
     video_encoder_close(vc->v_enc);
-    video_decoder_close(vc->v_dec);
     if (vc->display) { video_display_close(vc->display); vc->display = NULL; }
-
-    video_frag_receiver_free(&vc->frag_recv);
-    pcmring_free(&vc->out_ring);
 
     if (vc->tcp_sock) CLOSESOCK(vc->tcp_sock);
     if (vc->sock) CLOSESOCK(vc->sock);
@@ -1385,6 +1818,38 @@ static void video_call_stop(VideoCall *vc) {
     pthread_mutex_destroy(&vc->disp_lock);
     if (vc->relay_mode) pthread_mutex_destroy(&vc->tcp_send_lock);
 #endif
+
+    /* One pair of lines per participant we installed: what decrypted, and
+     * what actually reached the user. They are not the same number and the
+     * difference is the whole point - per-sender keys make every packet
+     * authenticate, which looks like success right up until you notice
+     * "decrypted 441 mixed 0", one decoder shared by three senders. */
+    for (int i = 0; i < MS_MAX_SLOTS; i++) {
+        if (!vc->senders.slots[i].used) continue;
+        const uint8_t *sid = vc->senders.slots[i].sid;
+        uint64_t mixed = 0, decoded = 0, shown = 0;
+        for (int k = 0; k < VC_MAX_MIX; k++) {
+            if (vc->mix[k].slot == i) { mixed = vc->mix[k].frames; break; }
+        }
+        for (int k = 0; k < VC_MAX_VIDEO; k++) {
+            if (vc->vid[k].slot == i) {
+                decoded = vc->vid[k].frames;
+                shown = vc->vid[k].shown;
+                break;
+            }
+        }
+        printf("[MEDIA] peer %02x%02x%02x decrypted %llu mixed %llu\n",
+               sid[0], sid[1], sid[2],
+               (unsigned long long)vc->rx_audio[i], (unsigned long long)mixed);
+        printf("[VIDEO] peer %02x%02x%02x decrypted %llu decoded %llu shown %llu\n",
+               sid[0], sid[1], sid[2],
+               (unsigned long long)vc->rx_video[i],
+               (unsigned long long)decoded, (unsigned long long)shown);
+    }
+    fflush(stdout);
+
+    mix_teardown(vc);
+    vid_teardown(vc);
 
     /* Secure wipe: every key, salt and identity secret this call held. */
     ms_clear(&vc->senders);
@@ -1714,19 +2179,44 @@ static int start_video_call(const char *remote_ip, uint16_t remote_port,
                ? strlen(opts->camera) : sizeof(vc->camera_device) - 1);
     }
 
-    /* Ring buffer */
-    if (pcmring_init(&vc->out_ring, PCM_RING_CAPACITY) != 0) {
-        free(vc); SDL_Quit(); return -1;
+    /* Rendered-participant pool for video. The audio pool is set up in
+     * audio_init_codec, alongside the encoder, exactly as audio_call does it.
+     * Both run before any thread starts. */
+    for (int i = 0; i < VC_MAX_VIDEO; i++) {
+        vc->vid[i].slot = -1;
+        vc->vid[i].dec = NULL;
+        vc->vid[i].last_ms = 0;
+        vc->vid[i].frames = 0;
+        vc->vid[i].shown = 0;
+        video_frag_receiver_init(&vc->vid[i].frag);
     }
-
-    /* Fragment receiver */
-    video_frag_receiver_init(&vc->frag_recv);
+    vc->disp_slot = -1;
+    vc->cand_slot = -1;
 
     /* Socket */
     vc->sock = (socket_t)socket(AF_INET, SOCK_DGRAM, 0);
     if (vc->sock == (socket_t)SOCK_ERR) {
         fprintf(stderr, "socket() failed\n");
-        pcmring_free(&vc->out_ring); free(vc); SDL_Quit(); return -1;
+        free(vc); SDL_Quit(); return -1;
+    }
+
+    /* Bound how long recvfrom may block, so the receive thread notices
+     * vc->running going to zero. Without it the thread sits in recvfrom
+     * forever whenever the call is quiet, video_call_stop blocks in
+     * pthread_join, and Ctrl+C never completes - which also means none of the
+     * teardown below ever runs: not the report, not the key wiping. Same
+     * 200 ms as audio_call. */
+    {
+#ifdef _WIN32
+        DWORD rcv_to = 200;
+        setsockopt(vc->sock, SOL_SOCKET, SO_RCVTIMEO,
+                   (const char *)&rcv_to, sizeof rcv_to);
+#else
+        struct timeval rcv_to;
+        rcv_to.tv_sec = 0;
+        rcv_to.tv_usec = 200000;
+        setsockopt(vc->sock, SOL_SOCKET, SO_RCVTIMEO, &rcv_to, sizeof rcv_to);
+#endif
     }
 
     struct sockaddr_in local;
@@ -1736,7 +2226,7 @@ static int start_video_call(const char *remote_ip, uint16_t remote_port,
     local.sin_port = htons(opts->local_port);
     if (bind(vc->sock, (struct sockaddr *)&local, sizeof(local)) == SOCK_ERR) {
         fprintf(stderr, "bind() failed (port %u)\n", opts->local_port);
-        CLOSESOCK(vc->sock); pcmring_free(&vc->out_ring); free(vc); SDL_Quit(); return -1;
+        CLOSESOCK(vc->sock); free(vc); SDL_Quit(); return -1;
     }
 
     vc->peer_set = 0;
@@ -1747,7 +2237,7 @@ static int start_video_call(const char *remote_ip, uint16_t remote_port,
         vc->peer.sin_port = htons(remote_port);
         if (resolve_host_v4(remote_ip, &vc->peer.sin_addr) != 0) {
             fprintf(stderr, "cannot resolve host %s\n", remote_ip);
-            CLOSESOCK(vc->sock); pcmring_free(&vc->out_ring); free(vc); SDL_Quit(); return -1;
+            CLOSESOCK(vc->sock); free(vc); SDL_Quit(); return -1;
         }
         vc->peer_set = 1;
     }
@@ -1768,12 +2258,12 @@ static int start_video_call(const char *remote_ip, uint16_t remote_port,
             pthread_mutex_init(&vc->tcp_send_lock, NULL);
 #endif
             if (tcp_relay_connect(vc, remote_ip, remote_port) != 0) {
-                CLOSESOCK(vc->sock); pcmring_free(&vc->out_ring); free(vc); SDL_Quit(); return -1;
+                CLOSESOCK(vc->sock); free(vc); SDL_Quit(); return -1;
             }
             if (tcp_relay_register(vc) != 0) {
                 fprintf(stderr, "TCP relay registration failed\n");
                 CLOSESOCK(vc->tcp_sock); CLOSESOCK(vc->sock);
-                pcmring_free(&vc->out_ring); free(vc); SDL_Quit(); return -1;
+                free(vc); SDL_Quit(); return -1;
             }
             /* Set peer_set=1 so send guards pass (actual routing goes through TCP) */
             vc->peer_set = 1;
@@ -1818,28 +2308,39 @@ static int start_video_call(const char *remote_ip, uint16_t remote_port,
             }
         }
 
-        if (video_decoder_open(&vc->v_dec) != 0) {
-            fprintf(stderr, "Warning: VP8 decoder failed\n");
-            vc->v_dec = NULL;
-        }
+        /* No decoder is opened here. One per rendered participant is created
+         * on the first fragment from that participant (see vid_acquire),
+         * because one VP8 decoder fed by several senders decodes each one's
+         * frames against another's reference frames. */
     }
 
     /* Send initial HELLO */
     if (vc->peer_set) send_hello(vc);
 
-    /* Start threads (recv, asend, vsend) */
-    ThreadArgs *a1 = (ThreadArgs *)calloc(1, sizeof(ThreadArgs)); a1->vc = vc;
-    ThreadArgs *a2 = (ThreadArgs *)calloc(1, sizeof(ThreadArgs)); a2->vc = vc;
-    ThreadArgs *a3 = (ThreadArgs *)calloc(1, sizeof(ThreadArgs)); a3->vc = vc;
+    /* Start threads (recv, asend, vsend, play). Play-out is its own thread
+     * now: with several senders the receive loop runs several times per frame
+     * period, so it cannot be what paces the output device. */
+    ThreadArgs *a1 = (ThreadArgs *)calloc(1, sizeof(ThreadArgs));
+    ThreadArgs *a2 = (ThreadArgs *)calloc(1, sizeof(ThreadArgs));
+    ThreadArgs *a3 = (ThreadArgs *)calloc(1, sizeof(ThreadArgs));
+    ThreadArgs *a4 = (ThreadArgs *)calloc(1, sizeof(ThreadArgs));
+    if (!a1 || !a2 || !a3 || !a4) {
+        free(a1); free(a2); free(a3); free(a4);
+        fprintf(stderr, "out of memory starting call threads\n");
+        video_call_stop(vc); SDL_Quit(); return -1;
+    }
+    a1->vc = vc; a2->vc = vc; a3->vc = vc; a4->vc = vc;
 
 #ifdef _WIN32
     vc->th_recv  = CreateThread(NULL, 0, th_recv_func, a1, 0, NULL);
     vc->th_asend = CreateThread(NULL, 0, th_asend_func, a2, 0, NULL);
     vc->th_vsend = CreateThread(NULL, 0, th_vsend_func, a3, 0, NULL);
+    vc->th_play  = CreateThread(NULL, 0, th_play_func, a4, 0, NULL);
 #else
     pthread_create(&vc->th_recv,  NULL, th_recv_func, a1);
     pthread_create(&vc->th_asend, NULL, th_asend_func, a2);
     pthread_create(&vc->th_vsend, NULL, th_vsend_func, a3);
+    pthread_create(&vc->th_play,  NULL, th_play_func, a4);
 #endif
 
     /* Open display on main thread (SDL requires this on Windows/macOS) */
