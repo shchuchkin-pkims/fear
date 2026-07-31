@@ -742,3 +742,70 @@ The number of simultaneous decoders is a runtime limit, not a protocol
 constant: start with what a phone sustains and raise it once measured.
 
 Everything else in the revised section stands as written.
+
+---
+
+## Step 5 checklist (the one indivisible landing)
+
+Everything below already exists and is tested; step 5 is only the
+switchover. Nothing in this list changes a byte until all of it is done,
+which is why it cannot be split across commits.
+
+**Ready to call, currently unused:**
+
+| Module | What it gives step 5 |
+|---|---|
+| `identity/media_keys.c` | `mk_derive_sender`, `mk_sender_id`, `mk_hello_key`, `mk_call_id_parse` |
+| `identity/media_hello.c` | `mh_build` / `mh_parse`, legacy-peer detection |
+| `identity/media_senders.c` | slot table, replay windows, tombstones, SID lookup |
+| `identity/media_packet.c` | `mp_encrypt` / `mp_peek` / `mp_decrypt`, `[type][SID][counter]` + AAD |
+| `identity/call_invite.c` | invite payload; `call_id` already reaches both ends |
+| Kotlin mirrors | `MediaKeys`, `MediaHello`, `SenderTable`, `CallInvite` |
+
+All five C files are already in the `audio_call` and `video_call` source
+lists, so the switchover cannot fail to link.
+
+**Desktop, `audio_call/src/audio_call.c`:**
+
+- [ ] struct: drop `key`, `local_nonce_prefix`, `remote_nonce_prefix`,
+      `remote_prefix_ready`, `rx_audio`, `rx_stats`; add `master_key`,
+      `own_salt`, `own_sid`, `key_tx`, `ms_table_t senders`, `keys_ready`
+- [ ] `--call-id` becomes mandatory; refuse to start without it
+- [ ] `send_hello` / `handle_hello` rewritten over `mh_build` / `mh_parse`
+- [ ] `encrypt_opus` / `decrypt_opus` / `encrypt_stats` / `decrypt_stats`
+      over `mp_encrypt` / `mp_decrypt`; stats ride the audio key, because
+      they share the audio counter
+- [ ] receive path: `mp_peek` for the SID, `ms_find_by_sid` for candidate
+      keys, `ms_accept_seq` after a successful decrypt
+- [ ] delete the send-thread spin on `remote_prefix_ready`: a sender needs
+      no peer input to start
+- [ ] `sodium_memzero` on teardown - this file never wipes its key today
+
+**Desktop, `video_call/src/video_call.c`:** the same, plus
+
+- [ ] `derive_subkeys` replaced by per-sender derivation; the call at
+      `start_video_call` moves after the HELLO
+- [ ] the `send_hello` stack buffer grows to `MH_SIZE_SIGNED`; at 107
+      bytes today, writing a HELLO2 into it is a stack smash
+- [ ] stats ride the **video** key, because they share the video counter
+
+**Android:** `AudioCallManager.kt` and `VideoCallManager.kt`, same shape.
+Note `initialize()` needs the `call_id` parameter, and the HELLO parse in
+`AudioCallManager` currently overwrites the remote prefix on every HELLO -
+under the new scheme that would be a remote key-reset primitive.
+
+**Tests that must exist before this is called done:**
+
+- [ ] `tests/media_loopback.sh`: three processes over the hub, each
+      decrypting the other two. This is the only test that can catch a
+      role inversion or a salt-agreement mismatch, and no unit test can
+      reach it.
+- [ ] a forced SID-collision case, a tombstone case, and a legacy-peer
+      case in that same script
+
+**Release:** tag desktop and Android the same day, desktop first because
+its vectors are the reference, and say plainly in both release notes that
+the version does not interoperate with any earlier build in either
+direction. Between the two tags every cross-platform call fails at the
+handshake - loudly, thanks to the legacy-peer detection, which is what
+makes a short window tolerable.
