@@ -46,7 +46,7 @@ jobs:
             -DFEAR_GUI_ONLY=ON
 
       - name: Build tests and console client
-        run: cmake --build build --target fear test_identity test_backup test_contacts test_key_schedule test_blob_auth -j
+        run: cmake --build build --target fear test_identity test_backup test_contacts test_key_schedule test_rotation test_blob_auth -j
 
       - name: Run tests
         run: ctest --test-dir build --output-on-failure
