@@ -4,6 +4,7 @@
  */
 
 #include "backend.h"
+#include <sodium.h>
 #include <QFile>
 #include <QDir>
 #include <QDebug>
@@ -502,6 +503,35 @@ bool Backend::hasIdentity() const {
     return identityAvailable;
 }
 
+bool Backend::sendCallInvite(const QString &host, quint16 port, bool video) {
+    if (!clientProc || !isConnected) return false;
+
+    /* Draw the id here rather than letting the CLI draw it and reading it
+     * back: the call would otherwise start before the answer arrived. */
+    unsigned char raw[16];
+    randombytes_buf(raw, sizeof raw);
+    const QString callId =
+        QByteArray(reinterpret_cast<const char *>(raw), sizeof raw).toHex();
+
+    /* The media process must use exactly the id the room was told about. */
+    if (video) {
+        if (videoManager) videoManager->callId = callId;
+    } else {
+        if (audioManager) audioManager->callId = callId;
+    }
+
+    QString cmd = QStringLiteral("/invite ") + callId;
+    if (!host.isEmpty()) {
+        cmd += QLatin1Char(' ') + host + QLatin1Char(' ') + QString::number(port);
+    }
+    if (video) cmd += QStringLiteral(" video");
+    cmd += QLatin1Char('\n');
+    if (clientProc->write(cmd.toUtf8()) <= 0) return false;
+
+    emit callInviteSent(callId, host, port, video);
+    return true;
+}
+
 void Backend::parseClientOutput(const QString &s) {
     if (s.isEmpty()) return;
 
@@ -533,6 +563,32 @@ void Backend::parseClientOutput(const QString &s) {
                     roomKeyHex = keyBytes.toHex();
                     qDebug() << "Room key captured (" << km.captured(1) << "), hex length:" << roomKeyHex.length();
                 }
+            }
+        }
+
+        // Call signalling. The CLI has already authenticated and validated
+        // these: they arrived inside the room AEAD and the host was checked
+        // at the parse, so what reaches here is safe to act on.
+        {
+            static const QRegularExpression inviteRe(
+                QStringLiteral("^\\[CALL_INVITE\\] (\\S+) ([0-9a-f]{32}) (\\S+) (\\d+) (audio|video)$"));
+            if (auto m = inviteRe.match(t); m.hasMatch()) {
+                const QString hostHint = (m.captured(3) == QStringLiteral("-"))
+                                             ? QString() : m.captured(3);
+                emit callInviteReceived(m.captured(1), m.captured(2), hostHint,
+                                        static_cast<quint16>(m.captured(4).toUInt()),
+                                        m.captured(5) == QStringLiteral("video"));
+                continue;
+            }
+            static const QRegularExpression sentRe(
+                QStringLiteral("^\\[CALL_INVITE_SENT\\] ([0-9a-f]{32}) (\\S+) (\\d+) (audio|video)$"));
+            if (auto m = sentRe.match(t); m.hasMatch()) {
+                const QString hostHint = (m.captured(2) == QStringLiteral("-"))
+                                             ? QString() : m.captured(2);
+                emit callInviteSent(m.captured(1), hostHint,
+                                    static_cast<quint16>(m.captured(3).toUInt()),
+                                    m.captured(4) == QStringLiteral("video"));
+                continue;
             }
         }
 

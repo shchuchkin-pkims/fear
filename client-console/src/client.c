@@ -946,6 +946,21 @@ static void handle_invite_command(const char *arg, sock_t s,
     char host[CI_MAX_HOST + 1] = {0};
     unsigned port = 0;
     char extra[16] = {0};
+    int have_id = 0;
+
+    /* An explicit id may come first. The GUI needs it: it has to hand the
+     * same value to the media process, and waiting for this command to
+     * report one back would be a race against the call starting. */
+    if (arg && *arg) {
+        char maybe_id[64] = {0};
+        if (sscanf(arg, "%63s", maybe_id) == 1 &&
+            mk_call_id_parse(maybe_id, inv.call_id) == 0) {
+            have_id = 1;
+            arg += strlen(maybe_id);
+            while (*arg == ' ') arg++;
+        }
+    }
+
     if (arg && *arg) {
         int n = sscanf(arg, "%255s %u %15s", host, &port, extra);
         if (n >= 1 && strcmp(host, "video") == 0) {
@@ -962,7 +977,7 @@ static void handle_invite_command(const char *arg, sock_t s,
     inv.port = (uint16_t)port;
     snprintf(inv.host, sizeof inv.host, "%s", host);
 
-    randombytes_buf(inv.call_id, sizeof inv.call_id);
+    if (!have_id) randombytes_buf(inv.call_id, sizeof inv.call_id);
 
     uint8_t payload[CI_MAX_BYTES];
     size_t plen = 0;

@@ -146,6 +146,15 @@ public:
      * @brief Generates a new Ed25519 identity keypair
      * @return true if identity generated successfully
      */
+    /**
+     * @brief Announce a call to the room over the encrypted chat channel.
+     *
+     * The CLI draws the call_id and reports it back, which arrives as
+     * callInviteSent(). Host and port are an optional hint for a direct
+     * connection; leave them empty for a relayed or group call.
+     */
+    bool sendCallInvite(const QString &host, quint16 port, bool video);
+
     bool generateIdentity(bool copyToClipboard = true);
 
     /**
@@ -158,6 +167,21 @@ signals:
     /**
      * @brief Emitted when client successfully connects
      */
+    /**
+     * @brief A room member announced a call.
+     * @param sender who is calling
+     * @param callId 32 hex chars; every media key of that call is bound to it
+     * @param host   direct-connection hint, empty when the call is relayed
+     * @param port   direct-connection hint, 0 when the call is relayed
+     * @param video  true when the invite offers video
+     */
+    void callInviteReceived(const QString &sender, const QString &callId,
+                            const QString &host, quint16 port, bool video);
+
+    /** @brief Our own invite went out; carries the id we must now use. */
+    void callInviteSent(const QString &callId, const QString &host,
+                        quint16 port, bool video);
+
     void connected();
 
     /**

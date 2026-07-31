@@ -190,6 +190,10 @@ private:
     QString currentKey;      ///< Currently stored encryption key
     QSettings *settings;     ///< Application settings storage
 public:
+    /** Per-call identifier from the invite, 32 hex chars. Empty until the
+     *  call is announced; the media binary refuses an all-zero one. */
+    QString callId;
+
     QString identityFilePath; ///< Path to identity key (set by Backend)
 };
 

@@ -84,6 +84,9 @@ bool AudioCallManager::startCall(const QString &remoteIp, quint16 remotePort, co
     // Instead, we pass it via stdin
     QStringList args;
     args << "call" << remoteIp << QString::number(remotePort);
+    if (!callId.isEmpty()) {
+        args << "--call-id" << callId;
+    }
     // NOTE: NO key argument here for security!
 
     // Pass identity file if available
@@ -160,6 +163,9 @@ bool AudioCallManager::startListening(quint16 localPort, const QString &key,
     // Instead, we pass it via stdin
     QStringList args;
     args << "listen" << QString::number(localPort);
+    if (!callId.isEmpty()) {
+        args << "--call-id" << callId;
+    }
     // NOTE: NO key argument here for security!
 
     // Pass identity file if available
@@ -230,6 +236,9 @@ bool AudioCallManager::startRelay(const QString &serverIp, quint16 serverPort,
     QStringList args;
     args << "relay" << serverIp << QString::number(serverPort)
          << "--room" << room << "--name" << name;
+    if (!callId.isEmpty()) {
+        args << "--call-id" << callId;
+    }
 
     if (!identityFilePath.isEmpty() && QFile::exists(identityFilePath)) {
         args << "--identity-file" << identityFilePath;

@@ -105,6 +105,7 @@ ChatWindow::ChatWindow(QWidget *parent) : QMainWindow(parent) {
 
     // Backend → UI
     connect(m_backend, &Backend::connected,         this, &ChatWindow::handleConnected);
+    connect(m_backend, &Backend::callInviteReceived, this, &ChatWindow::handleCallInvite);
     connect(m_backend, &Backend::disconnected,      this, &ChatWindow::handleDisconnected);
     connect(m_backend, &Backend::newMessages,       this, &ChatWindow::handleNewMessages);
     connect(m_backend, &Backend::contactsUpdated,   this, &ChatWindow::handleContactsUpdated);
@@ -318,6 +319,51 @@ void ChatWindow::handleError(const QString &err) {
     m.timestamp = QDateTime::currentDateTime();
     m.isSystem  = true;
     m_chatArea->appendMessage(m);
+}
+
+void ChatWindow::handleCallInvite(const QString &sender, const QString &callId,
+                                  const QString &host, quint16 port, bool video) {
+    /* Leave a trace either way: a call that was offered and declined is
+     * something the user may want to see later. */
+    Message note;
+    note.text      = video ? tr("%1 is inviting you to a video call").arg(sender)
+                           : tr("%1 is inviting you to a voice call").arg(sender);
+    note.timestamp = QDateTime::currentDateTime();
+    note.isSystem  = true;
+    m_chatArea->appendMessage(note);
+
+    QMessageBox box(this);
+    box.setIcon(QMessageBox::Question);
+    box.setWindowTitle(video ? tr("Incoming video call") : tr("Incoming voice call"));
+    box.setText(note.text);
+    box.setInformativeText(host.isEmpty()
+        ? tr("The call goes through the server.")
+        : tr("Direct connection to %1:%2.").arg(host).arg(port));
+    QPushButton *joinBtn = box.addButton(tr("Join"), QMessageBox::AcceptRole);
+    box.addButton(tr("Decline"), QMessageBox::RejectRole);
+    box.exec();
+    if (box.clickedButton() != joinBtn) return;
+
+    /* The call_id from the invite is what binds every media key of this
+     * call, so it has to reach the media process unchanged. Without it the
+     * two ends would derive different keys and hear nothing. */
+    if (video) {
+        if (m_backend->videoManager) m_backend->videoManager->callId = callId;
+    } else {
+        if (m_backend->audioManager) m_backend->audioManager->callId = callId;
+    }
+
+    /* Reuse the existing call dialogs rather than inventing a second path:
+     * they own device selection and the key field. The host and port from
+     * the invite are a hint the user can still override there. */
+    if (video) {
+        VideoCallDialog dlg(m_backend->videoManager, m_backend, this, m_backend->roomKeyHex);
+        dlg.exec();
+    } else {
+        AudioCallDialog dlg(m_backend->audioManager, m_backend, this, m_backend->roomKeyHex);
+        dlg.exec();
+    }
+    Q_UNUSED(host); Q_UNUSED(port);
 }
 
 void ChatWindow::promptKeyChanged(const QString &peer, const QString &fp) {

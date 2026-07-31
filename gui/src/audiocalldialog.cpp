@@ -98,6 +98,11 @@ void AudioCallDialog::onStartCall() {
     int inputDevice = inputDeviceCombo->currentData().toInt();
     int outputDevice = outputDeviceCombo->currentData().toInt();
 
+    /* Announce the call to the room first: the invite carries the call_id
+     * every media key is bound to, and the far side cannot derive a
+     * matching key without it. */
+    if (backend) backend->sendCallInvite(remoteIp, remotePort, /*video=*/false);
+
     if (relayCheck->isChecked() && backend) {
         // Relay mode: route through server
         if (audioManager->startRelay(remoteIp, remotePort,
@@ -122,6 +127,10 @@ void AudioCallDialog::onStartListening() {
     // Get selected audio devices
     int inputDevice = inputDeviceCombo->currentData().toInt();
     int outputDevice = outputDeviceCombo->currentData().toInt();
+
+    /* Listening announces too, with no address hint: whoever answers uses
+     * the id from the invite. */
+    if (backend) backend->sendCallInvite(QString(), localPortSpin->value(), /*video=*/false);
 
     if (audioManager->startListening(localPortSpin->value(), key, inputDevice, outputDevice)) {
         statusLabel->setText("Listening started");

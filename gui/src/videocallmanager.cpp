@@ -109,6 +109,9 @@ bool VideoCallManager::startCall(const QString &remoteIp, quint16 remotePort, co
 
     QStringList args;
     args << "call" << remoteIp << QString::number(remotePort);
+    if (!callId.isEmpty()) {
+        args << "--call-id" << callId;
+    }
     args << buildArgs(quality, adaptive, width, height, fps, bitrate,
                       camera, audioInput, audioOutput, noVideo, noAudio);
     // Pass identity file if available
@@ -171,6 +174,9 @@ bool VideoCallManager::startListening(quint16 localPort, const QString &key,
 
     QStringList args;
     args << "listen" << QString::number(localPort);
+    if (!callId.isEmpty()) {
+        args << "--call-id" << callId;
+    }
     args << buildArgs(quality, adaptive, width, height, fps, bitrate,
                       camera, audioInput, audioOutput, noVideo, noAudio);
     // Pass identity file if available
@@ -232,6 +238,9 @@ bool VideoCallManager::startRelay(const QString &serverIp, quint16 serverPort,
     QStringList args;
     args << "relay" << serverIp << QString::number(serverPort)
          << "--room" << room << "--name" << name;
+    if (!callId.isEmpty()) {
+        args << "--call-id" << callId;
+    }
     args << buildArgs(quality, adaptive, width, height, fps, bitrate,
                       camera, audioInput, audioOutput, noVideo, noAudio);
     if (!identityFilePath.isEmpty() && QFile::exists(identityFilePath)) {

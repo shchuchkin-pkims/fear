@@ -85,6 +85,10 @@ private:
     int           m_reportedCount = 0; // last count from server [USERS] broadcast
     QSet<QString> m_keyChangePrompted; // "(peer)/(fp)" pairs already raised modally
 
+    /** A room member announced a call: ask whether to join it. */
+    void handleCallInvite(const QString &sender, const QString &callId,
+                          const QString &host, quint16 port, bool video);
+
     /** Modal MITM prompt for a changed peer identity key (audit UX). */
     void promptKeyChanged(const QString &peer, const QString &fp);
 };
