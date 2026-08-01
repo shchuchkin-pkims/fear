@@ -31,6 +31,7 @@ set(SOURCES
     ${CMAKE_SOURCE_DIR}/identity/identity.c
     ${CMAKE_SOURCE_DIR}/identity/call_invite.c
     ${CMAKE_SOURCE_DIR}/identity/media_keys.c
+    ${CMAKE_SOURCE_DIR}/identity/key_schedule.c
 )
 
 # Создание исполняемого файла

@@ -96,11 +96,15 @@
 ## In Progress
 
 - [ ] **Phase C - crypto evolution.** Landed: the key schedule, rotation
-      bundles, sender-rooted media keys, HELLO2, the sender table with replay
-      windows, call invites carrying the call_id, and the switchover of the
-      live media path on both platforms, with group audio mixing. Remaining:
-      group video rendering, an incoming-call screen on Android, and wiring
-      the key schedule and rotation bundles into the chat path.
+      bundles, sender-rooted media keys, HELLO2 (now carrying a display name),
+      the sender table with replay windows, call invites carrying the call_id,
+      the switchover of the live media path on both platforms, group audio
+      mixing, group video with a speaker view and a strip on both platforms,
+      an incoming-call screen on Android, and the epoch key schedule under the
+      chat path on the desktop. Remaining: the same epoch schedule on Android
+      - until it lands the two platforms cannot read each other's chat - and
+      rotation bundles on a membership change, which is what actually closes
+      the forward-secrecy finding.
 - [ ] Documentation updates and localization
 
 ## Planned

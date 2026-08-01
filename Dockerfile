@@ -37,6 +37,7 @@ RUN mkdir -p /out && gcc -O2 -Wall -Wextra -pthread \
         identity/identity.c \
         identity/call_invite.c \
         identity/media_keys.c \
+        identity/key_schedule.c \
         -I client-console/include \
         -I identity \
         -lsodium -lsqlite3

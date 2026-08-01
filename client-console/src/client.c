@@ -19,6 +19,7 @@
 #include "client.h"
 #include "network.h"
 #include "identity.h"
+#include "key_schedule.h"
 #include "call_invite.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -111,6 +112,15 @@ static int g_has_identity = 0;
 static uint8_t g_identity_pk[IDENTITY_PK_BYTES];
 static uint8_t g_identity_sk[IDENTITY_SK_BYTES];
 static char g_known_keys_path[512];
+
+/* Sealing under the epoch key. Defined next to each other further down;
+ * declared here because the file's first sender predates them. */
+static int chat_seal(const uint8_t *k_room, const char *room, const char *name,
+                     const uint8_t *plain, size_t plen, const uint8_t *nonce,
+                     uint8_t *out, size_t *out_len);
+static int chat_open(const uint8_t *k_room, const char *room, const char *name,
+                     const uint8_t *sealed, size_t sealed_len, const uint8_t *nonce,
+                     uint8_t *out, unsigned long long *out_len);
 
 /* Forward declarations for signed message functions */
 static int send_signed_file_message(sock_t s, const char *room, const char *name,
@@ -497,29 +507,21 @@ int send_file_message(sock_t s, const char *room, const char *name,
         wr_u32(payload, crc);
     }
 
-    // Associated Data = только room + name
-    size_t ad_len = room_len + name_len + 2 + 2;
-    uint8_t *ad = (uint8_t*)malloc(ad_len);
-    if (!ad) { free(payload); return -1; }
-    uint8_t *aw = ad;
-    wr_u16(aw, room_len); aw += 2; memcpy(aw, room, room_len); aw += room_len;
-    wr_u16(aw, name_len); aw += 2; memcpy(aw, name, name_len);
-
     // Шифруем
-    size_t cmax = payload_len + CRYPTO_ABYTES;
+    size_t cmax = payload_len + CRYPTO_ABYTES + KS_HEADER_BYTES;
     uint8_t *cipher = (uint8_t*)malloc(cmax);
-    if (!cipher) { free(ad); free(payload); return -1; }
+    if (!cipher) { free(payload); return -1; }
     
-    unsigned long long clen = 0;
-    if (aes_gcm_encrypt(payload, payload_len, ad, ad_len, nonce, key, cipher, &clen) != 0) {
-        free(ad); free(cipher); free(payload);
+    size_t clen = 0;
+    if (chat_seal(key, room, name, payload, payload_len, nonce, cipher, &clen) != 0) {
+        free(cipher); free(payload);
         return -1;
     }
 
     // Формируем финальный frame
     size_t flen = 2 + room_len + 2 + name_len + 2 + CRYPTO_NPUBBYTES + 1 + 4 + (size_t)clen;
     uint8_t *frame = (uint8_t*)malloc(flen);
-    if (!frame) { free(ad); free(cipher); free(payload); return -1; }
+    if (!frame) { free(cipher); free(payload); return -1; }
 
     uint8_t *w = frame;
     wr_u16(w, room_len); w += 2; memcpy(w, room, room_len); w += room_len;
@@ -531,7 +533,6 @@ int send_file_message(sock_t s, const char *room, const char *name,
 
     int rc = send_all(s, frame, flen);
 
-    free(ad);
     free(cipher);
     free(payload);
     free(frame);
@@ -1004,6 +1005,112 @@ static void handle_invite_command(const char *arg, sock_t s,
     fflush(stdout);
 }
 
+/*
+ * Chat frames are sealed under an epoch key, not under K_room itself.
+ *
+ *     K_epoch = BLAKE2b(key = K_room, "fear.epoch.v1" || version || epoch)
+ *
+ * derived from the clock by every member independently, nothing exchanged.
+ * The six bytes that name it - [key_version(2)][epoch(4)] - travel in front
+ * of the ciphertext and are bound into the additional data, so a relay can
+ * read them for nothing and cannot change them without the AEAD noticing.
+ *
+ * They go in front of the ciphertext rather than into a field of their own
+ * because the server reads msg_type and the ciphertext length at fixed
+ * offsets; the ciphertext itself is opaque to it. The server does not and
+ * should not understand the key schedule.
+ *
+ * key_version is zero until rotation bundles land. K_room has no generation
+ * counter yet, and putting a number on the wire that nothing maintains would
+ * be worse than putting the honest zero there: the field exists so that a
+ * rotation can be told apart from a replay, and today there are no rotations.
+ */
+#define CHAT_KEY_VERSION 0
+
+/** Additional data: what the server routes on, plus what names the key. */
+static uint8_t *chat_ad(const char *room, const char *name,
+                        const uint8_t hdr[KS_HEADER_BYTES], size_t *out_len) {
+    uint16_t room_len = (uint16_t)strlen(room);
+    uint16_t name_len = (uint16_t)strlen(name);
+    size_t len = 2 + room_len + 2 + name_len + KS_HEADER_BYTES;
+    uint8_t *ad = (uint8_t *)malloc(len);
+    if (!ad) return NULL;
+    uint8_t *w = ad;
+    wr_u16(w, room_len); w += 2; memcpy(w, room, room_len); w += room_len;
+    wr_u16(w, name_len); w += 2; memcpy(w, name, name_len); w += name_len;
+    memcpy(w, hdr, KS_HEADER_BYTES);
+    *out_len = len;
+    return ad;
+}
+
+/**
+ * Seal one chat payload: derive this hour's key, encrypt, and emit
+ * [key_version(2)][epoch(4)][ciphertext].
+ *
+ * @param out must have room for plen + CRYPTO_ABYTES + KS_HEADER_BYTES
+ * @return 0 on success, -1 otherwise
+ */
+static int chat_seal(const uint8_t *k_room, const char *room, const char *name,
+                     const uint8_t *plain, size_t plen, const uint8_t *nonce,
+                     uint8_t *out, size_t *out_len) {
+    if (!k_room || !room || !name || !out || !out_len) return -1;
+
+    uint32_t epoch = ks_epoch_from_unix((uint64_t)time(NULL));
+    uint8_t hdr[KS_HEADER_BYTES];
+    ks_write_header(hdr, CHAT_KEY_VERSION, epoch);
+
+    uint8_t k_epoch[KS_KEY_BYTES];
+    if (ks_derive_epoch_key(k_room, CHAT_KEY_VERSION, epoch, k_epoch) != 0) return -1;
+
+    size_t ad_len = 0;
+    uint8_t *ad = chat_ad(room, name, hdr, &ad_len);
+    if (!ad) { sodium_memzero(k_epoch, sizeof k_epoch); return -1; }
+
+    unsigned long long clen = 0;
+    int rc = aes_gcm_encrypt(plain, plen, ad, ad_len, nonce, k_epoch,
+                             out + KS_HEADER_BYTES, &clen);
+    sodium_memzero(k_epoch, sizeof k_epoch);
+    free(ad);
+    if (rc != 0) return -1;
+
+    memcpy(out, hdr, KS_HEADER_BYTES);
+    *out_len = KS_HEADER_BYTES + (size_t)clen;
+    return 0;
+}
+
+/**
+ * Open one sealed chat payload.
+ *
+ * Refuses an epoch too far from ours before deriving anything: an attacker
+ * who can name any epoch could otherwise make us derive an unbounded number
+ * of keys, and a message from days ago is a replay however well it decrypts.
+ */
+static int chat_open(const uint8_t *k_room, const char *room, const char *name,
+                     const uint8_t *sealed, size_t sealed_len, const uint8_t *nonce,
+                     uint8_t *out, unsigned long long *out_len) {
+    if (!k_room || !room || !name || !sealed || sealed_len < KS_HEADER_BYTES) return -1;
+
+    uint16_t version = 0;
+    uint32_t epoch = 0;
+    ks_read_header(sealed, &version, &epoch);
+
+    if (version != CHAT_KEY_VERSION) return -1;
+    if (!ks_epoch_acceptable(epoch, ks_epoch_from_unix((uint64_t)time(NULL)))) return -1;
+
+    uint8_t k_epoch[KS_KEY_BYTES];
+    if (ks_derive_epoch_key(k_room, version, epoch, k_epoch) != 0) return -1;
+
+    size_t ad_len = 0;
+    uint8_t *ad = chat_ad(room, name, sealed, &ad_len);
+    if (!ad) { sodium_memzero(k_epoch, sizeof k_epoch); return -1; }
+
+    int rc = aes_gcm_decrypt(sealed + KS_HEADER_BYTES, sealed_len - KS_HEADER_BYTES,
+                             ad, ad_len, nonce, k_epoch, out, out_len);
+    sodium_memzero(k_epoch, sizeof k_epoch);
+    free(ad);
+    return rc;
+}
+
 int send_ciphertext_typed(sock_t s, const char *room, const char *name, const uint8_t *key,
                    const uint8_t *plaintext, size_t plen, uint8_t msg_type) {
     uint16_t room_len = (uint16_t)strlen(room);
@@ -1011,27 +1118,22 @@ int send_ciphertext_typed(sock_t s, const char *room, const char *name, const ui
     uint8_t nonce[CRYPTO_NPUBBYTES];
     randombytes_buf(nonce, sizeof nonce);
 
-    size_t ad_len = room_len + name_len + 2 + 2;
-    uint8_t *ad = (uint8_t*)malloc(ad_len);
-    if (!ad) return -1;
-    uint8_t *w = ad;
-    wr_u16(w, room_len); w += 2; memcpy(w, room, room_len); w += room_len;
-    wr_u16(w, name_len); w += 2; memcpy(w, name, name_len);
 
-    size_t cmax = plen + CRYPTO_ABYTES;
+    /* Room for the epoch header the seal puts in front of the ciphertext. */
+    size_t cmax = plen + CRYPTO_ABYTES + KS_HEADER_BYTES;
     uint8_t *cipher = (uint8_t*)malloc(cmax);
-    if (!cipher) { free(ad); return -1; }
-    
-    unsigned long long clen = 0;
-    if (aes_gcm_encrypt(plaintext, plen, ad, ad_len, nonce, key, cipher, &clen) != 0) {
-        free(ad); free(cipher);
+    if (!cipher) return -1;
+
+    size_t clen = 0;
+    if (chat_seal(key, room, name, plaintext, plen, nonce, cipher, &clen) != 0) {
+        free(cipher);
         return -1;
     }
 
     size_t flen = 2 + room_len + 2 + name_len + 2 + CRYPTO_NPUBBYTES + 1 + 4 + (size_t)clen;
     uint8_t *frame = (uint8_t*)malloc(flen);
-    if (!frame) { free(ad); free(cipher); return -1; }
-    w = frame;
+    if (!frame) { free(cipher); return -1; }
+    uint8_t *w = frame;
     wr_u16(w, room_len); w += 2; memcpy(w, room, room_len); w += room_len;
     wr_u16(w, name_len); w += 2; memcpy(w, name, name_len); w += name_len;
     wr_u16(w, (uint16_t)CRYPTO_NPUBBYTES); w += 2;
@@ -1044,7 +1146,6 @@ int send_ciphertext_typed(sock_t s, const char *room, const char *name, const ui
 
     int rc = send_all(s, frame, flen);
 
-    free(ad);
     free(cipher);
     free(frame);
     return rc;
@@ -1090,27 +1191,20 @@ static int send_signed_ciphertext(sock_t s, const char *room, const char *name,
     uint8_t nonce[CRYPTO_NPUBBYTES];
     randombytes_buf(nonce, sizeof nonce);
 
-    size_t ad_len = room_len + name_len + 2 + 2;
-    uint8_t *ad = (uint8_t*)malloc(ad_len);
-    if (!ad) { free(signed_plain); return -1; }
-    uint8_t *w = ad;
-    wr_u16(w, room_len); w += 2; memcpy(w, room, room_len); w += room_len;
-    wr_u16(w, name_len); w += 2; memcpy(w, name, name_len);
-
-    size_t cmax = signed_plen + CRYPTO_ABYTES;
+    size_t cmax = signed_plen + CRYPTO_ABYTES + KS_HEADER_BYTES;
     uint8_t *cipher = (uint8_t*)malloc(cmax);
-    if (!cipher) { free(ad); free(signed_plain); return -1; }
+    if (!cipher) { free(signed_plain); return -1; }
 
-    unsigned long long clen = 0;
-    if (aes_gcm_encrypt(signed_plain, signed_plen, ad, ad_len, nonce, key, cipher, &clen) != 0) {
-        free(ad); free(cipher); free(signed_plain);
+    size_t clen = 0;
+    if (chat_seal(key, room, name, signed_plain, signed_plen, nonce, cipher, &clen) != 0) {
+        free(cipher); free(signed_plain);
         return -1;
     }
 
     size_t flen = 2 + room_len + 2 + name_len + 2 + CRYPTO_NPUBBYTES + 1 + 4 + (size_t)clen;
     uint8_t *frame = (uint8_t*)malloc(flen);
-    if (!frame) { free(ad); free(cipher); free(signed_plain); return -1; }
-    w = frame;
+    if (!frame) { free(cipher); free(signed_plain); return -1; }
+    uint8_t *w = frame;
     wr_u16(w, room_len); w += 2; memcpy(w, room, room_len); w += room_len;
     wr_u16(w, name_len); w += 2; memcpy(w, name, name_len); w += name_len;
     wr_u16(w, (uint16_t)CRYPTO_NPUBBYTES); w += 2;
@@ -1121,7 +1215,6 @@ static int send_signed_ciphertext(sock_t s, const char *room, const char *name,
 
     int rc = send_all(s, frame, flen);
 
-    free(ad);
     free(cipher);
     free(frame);
     free(signed_plain);
@@ -1148,28 +1241,21 @@ static int send_identity_announce(sock_t s, const char *room, const char *name,
     uint8_t nonce[CRYPTO_NPUBBYTES];
     randombytes_buf(nonce, sizeof nonce);
 
-    size_t ad_len = room_len + name_len + 2 + 2;
-    uint8_t *ad = (uint8_t*)malloc(ad_len);
-    if (!ad) return -1;
-    uint8_t *w = ad;
-    wr_u16(w, room_len); w += 2; memcpy(w, room, room_len); w += room_len;
-    wr_u16(w, name_len); w += 2; memcpy(w, name, name_len);
-
     size_t plen = sizeof(plain);
-    size_t cmax = plen + CRYPTO_ABYTES;
+    size_t cmax = plen + CRYPTO_ABYTES + KS_HEADER_BYTES;
     uint8_t *cipher = (uint8_t*)malloc(cmax);
-    if (!cipher) { free(ad); return -1; }
+    if (!cipher) { return -1; }
 
-    unsigned long long clen = 0;
-    if (aes_gcm_encrypt(plain, plen, ad, ad_len, nonce, key, cipher, &clen) != 0) {
-        free(ad); free(cipher);
+    size_t clen = 0;
+    if (chat_seal(key, room, name, plain, plen, nonce, cipher, &clen) != 0) {
+        free(cipher);
         return -1;
     }
 
     size_t flen = 2 + room_len + 2 + name_len + 2 + CRYPTO_NPUBBYTES + 1 + 4 + (size_t)clen;
     uint8_t *frame = (uint8_t*)malloc(flen);
-    if (!frame) { free(ad); free(cipher); return -1; }
-    w = frame;
+    if (!frame) { free(cipher); return -1; }
+    uint8_t *w = frame;
     wr_u16(w, room_len); w += 2; memcpy(w, room, room_len); w += room_len;
     wr_u16(w, name_len); w += 2; memcpy(w, name, name_len); w += name_len;
     wr_u16(w, (uint16_t)CRYPTO_NPUBBYTES); w += 2;
@@ -1180,7 +1266,6 @@ static int send_identity_announce(sock_t s, const char *room, const char *name,
 
     int rc = send_all(s, frame, flen);
 
-    free(ad);
     free(cipher);
     free(frame);
     return rc;
@@ -1247,27 +1332,20 @@ static int send_signed_file_message(sock_t s, const char *room, const char *name
     uint8_t nonce[CRYPTO_NPUBBYTES];
     randombytes_buf(nonce, sizeof nonce);
 
-    size_t ad_len = room_len + name_len + 2 + 2;
-    uint8_t *ad = (uint8_t*)malloc(ad_len);
-    if (!ad) { free(signed_plain); return -1; }
-    uint8_t *w = ad;
-    wr_u16(w, room_len); w += 2; memcpy(w, room, room_len); w += room_len;
-    wr_u16(w, name_len); w += 2; memcpy(w, name, name_len);
-
-    size_t cmax = signed_plen + CRYPTO_ABYTES;
+    size_t cmax = signed_plen + CRYPTO_ABYTES + KS_HEADER_BYTES;
     uint8_t *cipher = (uint8_t*)malloc(cmax);
-    if (!cipher) { free(ad); free(signed_plain); return -1; }
+    if (!cipher) { free(signed_plain); return -1; }
 
-    unsigned long long clen = 0;
-    if (aes_gcm_encrypt(signed_plain, signed_plen, ad, ad_len, nonce, key, cipher, &clen) != 0) {
-        free(ad); free(cipher); free(signed_plain);
+    size_t clen = 0;
+    if (chat_seal(key, room, name, signed_plain, signed_plen, nonce, cipher, &clen) != 0) {
+        free(cipher); free(signed_plain);
         return -1;
     }
 
     size_t flen = 2 + room_len + 2 + name_len + 2 + CRYPTO_NPUBBYTES + 1 + 4 + (size_t)clen;
     uint8_t *frame = (uint8_t*)malloc(flen);
-    if (!frame) { free(ad); free(cipher); free(signed_plain); return -1; }
-    w = frame;
+    if (!frame) { free(cipher); free(signed_plain); return -1; }
+    uint8_t *w = frame;
     wr_u16(w, room_len); w += 2; memcpy(w, room, room_len); w += room_len;
     wr_u16(w, name_len); w += 2; memcpy(w, name, name_len); w += name_len;
     wr_u16(w, (uint16_t)CRYPTO_NPUBBYTES); w += 2;
@@ -1278,7 +1356,6 @@ static int send_signed_file_message(sock_t s, const char *room, const char *name
 
     int rc = send_all(s, frame, flen);
 
-    free(ad);
     free(cipher);
     free(frame);
     free(signed_plain);
@@ -1325,13 +1402,6 @@ int recv_and_decrypt(sock_t s, const char *room, const uint8_t *key, const char 
     if (!cipher) { free(room_in); free(name); return -1; }
     if (recv_all(s, cipher, clen) < 0) { free(room_in); free(name); free(cipher); return -1; }
 
-    size_t ad_len = room_len + name_len + 2 + 2;
-    uint8_t *ad = (uint8_t*)malloc(ad_len);
-    if (!ad) { free(room_in); free(name); free(cipher); return -1; }
-    uint8_t *w = ad;
-    wr_u16(w, room_len); w += 2; memcpy(w, room_in, room_len); w += room_len;
-    wr_u16(w, name_len); w += 2; memcpy(w, name, name_len);
-
     int same_room = (strcmp(room, room_in) == 0);
 
     // Проверяем, является ли это служебным сообщением (nonce заполнен нулями)
@@ -1344,7 +1414,7 @@ int recv_and_decrypt(sock_t s, const char *room, const uint8_t *key, const char 
     }
 
     uint8_t *plain = (uint8_t*)malloc(clen);
-    if (!plain) { free(room_in); free(name); free(cipher); free(ad); return -1; }
+    if (!plain) { free(room_in); free(name); free(cipher); return -1; }
 
     unsigned long long plen = 0;
     int ok = -1;
@@ -1360,19 +1430,23 @@ int recv_and_decrypt(sock_t s, const char *room, const uint8_t *key, const char 
             strcmp(name, myname) != 0) {
             handle_key_request(s, room, myname, g_room_key, name, cipher);
         }
-        free(room_in); free(name); free(cipher); free(ad); free(plain);
+        free(room_in); free(name); free(cipher); free(plain);
         return 0;
     } else if (is_service_message && same_room && msg_type == MSG_TYPE_KEY_RESPONSE) {
         /* KEY_RESPONSE — ignore in normal recv loop (handled by ecdh_join_room) */
-        free(room_in); free(name); free(cipher); free(ad); free(plain);
+        free(room_in); free(name); free(cipher); free(plain);
         return 0;
     } else if (same_room && !is_service_message) {
         // Обычное зашифрованное сообщение
-        ok = aes_gcm_decrypt(cipher, clen, ad, ad_len, nonce, key, plain, &plen);
+        /* Sealed: [key_version(2)][epoch(4)][AEAD]. chat_open reads the
+         * header, refuses an epoch too far from ours before deriving
+         * anything, and binds those six bytes into the additional data so a
+         * relay cannot move the message to another epoch. */
+        ok = chat_open(key, room_in, name, cipher, clen, nonce, plain, &plen);
     }
 
     if (!same_room || ok != 0 || strcmp(name, myname) == 0) {
-        free(room_in); free(name); free(cipher); free(ad); free(plain);
+        free(room_in); free(name); free(cipher); free(plain);
         return 0;
     }
 
@@ -1406,7 +1480,7 @@ int recv_and_decrypt(sock_t s, const char *room, const uint8_t *key, const char 
          * did not compile at all on a toolchain where a valueless return from
          * an int function is an error rather than a warning, which is what
          * had the Windows build red. */
-        free(room_in); free(name); free(cipher); free(ad); free(plain);
+        free(room_in); free(name); free(cipher); free(plain);
         return 0;
     }
 
@@ -1547,7 +1621,7 @@ int recv_and_decrypt(sock_t s, const char *room, const uint8_t *key, const char 
     free(room_in);
     free(name);
     free(cipher);
-    free(ad);
+   
     free(plain);
     return 1;
 }
