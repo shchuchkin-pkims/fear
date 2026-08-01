@@ -1837,68 +1837,6 @@ static THREAD_RET th_recv_func(void *arg) {
 
 /* ===== Thread: Display (SDL event loop) ===== */
 
-static THREAD_RET th_disp_func(void *arg) {
-    ThreadArgs *ta = (ThreadArgs *)arg;
-    VideoCall *vc = ta->vc;
-    free(ta);
-
-    /* Open display immediately (show black screen until first frame arrives) */
-    int w = vc->capture_width;
-    int h = vc->capture_height;
-    if (w <= 0) w = 640;
-    if (h <= 0) h = 480;
-
-    if (video_display_open(&vc->display, "F.E.A.R. Video Call", w, h) != 0) {
-        fprintf(stderr, "Failed to open video display\n");
-#ifdef _WIN32
-        return 0;
-#else
-        return NULL;
-#endif
-    }
-
-    /* Render initial black frame (Y=0, U=128, V=128) */
-    {
-        int black_size = w * h * 3 / 2;
-        uint8_t *black = (uint8_t *)calloc(1, black_size);
-        if (black) {
-            memset(black + w * h, 128, w * h / 2);
-            video_display_render(vc->display, black, w, h);
-            free(black);
-        }
-    }
-
-    atomic_store(&vc->display_ready, 1);
-
-    while (atomic_load(&vc->running)) {
-        /* Process SDL events */
-        SDL_Event ev;
-        while (SDL_PollEvent(&ev)) {
-            if (ev.type == SDL_EVENT_QUIT) {
-                atomic_store(&vc->running, 0);
-            }
-        }
-
-        /* Render new frame if available */
-        if (atomic_load(&vc->disp_new_frame)) {
-            atomic_store(&vc->disp_new_frame, 0);
-    vc->main_slot = -1;
-    vc->pinned_slot = -1;
-            vc_render_frame(vc);
-        } else {
-            msleep(16);
-        }
-    }
-
-    video_display_close(vc->display);
-    vc->display = NULL;
-
-#ifdef _WIN32
-    return 0;
-#else
-    return NULL;
-#endif
-}
 
 /* ===== Audio initialization ===== */
 
