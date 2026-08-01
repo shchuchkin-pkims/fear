@@ -8,7 +8,7 @@
 #include <string.h>
 #include <time.h>
 
-/** K_room generation on the wire. Zero until rotation bundles land. */
+/** K_room generation used when the caller has not been told otherwise. */
 #define CF_KEY_VERSION 0
 
 const char *cf_strerror(cf_status_t st) {
@@ -59,13 +59,15 @@ static size_t cf_ad(const char *room, const char *name,
 /** Room and name are bounded by the frame format; 1 KiB covers both twice. */
 #define CF_AD_MAX 1024
 
-cf_status_t cf_seal_at(const uint8_t k_room[KS_KEY_BYTES],
+cf_status_t cf_seal_at(const cf_key_t *key,
                        const char *room, const char *name,
                        const uint8_t *plain, size_t plen,
                        const uint8_t nonce[CF_NONCE_BYTES],
-                       uint16_t key_version, uint32_t epoch,
+                       uint32_t epoch,
                        uint8_t *out, size_t out_cap, size_t *out_len) {
-    if (!k_room || !room || !name || !nonce || !out || !out_len) return CF_ERR_ARGS;
+    if (!key || !room || !name || !nonce || !out || !out_len) return CF_ERR_ARGS;
+    uint16_t key_version = key->version;
+    const uint8_t *k_room = key->key;
     if (plen > 0 && !plain) return CF_ERR_ARGS;
     if (out_cap < plen + CF_OVERHEAD_BYTES) return CF_ERR_SPACE;
 
@@ -94,23 +96,24 @@ cf_status_t cf_seal_at(const uint8_t k_room[KS_KEY_BYTES],
     return CF_OK;
 }
 
-cf_status_t cf_seal(const uint8_t k_room[KS_KEY_BYTES],
+cf_status_t cf_seal(const cf_key_t *key,
                     const char *room, const char *name,
                     const uint8_t *plain, size_t plen,
                     const uint8_t nonce[CF_NONCE_BYTES],
                     uint8_t *out, size_t out_cap, size_t *out_len) {
     uint32_t epoch = ks_epoch_from_unix((uint64_t)time(NULL));
-    return cf_seal_at(k_room, room, name, plain, plen, nonce,
-                      CF_KEY_VERSION, epoch, out, out_cap, out_len);
+    return cf_seal_at(key, room, name, plain, plen, nonce,
+                      epoch, out, out_cap, out_len);
 }
 
-cf_status_t cf_open_at(const uint8_t k_room[KS_KEY_BYTES],
+cf_status_t cf_open_at(const cf_key_t *keys, size_t nkeys,
                        const char *room, const char *name,
                        const uint8_t *sealed, size_t sealed_len,
                        const uint8_t nonce[CF_NONCE_BYTES],
                        uint32_t local_epoch,
                        uint8_t *out, size_t out_cap, size_t *out_len) {
-    if (!k_room || !room || !name || !sealed || !nonce || !out || !out_len) {
+    if (!keys || nkeys == 0 || !room || !name || !sealed || !nonce ||
+        !out || !out_len) {
         return CF_ERR_ARGS;
     }
     if (sealed_len < KS_HEADER_BYTES + CF_TAG_BYTES) return CF_ERR_TOO_SHORT;
@@ -122,8 +125,14 @@ cf_status_t cf_open_at(const uint8_t k_room[KS_KEY_BYTES],
     uint32_t epoch = 0;
     ks_read_header(sealed, &version, &epoch);
 
-    /* Both checks come before the derivation on purpose. */
-    if (version != CF_KEY_VERSION) return CF_ERR_VERSION;
+    /* Both checks come before the derivation on purpose: an attacker who can
+     * name a generation or an epoch should not be able to make us derive
+     * anything at all. */
+    const uint8_t *k_room = NULL;
+    for (size_t i = 0; i < nkeys; i++) {
+        if (keys[i].version == version) { k_room = keys[i].key; break; }
+    }
+    if (!k_room) return CF_ERR_VERSION;
     if (!ks_epoch_acceptable(epoch, local_epoch)) return CF_ERR_EPOCH;
 
     uint8_t ad[CF_AD_MAX];
@@ -148,12 +157,12 @@ cf_status_t cf_open_at(const uint8_t k_room[KS_KEY_BYTES],
     return CF_OK;
 }
 
-cf_status_t cf_open(const uint8_t k_room[KS_KEY_BYTES],
+cf_status_t cf_open(const cf_key_t *keys, size_t nkeys,
                     const char *room, const char *name,
                     const uint8_t *sealed, size_t sealed_len,
                     const uint8_t nonce[CF_NONCE_BYTES],
                     uint8_t *out, size_t out_cap, size_t *out_len) {
     uint32_t local = ks_epoch_from_unix((uint64_t)time(NULL));
-    return cf_open_at(k_room, room, name, sealed, sealed_len, nonce,
+    return cf_open_at(keys, nkeys, room, name, sealed, sealed_len, nonce,
                       local, out, out_cap, out_len);
 }

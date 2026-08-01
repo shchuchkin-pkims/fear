@@ -42,6 +42,10 @@ int main(void) {
     uint8_t k_room[KS_KEY_BYTES];
     for (size_t i = 0; i < sizeof k_room; i++) k_room[i] = (uint8_t)i;
 
+    cf_key_t v0;
+    v0.version = 0;
+    memcpy(v0.key, k_room, sizeof k_room);
+
     uint8_t nonce[CF_NONCE_BYTES];
     for (size_t i = 0; i < sizeof nonce; i++) nonce[i] = (uint8_t)(0xA0 + i);
 
@@ -50,8 +54,8 @@ int main(void) {
     size_t sealed_len = 0;
 
     /* --- the vector ------------------------------------------------------ */
-    CHECK(cf_seal_at(k_room, kRoom, kName, (const uint8_t *)kPlain, plen,
-                     nonce, 0, EPOCH, sealed, sizeof sealed, &sealed_len) == CF_OK);
+    CHECK(cf_seal_at(&v0, kRoom, kName, (const uint8_t *)kPlain, plen,
+                     nonce, EPOCH, sealed, sizeof sealed, &sealed_len) == CF_OK);
     CHECK(sealed_len == KS_HEADER_BYTES + plen + CF_TAG_BYTES);
 
     char hex[2 * sizeof sealed + 1];
@@ -68,19 +72,19 @@ int main(void) {
     /* --- round trip ------------------------------------------------------ */
     uint8_t opened[256];
     size_t olen = 0;
-    CHECK(cf_open_at(k_room, kRoom, kName, sealed, sealed_len, nonce, EPOCH,
+    CHECK(cf_open_at(&v0, 1, kRoom, kName, sealed, sealed_len, nonce, EPOCH,
                      opened, sizeof opened, &olen) == CF_OK);
     CHECK(olen == plen);
     CHECK(memcmp(opened, kPlain, plen) == 0);
 
     /* One epoch either way is skew; anything further is a replay. */
-    CHECK(cf_open_at(k_room, kRoom, kName, sealed, sealed_len, nonce, EPOCH + 1,
+    CHECK(cf_open_at(&v0, 1, kRoom, kName, sealed, sealed_len, nonce, EPOCH + 1,
                      opened, sizeof opened, &olen) == CF_OK);
-    CHECK(cf_open_at(k_room, kRoom, kName, sealed, sealed_len, nonce, EPOCH - 1,
+    CHECK(cf_open_at(&v0, 1, kRoom, kName, sealed, sealed_len, nonce, EPOCH - 1,
                      opened, sizeof opened, &olen) == CF_OK);
-    CHECK(cf_open_at(k_room, kRoom, kName, sealed, sealed_len, nonce, EPOCH + 2,
+    CHECK(cf_open_at(&v0, 1, kRoom, kName, sealed, sealed_len, nonce, EPOCH + 2,
                      opened, sizeof opened, &olen) == CF_ERR_EPOCH);
-    CHECK(cf_open_at(k_room, kRoom, kName, sealed, sealed_len, nonce, EPOCH - 2,
+    CHECK(cf_open_at(&v0, 1, kRoom, kName, sealed, sealed_len, nonce, EPOCH - 2,
                      opened, sizeof opened, &olen) == CF_ERR_EPOCH);
 
     /* --- the header is authenticated, not merely carried ----------------- */
@@ -88,37 +92,68 @@ int main(void) {
         uint8_t evil[sizeof sealed];
         memcpy(evil, sealed, sealed_len);
         evil[2] ^= 0x01;   /* a neighbouring epoch, still inside the skew */
-        CHECK(cf_open_at(k_room, kRoom, kName, evil, sealed_len, nonce, EPOCH,
+        CHECK(cf_open_at(&v0, 1, kRoom, kName, evil, sealed_len, nonce, EPOCH,
                          opened, sizeof opened, &olen) == CF_ERR_AUTH);
 
         memcpy(evil, sealed, sealed_len);
         evil[0] ^= 0x01;   /* a K_room generation we do not have */
-        CHECK(cf_open_at(k_room, kRoom, kName, evil, sealed_len, nonce, EPOCH,
+        CHECK(cf_open_at(&v0, 1, kRoom, kName, evil, sealed_len, nonce, EPOCH,
                          opened, sizeof opened, &olen) == CF_ERR_VERSION);
     }
 
     /* The room and the sender are bound too: a relay cannot re-address a
      * message into another room or under another name. */
-    CHECK(cf_open_at(k_room, "other", kName, sealed, sealed_len, nonce, EPOCH,
+    CHECK(cf_open_at(&v0, 1, "other", kName, sealed, sealed_len, nonce, EPOCH,
                      opened, sizeof opened, &olen) == CF_ERR_AUTH);
-    CHECK(cf_open_at(k_room, kRoom, "mallory", sealed, sealed_len, nonce, EPOCH,
+    CHECK(cf_open_at(&v0, 1, kRoom, "mallory", sealed, sealed_len, nonce, EPOCH,
                      opened, sizeof opened, &olen) == CF_ERR_AUTH);
 
     /* --- refusals -------------------------------------------------------- */
-    CHECK(cf_open_at(k_room, kRoom, kName, sealed, KS_HEADER_BYTES, nonce, EPOCH,
+    CHECK(cf_open_at(&v0, 1, kRoom, kName, sealed, KS_HEADER_BYTES, nonce, EPOCH,
                      opened, sizeof opened, &olen) == CF_ERR_TOO_SHORT);
-    CHECK(cf_seal_at(k_room, kRoom, kName, (const uint8_t *)kPlain, plen, nonce,
-                     0, EPOCH, sealed, plen, &sealed_len) == CF_ERR_SPACE);
+    CHECK(cf_seal_at(&v0, kRoom, kName, (const uint8_t *)kPlain, plen, nonce,
+                     EPOCH, sealed, plen, &sealed_len) == CF_ERR_SPACE);
 
     /* A different K_room derives a different epoch key, so the tag fails. */
     {
-        uint8_t other[KS_KEY_BYTES];
-        memcpy(other, k_room, sizeof other);
-        other[0] ^= 0x01;
-        CHECK(cf_seal_at(k_room, kRoom, kName, (const uint8_t *)kPlain, plen,
-                         nonce, 0, EPOCH, sealed, sizeof sealed, &sealed_len) == CF_OK);
-        CHECK(cf_open_at(other, kRoom, kName, sealed, sealed_len, nonce, EPOCH,
+        cf_key_t other_key;
+        other_key.version = 0;
+        memcpy(other_key.key, k_room, sizeof other_key.key);
+        other_key.key[0] ^= 0x01;
+        CHECK(cf_seal_at(&v0, kRoom, kName, (const uint8_t *)kPlain, plen,
+                         nonce, EPOCH, sealed, sizeof sealed, &sealed_len) == CF_OK);
+        CHECK(cf_open_at(&other_key, 1, kRoom, kName, sealed, sealed_len, nonce, EPOCH,
                          opened, sizeof opened, &olen) == CF_ERR_AUTH);
+    }
+
+    /* --- more than one generation held at once --------------------------- */
+    {
+        cf_key_t ring[CF_MAX_KEYS];
+        ring[0].version = 1;
+        memcpy(ring[0].key, k_room, KS_KEY_BYTES);
+        ring[0].key[0] ^= 0xFF;          /* a different generation entirely */
+        ring[1] = v0;
+
+        /* Sealed under 0, opened by a receiver whose current generation is 1
+         * and who still holds 0. This is the message that was in flight when
+         * the room rotated. */
+        CHECK(cf_seal_at(&v0, kRoom, kName, (const uint8_t *)kPlain, plen,
+                         nonce, EPOCH, sealed, sizeof sealed, &sealed_len) == CF_OK);
+        CHECK(cf_open_at(ring, 2, kRoom, kName, sealed, sealed_len, nonce, EPOCH,
+                         opened, sizeof opened, &olen) == CF_OK);
+        CHECK(olen == plen && memcmp(opened, kPlain, plen) == 0);
+
+        /* Once generation 0 is dropped, the same frame is unreadable - which
+         * is the whole point of dropping it. */
+        CHECK(cf_open_at(ring, 1, kRoom, kName, sealed, sealed_len, nonce, EPOCH,
+                         opened, sizeof opened, &olen) == CF_ERR_VERSION);
+
+        /* And a generation we hold still has to authenticate. */
+        CHECK(cf_seal_at(&ring[0], kRoom, kName, (const uint8_t *)kPlain, plen,
+                         nonce, EPOCH, sealed, sizeof sealed, &sealed_len) == CF_OK);
+        CHECK(sealed[0] == 0x01 && sealed[1] == 0x00);      /* version 1, LE */
+        CHECK(cf_open_at(ring, 2, kRoom, kName, sealed, sealed_len, nonce, EPOCH,
+                         opened, sizeof opened, &olen) == CF_OK);
     }
 
     printf("test_chat_frame: OK\n");

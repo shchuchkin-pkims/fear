@@ -111,7 +111,13 @@ static void feed(const uint8_t *buf, size_t len,
 
     uint8_t nonce[CF_NONCE_BYTES];
     memset(nonce, 0x5A, sizeof nonce);
-    (void)cf_open_at(k_room, "live", "peer", buf, len, nonce, 0,
+    cf_key_t ring[2];
+    ring[0].version = 0;
+    memcpy(ring[0].key, k_room, KS_KEY_BYTES);
+    ring[1].version = 1;
+    memcpy(ring[1].key, k_room, KS_KEY_BYTES);
+    ring[1].key[0] ^= 0xFF;
+    (void)cf_open_at(ring, 2, "live", "peer", buf, len, nonce, 0,
                      out, sizeof out, &out_len);
 
     check_frame_contract(buf, len);

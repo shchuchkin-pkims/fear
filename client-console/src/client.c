@@ -114,6 +114,10 @@ static uint8_t g_identity_pk[IDENTITY_PK_BYTES];
 static uint8_t g_identity_sk[IDENTITY_SK_BYTES];
 static char g_known_keys_path[512];
 
+/* Defined below with the sealing helpers; the file's first sender is above
+ * it and needs the declaration. */
+static void chat_keyring(const uint8_t *k_room, cf_key_t *out);
+
 /* Forward declarations for signed message functions */
 static int send_signed_file_message(sock_t s, const char *room, const char *name,
                                     const uint8_t *key, message_type_t type,
@@ -505,7 +509,9 @@ int send_file_message(sock_t s, const char *room, const char *name,
     if (!cipher) { free(payload); return -1; }
     
     size_t clen = 0;
-    if (cf_seal(key, room, name, payload, payload_len, nonce, cipher, cmax, &clen) != CF_OK) {
+    cf_key_t ck;
+    chat_keyring(key, &ck);
+    if (cf_seal(&ck, room, name, payload, payload_len, nonce, cipher, cmax, &clen) != CF_OK) {
         free(cipher); free(payload);
         return -1;
     }
@@ -997,6 +1003,17 @@ static void handle_invite_command(const char *arg, sock_t s,
     fflush(stdout);
 }
 
+/**
+ * The room key as a generation. There is one for now and its version is zero;
+ * rotation is what will make this a real lookup, and everything that reads a
+ * frame already takes a set rather than a key so that day changes callers
+ * here and nothing below them.
+ */
+static void chat_keyring(const uint8_t *k_room, cf_key_t *out) {
+    out->version = 0;
+    memcpy(out->key, k_room, KS_KEY_BYTES);
+}
+
 int send_ciphertext_typed(sock_t s, const char *room, const char *name, const uint8_t *key,
                    const uint8_t *plaintext, size_t plen, uint8_t msg_type) {
     uint16_t room_len = (uint16_t)strlen(room);
@@ -1011,7 +1028,9 @@ int send_ciphertext_typed(sock_t s, const char *room, const char *name, const ui
     if (!cipher) return -1;
 
     size_t clen = 0;
-    if (cf_seal(key, room, name, plaintext, plen, nonce, cipher, cmax, &clen) != CF_OK) {
+    cf_key_t ck;
+    chat_keyring(key, &ck);
+    if (cf_seal(&ck, room, name, plaintext, plen, nonce, cipher, cmax, &clen) != CF_OK) {
         free(cipher);
         return -1;
     }
@@ -1082,7 +1101,9 @@ static int send_signed_ciphertext(sock_t s, const char *room, const char *name,
     if (!cipher) { free(signed_plain); return -1; }
 
     size_t clen = 0;
-    if (cf_seal(key, room, name, signed_plain, signed_plen, nonce, cipher, cmax, &clen) != CF_OK) {
+    cf_key_t ck;
+    chat_keyring(key, &ck);
+    if (cf_seal(&ck, room, name, signed_plain, signed_plen, nonce, cipher, cmax, &clen) != CF_OK) {
         free(cipher); free(signed_plain);
         return -1;
     }
@@ -1133,7 +1154,9 @@ static int send_identity_announce(sock_t s, const char *room, const char *name,
     if (!cipher) { return -1; }
 
     size_t clen = 0;
-    if (cf_seal(key, room, name, plain, plen, nonce, cipher, cmax, &clen) != CF_OK) {
+    cf_key_t ck;
+    chat_keyring(key, &ck);
+    if (cf_seal(&ck, room, name, plain, plen, nonce, cipher, cmax, &clen) != CF_OK) {
         free(cipher);
         return -1;
     }
@@ -1223,7 +1246,9 @@ static int send_signed_file_message(sock_t s, const char *room, const char *name
     if (!cipher) { free(signed_plain); return -1; }
 
     size_t clen = 0;
-    if (cf_seal(key, room, name, signed_plain, signed_plen, nonce, cipher, cmax, &clen) != CF_OK) {
+    cf_key_t ck;
+    chat_keyring(key, &ck);
+    if (cf_seal(&ck, room, name, signed_plain, signed_plen, nonce, cipher, cmax, &clen) != CF_OK) {
         free(cipher); free(signed_plain);
         return -1;
     }
@@ -1329,7 +1354,9 @@ int recv_and_decrypt(sock_t s, const char *room, const uint8_t *key, const char 
          * anything, and binds those six bytes into the additional data so a
          * relay cannot move the message to another epoch. */
         size_t opened = 0;
-        cf_status_t st = cf_open(key, room_in, name, cipher, clen, nonce,
+        cf_key_t ck;
+        chat_keyring(key, &ck);
+        cf_status_t st = cf_open(&ck, 1, room_in, name, cipher, clen, nonce,
                                  plain, clen, &opened);
         ok = (st == CF_OK) ? 0 : -1;
         plen = (unsigned long long)opened;

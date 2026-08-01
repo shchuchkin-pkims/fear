@@ -28,6 +28,11 @@
  * K_epoch never reaches storage. It is not forward secrecy on its own -
  * anyone holding K_room derives every epoch. That needs rotation on a
  * membership change and the old K_room actually destroyed.
+ *
+ * key_version names the K_room generation. It is still zero everywhere until
+ * rotation bundles land, but the plumbing takes a set of generations now
+ * rather than one key, because the moment rotation exists a receiver has to
+ * be able to read the messages that were already on their way.
  */
 #ifndef FEAR_CHAT_FRAME_H
 #define FEAR_CHAT_FRAME_H
@@ -50,6 +55,24 @@ extern "C" {
 /** Bytes a sealed payload adds to the plaintext. */
 #define CF_OVERHEAD_BYTES (KS_HEADER_BYTES + CF_TAG_BYTES)
 
+/**
+ * One generation of K_room.
+ *
+ * Sealing takes exactly one - the current generation, never an old one.
+ * Opening takes a small set, because a rotation does not stop the messages
+ * already in flight under the generation it replaces: they arrive after it
+ * and would be refused by a receiver that had already forgotten how to read
+ * them. Two is enough for that, and holding more would be keeping keys alive
+ * for no reason anyone can point at.
+ */
+typedef struct {
+    uint16_t version;
+    uint8_t  key[KS_KEY_BYTES];
+} cf_key_t;
+
+/** Generations a receiver may hold at once. */
+#define CF_MAX_KEYS 2
+
 /** One value per rejection, so a dropped frame can say why. */
 typedef enum {
     CF_OK = 0,
@@ -71,15 +94,15 @@ const char *cf_strerror(cf_status_t st);
  *
  * @param out_cap must be at least plen + CF_OVERHEAD_BYTES
  */
-cf_status_t cf_seal_at(const uint8_t k_room[KS_KEY_BYTES],
+cf_status_t cf_seal_at(const cf_key_t *key,
                        const char *room, const char *name,
                        const uint8_t *plain, size_t plen,
                        const uint8_t nonce[CF_NONCE_BYTES],
-                       uint16_t key_version, uint32_t epoch,
+                       uint32_t epoch,
                        uint8_t *out, size_t out_cap, size_t *out_len);
 
 /** Seal for the current hour and the current K_room generation. */
-cf_status_t cf_seal(const uint8_t k_room[KS_KEY_BYTES],
+cf_status_t cf_seal(const cf_key_t *key,
                     const char *room, const char *name,
                     const uint8_t *plain, size_t plen,
                     const uint8_t nonce[CF_NONCE_BYTES],
@@ -93,7 +116,7 @@ cf_status_t cf_seal(const uint8_t k_room[KS_KEY_BYTES],
  * number of keys, and a message from days ago is a replay however well it
  * authenticates.
  */
-cf_status_t cf_open_at(const uint8_t k_room[KS_KEY_BYTES],
+cf_status_t cf_open_at(const cf_key_t *keys, size_t nkeys,
                        const char *room, const char *name,
                        const uint8_t *sealed, size_t sealed_len,
                        const uint8_t nonce[CF_NONCE_BYTES],
@@ -101,7 +124,7 @@ cf_status_t cf_open_at(const uint8_t k_room[KS_KEY_BYTES],
                        uint8_t *out, size_t out_cap, size_t *out_len);
 
 /** Open, taking the local epoch from the clock. */
-cf_status_t cf_open(const uint8_t k_room[KS_KEY_BYTES],
+cf_status_t cf_open(const cf_key_t *keys, size_t nkeys,
                     const char *room, const char *name,
                     const uint8_t *sealed, size_t sealed_len,
                     const uint8_t nonce[CF_NONCE_BYTES],
