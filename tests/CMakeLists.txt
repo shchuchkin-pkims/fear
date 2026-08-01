@@ -50,7 +50,9 @@ add_fear_test(test_chat_frame   test_chat_frame.c   ${IDENTITY_DIR}/chat_frame.c
 add_fear_test(fuzz_parsers fuzz_parsers.c
     ${IDENTITY_DIR}/media_hello.c ${IDENTITY_DIR}/media_keys.c
     ${IDENTITY_DIR}/media_packet.c ${IDENTITY_DIR}/call_invite.c
-    ${IDENTITY_DIR}/chat_frame.c ${IDENTITY_DIR}/key_schedule.c)
+    ${IDENTITY_DIR}/chat_frame.c ${IDENTITY_DIR}/key_schedule.c
+    ${CMAKE_SOURCE_DIR}/client-console/src/common.c)
+target_include_directories(fuzz_parsers PRIVATE ${CMAKE_SOURCE_DIR}/client-console/include)
 # check_c_compiler_flag only compiles, and these flags need the runtime at
 # link time - it reported success while the binary came out without a trace
 # of a sanitizer in it.

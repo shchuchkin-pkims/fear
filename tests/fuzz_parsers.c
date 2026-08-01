@@ -36,6 +36,7 @@
 #include "media_hello.h"
 #include "media_keys.h"
 #include "media_packet.h"
+#include "common.h"
 
 /** xorshift64*, so the sequence is ours and not the C library's. */
 static uint64_t g_state = 0x2545F4914F6CDD1DULL;
@@ -52,6 +53,41 @@ static uint32_t rnd_below(uint32_t n) {
 }
 
 #define MAX_INPUT 4096
+
+/**
+ * The server's frame header, and the contract its callers depend on.
+ *
+ * Checking that it returned is not enough here: every caller takes the
+ * pointers it hands back and reads through them, so what matters is that on
+ * success each one lies inside the buffer. That is the property a bad length
+ * check would break, and it would break it silently - the parse would
+ * "succeed" and the caller would walk off the end.
+ */
+static unsigned long g_frames_parsed = 0;
+
+static void check_frame_contract(const uint8_t *buf, size_t len) {
+    fear_frame_t f;
+    if (fear_frame_parse(buf, len, &f) != 0) return;
+    g_frames_parsed++;
+
+    const uint8_t *end = buf + len;
+    const struct { const uint8_t *p; size_t n; const char *what; } views[] = {
+        { (const uint8_t *)f.room,    f.room_len,    "room"    },
+        { (const uint8_t *)f.name,    f.name_len,    "name"    },
+        { f.nonce,                    f.nonce_len,   "nonce"   },
+        { f.payload,                  f.payload_len, "payload" },
+    };
+
+    for (size_t i = 0; i < sizeof views / sizeof views[0]; i++) {
+        if (views[i].p < buf || views[i].p > end ||
+            (size_t)(end - views[i].p) < views[i].n) {
+            fprintf(stderr,
+                    "fuzz_parsers: %s escapes the buffer (len=%zu, off=%td, n=%zu)\n",
+                    views[i].what, len, views[i].p - buf, views[i].n);
+            abort();
+        }
+    }
+}
 
 /** Every parser under test, given one buffer. */
 static void feed(const uint8_t *buf, size_t len,
@@ -77,6 +113,45 @@ static void feed(const uint8_t *buf, size_t len,
     memset(nonce, 0x5A, sizeof nonce);
     (void)cf_open_at(k_room, "live", "peer", buf, len, nonce, 0,
                      out, sizeof out, &out_len);
+
+    check_frame_contract(buf, len);
+}
+
+/**
+ * A server frame that parses, so mutations start from somewhere plausible.
+ *
+ * Random bytes do not reach fear_frame_parse's body: the first length it
+ * reads has to be small enough for the buffer, and by chance it is not. The
+ * interesting inputs are the ones where a length is *almost* right.
+ *
+ *     [room_len(2)][room][name_len(2)][name][nonce_len(2)][nonce]
+ *     [type(1)][payload_len(4)][payload]
+ */
+static size_t build_frame(uint8_t *out, size_t cap) {
+    static const char room[] = "live";
+    static const char name[] = "pc";
+    const size_t room_len = sizeof room - 1;
+    const size_t name_len = sizeof name - 1;
+    const size_t nonce_len = 12;
+    const size_t payload_len = 24;
+
+    size_t need = 2 + room_len + 2 + name_len + 2 + nonce_len + 1 + 4 + payload_len;
+    if (need > cap) return 0;
+
+    uint8_t *w = out;
+    *w++ = (uint8_t)(room_len & 0xFF); *w++ = (uint8_t)(room_len >> 8);
+    memcpy(w, room, room_len); w += room_len;
+    *w++ = (uint8_t)(name_len & 0xFF); *w++ = (uint8_t)(name_len >> 8);
+    memcpy(w, name, name_len); w += name_len;
+    *w++ = (uint8_t)(nonce_len & 0xFF); *w++ = (uint8_t)(nonce_len >> 8);
+    memset(w, 0x11, nonce_len); w += nonce_len;
+    *w++ = 0x01;
+    *w++ = (uint8_t)(payload_len & 0xFF);
+    *w++ = (uint8_t)((payload_len >> 8) & 0xFF);
+    *w++ = (uint8_t)((payload_len >> 16) & 0xFF);
+    *w++ = (uint8_t)((payload_len >> 24) & 0xFF);
+    memset(w, 0x22, payload_len);
+    return need;
 }
 
 /** A HELLO2 that would parse, so mutations start from somewhere plausible. */
@@ -123,12 +198,35 @@ int main(int argc, char **argv) {
     uint8_t seed_hello[MH_SIZE_SIGNED];
     size_t seed_hello_len = build_hello(seed_hello, sizeof seed_hello, hello_key, call_id);
 
+    uint8_t seed_frame[128];
+    size_t seed_frame_len = build_frame(seed_frame, sizeof seed_frame);
+
     uint8_t buf[MAX_INPUT];
 
     for (unsigned long i = 0; i < rounds; i++) {
         size_t len;
 
-        if (seed_hello_len && (i % 3) != 0) {
+        if (seed_frame_len && (i % 3) == 1) {
+            /* Near-valid server frame. Its lengths are what the parser has to
+             * survive being lied to about. */
+            len = seed_frame_len;
+            memcpy(buf, seed_frame, len);
+
+            if ((rnd() & 3) == 0) {
+                len = rnd_below((uint32_t)seed_frame_len + 8);
+                if (len > sizeof buf) len = sizeof buf;
+            }
+
+            unsigned flips = 1 + rnd_below(5);
+            for (unsigned f = 0; f < flips && len; f++) {
+                /* Weighted towards the length fields, which is where a parser
+                 * gets walked off the end if it is going to be. */
+                size_t at = ((rnd() & 1) && len > 12)
+                            ? rnd_below(12)
+                            : rnd_below((uint32_t)len);
+                buf[at] ^= (uint8_t)(1u << rnd_below(8));
+            }
+        } else if (seed_hello_len && (i % 3) != 0) {
             /* Near-valid: a packet that parses, with a few bytes disturbed.
              * This is the case that reaches past the first length check. */
             len = seed_hello_len;
@@ -163,6 +261,13 @@ int main(int argc, char **argv) {
         feed(buf, len, hello_key, k_call, k_room);
     }
 
-    printf("fuzz_parsers: %lu inputs, no crash\n", rounds);
+    printf("fuzz_parsers: %lu inputs, %lu reached the frame parser's body, no crash\n",
+           rounds, g_frames_parsed);
+    if (g_frames_parsed == 0) {
+        /* Then the target was never actually exercised, and a clean run means
+         * nothing. Better to fail than to report a success it did not earn. */
+        fprintf(stderr, "fuzz_parsers: no input ever parsed as a frame\n");
+        return 1;
+    }
     return 0;
 }

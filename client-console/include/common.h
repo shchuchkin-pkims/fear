@@ -201,6 +201,43 @@ int b64_decode(const char *b64, uint8_t *out, size_t outlen);
 uint32_t crc32(const uint8_t *data, size_t len);
 
 /* AES-256-GCM encryption/decryption (AEAD) */
+/**
+ * @struct fear_frame_t
+ * @brief One frame's header, as views into the caller's buffer
+ *
+ * Nothing is copied: every pointer here is inside the buffer passed to
+ * fear_frame_parse, and stays valid only as long as it does.
+ */
+typedef struct {
+    const char    *room;
+    uint16_t       room_len;
+    const char    *name;
+    uint16_t       name_len;
+    const uint8_t *nonce;
+    uint16_t       nonce_len;
+    uint8_t        type;
+    const uint8_t *payload;
+    uint32_t       payload_len;
+} fear_frame_t;
+
+/**
+ * @brief Parse a frame header
+ * @param frame Buffer as received
+ * @param flen Its length
+ * @param out Receives views into `frame`
+ * @return 0 if the buffer holds everything it declares, -1 otherwise
+ *
+ * This is the only place the offsets are worked out. Every field length in a
+ * frame is chosen by whoever sent it, and the server reads frames from anyone
+ * who can connect, before a single byte has been authenticated. Two copies of
+ * that arithmetic is one copy too many: they were identical here for a while,
+ * which is luck rather than design.
+ *
+ * On success every pointer and length in `out` lies inside `frame`. The fuzz
+ * target checks exactly that, because it is what the callers rely on.
+ */
+int fear_frame_parse(const uint8_t *frame, size_t flen, fear_frame_t *out);
+
 int aes_gcm_encrypt(const uint8_t *plaintext, size_t plaintext_len,
                    const uint8_t *additional_data, size_t additional_data_len,
                    const uint8_t *nonce, const uint8_t *key,

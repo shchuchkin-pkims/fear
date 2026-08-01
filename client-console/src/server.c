@@ -403,20 +403,13 @@ static void send_blob_result(sock_t fd, const char *room, uint16_t room_len,
  */
 static int try_handle_command(client_t *cl, const uint8_t *frame, size_t flen) {
     sock_t fd = cl->fd;
-    if (flen < 2) return 0;
-    uint16_t room_len = rd_u16(frame);
-    if (flen < (size_t)2 + room_len + 2) return 0;
-    uint16_t name_len = rd_u16(frame + 2 + room_len);
-    size_t off = 2 + room_len + 2 + name_len;
-    if (flen < off + 2) return 0;
-    uint16_t nonce_len = rd_u16(frame + off);
-    off += 2 + nonce_len;
-    if (flen < off + 1 + 4) return 0;
-    uint8_t  type = frame[off];
-    uint32_t clen = rd_u32(frame + off + 1);
-    if (flen < off + 5 + clen) return 0;
-    const uint8_t *cipher = frame + off + 5;
-    const char    *room   = (const char *)(frame + 2);
+    fear_frame_t fv;
+    if (fear_frame_parse(frame, flen, &fv) != 0) return 0;
+    uint16_t       room_len = fv.room_len;
+    uint8_t        type     = fv.type;
+    uint32_t       clen     = fv.payload_len;
+    const uint8_t *cipher   = fv.payload;
+    const char    *room     = fv.room;
 
     if (type == MSG_TYPE_REGISTER_HANDLE) {
         /* payload: [pk(32)][sig(64)][handle_len(1)][handle UTF-8] */
@@ -734,19 +727,11 @@ static int try_handle_command(client_t *cl, const uint8_t *frame, size_t flen) {
 static int try_room_command(sock_t fd,
                             const uint8_t *frame, size_t flen,
                             const client_t *clients, int nclients) {
-    if (flen < 2) return 0;
-    uint16_t room_len = rd_u16(frame);
-    if (flen < (size_t)2 + room_len + 2) return 0;
-    uint16_t name_len = rd_u16(frame + 2 + room_len);
-    size_t off = 2 + room_len + 2 + name_len;
-    if (flen < off + 2) return 0;
-    uint16_t nonce_len = rd_u16(frame + off);
-    off += 2 + nonce_len;
-    if (flen < off + 1 + 4) return 0;
-    uint8_t  type = frame[off];
-    /* clen unused but parsed for consistency with try_handle_command */
-    (void)rd_u32(frame + off + 1);
-    const char *room = (const char *)(frame + 2);
+    fear_frame_t fv;
+    if (fear_frame_parse(frame, flen, &fv) != 0) return 0;
+    uint16_t    room_len = fv.room_len;
+    uint8_t     type     = fv.type;
+    const char *room     = fv.room;
 
     if (type == MSG_TYPE_PING) {
         /* No reply needed — caller already bumped last_seen on read_frame. */

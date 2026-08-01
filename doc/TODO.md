@@ -124,8 +124,11 @@
 - [x] Fuzzing the parsers that read the network before anything is trusted -
       HELLO2, the call invite, the media packet header, the sealed chat frame.
       Deterministic driver under ASan/UBSan, bounded in CI, 100M inputs over
-      five seeds locally with nothing found. Still open: server.c and
-      client.c frame handling, which need a harness that owns a socket.
+      five seeds locally with nothing found. The server frame header joined
+      them once both of its parsers were merged into one; the fuzzer checks
+      that every view it returns lies inside the buffer, not merely that it
+      returned. Still open: client.c, which reads field by field from a
+      socket and needs a harness that owns one.
 - [ ] One UI instead of two (ChatWindow vs the legacy MainWindow)
 
 ### Features

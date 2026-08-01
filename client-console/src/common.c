@@ -217,6 +217,44 @@ uint32_t crc32(const uint8_t *data, size_t len) {
  * @note Nonce must NEVER be reused with the same key (use randombytes_buf)
  * @note Additional data is authenticated but sent in plaintext (metadata)
  */
+int fear_frame_parse(const uint8_t *frame, size_t flen, fear_frame_t *out) {
+    if (!frame || !out) return -1;
+
+    /* Each length is read only after the bytes carrying it are known to be
+     * present, and each field is claimed only after the bytes it declares
+     * are. size_t arithmetic throughout: room_len and name_len are 16 bit and
+     * payload_len is 32, so no sum here can wrap on any target we build for. */
+    if (flen < 2) return -1;
+    uint16_t room_len = rd_u16(frame);
+
+    if (flen < (size_t)2 + room_len + 2) return -1;
+    uint16_t name_len = rd_u16(frame + 2 + room_len);
+
+    size_t off = (size_t)2 + room_len + 2 + name_len;
+    if (flen < off + 2) return -1;
+    uint16_t nonce_len = rd_u16(frame + off);
+
+    size_t nonce_at = off + 2;
+    off = nonce_at + nonce_len;
+    if (flen < off + 1 + 4) return -1;
+
+    uint8_t type = frame[off];
+    uint32_t payload_len = rd_u32(frame + off + 1);
+    size_t payload_at = off + 5;
+    if (flen < payload_at + payload_len) return -1;
+
+    out->room        = (const char *)(frame + 2);
+    out->room_len    = room_len;
+    out->name        = (const char *)(frame + 2 + room_len + 2);
+    out->name_len    = name_len;
+    out->nonce       = frame + nonce_at;
+    out->nonce_len   = nonce_len;
+    out->type        = type;
+    out->payload     = frame + payload_at;
+    out->payload_len = payload_len;
+    return 0;
+}
+
 int aes_gcm_encrypt(const uint8_t *plaintext, size_t plaintext_len,
                    const uint8_t *additional_data, size_t additional_data_len,
                    const uint8_t *nonce, const uint8_t *key,
