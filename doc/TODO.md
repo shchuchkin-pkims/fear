@@ -121,7 +121,11 @@
 
 ### Quality
 - [ ] Load testing for server and calls
-- [ ] Fuzzing the frame parsers (server.c, client.c, media decrypt glue)
+- [x] Fuzzing the parsers that read the network before anything is trusted -
+      HELLO2, the call invite, the media packet header, the sealed chat frame.
+      Deterministic driver under ASan/UBSan, bounded in CI, 100M inputs over
+      five seeds locally with nothing found. Still open: server.c and
+      client.c frame handling, which need a harness that owns a socket.
 - [ ] One UI instead of two (ChatWindow vs the legacy MainWindow)
 
 ### Features
