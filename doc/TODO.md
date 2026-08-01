@@ -120,7 +120,10 @@
 - [ ] TLS for TCP transport layer
 
 ### Quality
-- [ ] Load testing for server and calls
+- [x] Load testing for the server: tests/load_server.c, plus a regression test
+      that the connection caps hold (16 per address, 100 total - both measured
+      exactly). About 365k relayed frames/s with a full room of 100.
+      Still open: load testing the calls themselves.
 - [x] Fuzzing the parsers that read the network before anything is trusted -
       HELLO2, the call invite, the media packet header, the sealed chat frame.
       Deterministic driver under ASan/UBSan, bounded in CI, 100M inputs over

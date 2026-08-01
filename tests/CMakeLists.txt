@@ -97,6 +97,17 @@ if(TARGET video_call)
     set_tests_properties(video_loopback PROPERTIES TIMEOUT 120)
 endif()
 
+# Нагрузочный инструмент и регрессия на лимиты подключений. Пропускная
+# способность меряется вручную (см. tests/load_server.c), а тестом проверяется
+# только то, что детерминировано: сколько соединений переживает лимит.
+add_executable(load_server load_server.c)
+if(TARGET fear)
+    add_test(NAME server_caps
+             COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/server_caps.sh
+                     $<TARGET_FILE:fear> $<TARGET_FILE:load_server>)
+    set_tests_properties(server_caps PROPERTIES TIMEOUT 90)
+endif()
+
 # Протокольный тест M10: BLOB_GET доступен только владельцу pk (подписанный
 # challenge). Бинарь ходит на живой сервер через реальные sp_*-функции;
 # сервер поднимает обёртка blob_auth.sh.

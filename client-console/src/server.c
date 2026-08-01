@@ -1056,6 +1056,22 @@ void run_server(uint16_t port) {
                     nclients++;
                     printf("[server] new connection (%d total)\n", nclients);
                 } else {
+                    /* Full. The per-IP refusal above says so and this one did
+                     * not, so an operator whose users cannot connect found
+                     * nothing in the log to explain it.
+                     *
+                     * Rate limited because the condition that produces it is
+                     * exactly the condition under which it would repeat for
+                     * every retry of every client, and a log nobody can read
+                     * is no better than the silence it replaced. */
+                    static time_t last_full_log = 0;
+                    time_t now_full = time(NULL);
+                    if (now_full - last_full_log >= 10) {
+                        last_full_log = now_full;
+                        printf("[server] connection refused: server is full (%d/%d)\n",
+                               nclients, MAX_CLIENTS);
+                        fflush(stdout);
+                    }
                     close_socket(c);
                 }
             }
