@@ -21,6 +21,8 @@
 #include "identity.h"
 #include "key_schedule.h"
 #include "chat_frame.h"
+#include "room_keys.h"
+#include "rotation_bundle.h"
 #include "call_invite.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -128,6 +130,125 @@ static int send_signed_file_message(sock_t s, const char *room, const char *name
 
 /* Module-level room key pointer (set in run_client, used by KEY_REQUEST handler) */
 static const uint8_t *g_room_key = NULL;
+
+/*
+ * The generations of K_room we hold, and who is in the room.
+ *
+ * The roster exists because rotation has to address a bundle to every member
+ * by identity key, and until now nothing kept one: identities were checked
+ * against the TOFU store as they arrived and then forgotten. The store is on
+ * disk and keyed by name; what rotation needs is who is here *now*.
+ */
+static room_keys_t g_rk;
+static int g_rk_ready = 0;
+
+/*
+ * Rotation waits for the room to agree on who is in it.
+ *
+ * The server announces a membership change before the members involved have
+ * said who they are, so for a moment every client holds a different roster -
+ * and an election run on differing rosters elects everybody. That is not
+ * hypothetical: run three clients without this and two of them rotate at
+ * once, each sealing a bundle only it can open.
+ *
+ * So a membership change arms a rotation instead of performing one. The wait
+ * is what lets the identity announcements land, after which every roster is
+ * the same and the election has one answer. A member that never announces an
+ * identity would otherwise hold the room forever, so the wait has an end.
+ */
+#define ROT_SETTLE_MS   1500   /**< quiet time after the last roster change */
+#define ROT_DEADLINE_MS 6000   /**< stop waiting on a member that stays silent */
+
+static int      g_rot_pending  = 0;
+static uint64_t g_rot_settle_at = 0;
+static uint64_t g_rot_deadline  = 0;
+
+static uint64_t rot_now_ms(void) {
+#ifdef _WIN32
+    return (uint64_t)GetTickCount64();
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)(ts.tv_nsec / 1000000);
+#endif
+}
+
+#define ROSTER_MAX 64
+
+typedef struct {
+    char    name[MAX_NAME];
+    uint8_t pk[IDENTITY_PK_BYTES];
+    int     has_identity;
+    int     present;
+} roster_entry_t;
+
+static roster_entry_t g_roster[ROSTER_MAX];
+static int g_roster_count = 0;
+
+/** Remember, or update, one member's identity key. */
+static void roster_note_identity(const char *name, const uint8_t *pk) {
+    if (!name || !pk) return;
+    for (int i = 0; i < g_roster_count; i++) {
+        if (strcmp(g_roster[i].name, name) != 0) continue;
+        memcpy(g_roster[i].pk, pk, IDENTITY_PK_BYTES);
+        g_roster[i].has_identity = 1;
+        return;
+    }
+    if (g_roster_count >= ROSTER_MAX) return;
+    snprintf(g_roster[g_roster_count].name, MAX_NAME, "%s", name);
+    memcpy(g_roster[g_roster_count].pk, pk, IDENTITY_PK_BYTES);
+    g_roster[g_roster_count].has_identity = 1;
+    g_roster[g_roster_count].present = 1;
+    g_roster_count++;
+}
+
+/** Mark who the server says is here. Returns 1 if the set changed. */
+static int roster_set_present(char names[][MAX_NAME], int count) {
+    int changed = 0;
+
+    for (int i = 0; i < g_roster_count; i++) {
+        int here = 0;
+        for (int j = 0; j < count; j++) {
+            if (strcmp(g_roster[i].name, names[j]) == 0) { here = 1; break; }
+        }
+        if (g_roster[i].present != here) { g_roster[i].present = here; changed = 1; }
+    }
+
+    for (int j = 0; j < count; j++) {
+        int known = 0;
+        for (int i = 0; i < g_roster_count; i++) {
+            if (strcmp(g_roster[i].name, names[j]) == 0) { known = 1; break; }
+        }
+        if (known || g_roster_count >= ROSTER_MAX) continue;
+        snprintf(g_roster[g_roster_count].name, MAX_NAME, "%s", names[j]);
+        g_roster[g_roster_count].has_identity = 0;
+        g_roster[g_roster_count].present = 1;
+        g_roster_count++;
+        changed = 1;
+    }
+    return changed;
+}
+
+/** True once every member the server lists has told us who they are. */
+static int roster_identities_complete(void) {
+    for (int i = 0; i < g_roster_count; i++) {
+        if (g_roster[i].present && !g_roster[i].has_identity) return 0;
+    }
+    return 1;
+}
+
+/** Everyone present, as room_keys wants to see them. */
+static size_t roster_members(rk_member_t *out, size_t cap) {
+    size_t n = 0;
+    for (int i = 0; i < g_roster_count && n < cap; i++) {
+        if (!g_roster[i].present) continue;
+        memcpy(out[n].pk, g_roster[i].pk, IDENTITY_PK_BYTES);
+        out[n].has_identity = g_roster[i].has_identity;
+        n++;
+    }
+    return n;
+}
+
 static sock_t g_sock = -1;
 static const char *g_room = NULL;
 static const char *g_name = NULL;
@@ -317,7 +438,16 @@ static int ecdh_join_room(sock_t s, const char *room, const char *name, uint8_t 
                                 printf("[join] New identity for '%s': %s (trusted on first use)\n",
                                        sender, fp_buf);
                                 sig_verified = 1;
-                            } else if (tofu == TOFU_KEY_CONFLICT) {
+                            }
+                            /* Into the roster, not just the TOFU store.
+                             *
+                             * This loop reads frames looking for a key
+                             * response and drops everything else, so the
+                             * announcement this member made when we arrived
+                             * is gone. Without recording them here the first
+                             * thing we do in the room is refuse their
+                             * rotation, having no idea who else is in it. */
+                            if (sig_verified) roster_note_identity(sender, id_pk); else if (tofu == TOFU_KEY_CONFLICT) {
                                 /* Blocking: a changed identity key is exactly what an
                                  * active MITM looks like, so we must not proceed. */
                                 fprintf(stderr,
@@ -1009,9 +1139,182 @@ static void handle_invite_command(const char *arg, sock_t s,
  * frame already takes a set rather than a key so that day changes callers
  * here and nothing below them.
  */
+/**
+ * Draw a new K_room and hand it to everyone present.
+ *
+ * The bundle is sealed under the generation being replaced, not the new one:
+ * nobody has the new key yet, and a message nobody can open is not a way to
+ * distribute it. Installing ours therefore happens after the bundle is on
+ * the wire, so that we are still able to seal it.
+ *
+ * A member present without an identity gets no entry - there is no key to
+ * address one to. They keep reading under the old generation until it
+ * expires, and then they are out of the room, which is what having no
+ * identity in a room that rotates means.
+ */
+static void rotation_rotate_now(sock_t s, const char *room, const char *myname,
+                                const uint8_t *active_key) {
+    if (!g_has_identity || !g_rk_ready) return;
+
+    uint8_t recipients[ROSTER_MAX][32];
+    size_t nrec = 0;
+    for (int i = 0; i < g_roster_count && nrec < ROSTER_MAX; i++) {
+        if (!g_roster[i].present || !g_roster[i].has_identity) continue;
+        memcpy(recipients[nrec++], g_roster[i].pk, 32);
+    }
+    if (nrec == 0) return;
+
+    uint8_t k_new[ROTATION_KEY_BYTES];
+    randombytes_buf(k_new, sizeof k_new);
+
+    uint16_t next = (uint16_t)(g_rk.current_version + 1);
+    /* The version is what tells a rotation from a replay, so wrapping it
+     * would make an old bundle look current. Sixty-five thousand membership
+     * changes in one room is somebody else's problem, and refusing is the
+     * honest answer to it. */
+    if (next < g_rk.current_version) {
+        fprintf(stderr, "[rotation] generation counter exhausted; not rotating\n");
+        sodium_memzero(k_new, sizeof k_new);
+        return;
+    }
+
+    uint8_t bundle[RB_HEADER_BYTES + ROSTER_MAX * ROTATION_ENTRY_BYTES];
+    size_t blen = 0;
+    rb_status_t rs = rb_build(room, next, k_new, g_identity_sk, g_identity_pk,
+                              (const uint8_t (*)[32])recipients, nrec,
+                              bundle, sizeof bundle, &blen);
+    if (rs != RB_OK) {
+        fprintf(stderr, "[rotation] could not build a bundle: %s\n", rb_strerror(rs));
+        sodium_memzero(k_new, sizeof k_new);
+        return;
+    }
+
+    /* Broadcast, not sealed under K_room. Every entry is already sealed to
+     * one member's identity key, so there is nothing here the server could
+     * read - and a member who has just joined has no current K_room to open
+     * an envelope with, which is exactly the member a rotation has to
+     * reach. */
+    (void)active_key;
+    if (send_service_frame(s, room, myname, (uint8_t)MSG_TYPE_ROTATION,
+                           bundle, blen) < 0) {
+        fprintf(stderr, "[rotation] could not send the bundle\n");
+        sodium_memzero(k_new, sizeof k_new);
+        return;
+    }
+
+    rk_install(&g_rk, next, k_new, (uint64_t)time(NULL));
+    sodium_memzero(k_new, sizeof k_new);
+    printf("[rotation] room key is now generation %u, sealed for %zu member(s)\n",
+           (unsigned)next, nrec);
+    fflush(stdout);
+}
+
+/**
+ * Rotate if a membership change is waiting and the room has settled.
+ *
+ * Called from the receive loop, so it costs nothing when nothing is pending.
+ */
+static void rotation_tick(sock_t s, const char *room, const char *myname,
+                          const uint8_t *active_key) {
+    if (!g_rot_pending || !g_has_identity || !g_rk_ready) return;
+
+    uint64_t now = rot_now_ms();
+    if (now < g_rot_settle_at) return;
+    if (!roster_identities_complete() && now < g_rot_deadline) return;
+
+    g_rot_pending = 0;
+
+    rk_member_t members[ROSTER_MAX];
+    size_t nmem = roster_members(members, ROSTER_MAX);
+    /* Every member reaches this same answer from the same roster, so exactly
+     * one of them goes on. */
+    if (rk_is_rotator(members, nmem, g_identity_pk)) {
+        rotation_rotate_now(s, room, myname, active_key);
+    }
+}
+
+/** Take in a rotation somebody else sent. */
+static void rotation_handle_bundle(const char *room, const char *sender,
+                                   const uint8_t *payload, size_t plen) {
+    if (!g_has_identity || !g_rk_ready) return;
+
+    rb_view_t view;
+    rb_status_t rs = rb_parse(payload, plen, &view);
+    if (rs != RB_OK) {
+        fprintf(stderr, "[rotation] ignoring a bundle from %s: %s\n",
+                sender, rb_strerror(rs));
+        return;
+    }
+
+    /* Whoever sealed it has to be the member this room expects to rotate.
+     * Without this check any member could rotate at any time, which is a
+     * denial of service dressed as a key update - and with two members
+     * rotating at once the room would split. rb_open_for authenticates the
+     * sender; this decides whether that sender had the right. */
+    rk_member_t members[ROSTER_MAX];
+    size_t nmem = roster_members(members, ROSTER_MAX);
+    size_t known = 0;
+    for (size_t i = 0; i < nmem; i++) if (members[i].has_identity) known++;
+
+    /* An election needs a roster, and a member who has just arrived may not
+     * have one yet - the announcements that build it can have been made
+     * before it was listening. Refusing then would lock it out of the room
+     * it just joined, so a member that knows nobody but itself takes what it
+     * is given: the entry is sealed to its identity key and authenticated as
+     * coming from the sender, and the only thing going unchecked is whether
+     * that sender was the member the room elected - which is not something
+     * it is in any position to check. */
+    if (known > 1 && !rk_is_rotator(members, nmem, view.sender_pk)) {
+        fprintf(stderr, "[rotation] ignoring a bundle from %s: not this room's rotator\n",
+                sender);
+        return;
+    }
+
+    /* Only ever forward. An older generation arriving late is a replay. */
+    if (view.key_version <= g_rk.current_version) return;
+
+    uint8_t k_new[ROTATION_KEY_BYTES];
+    rs = rb_open_for(&view, room, g_identity_sk, g_identity_pk, k_new);
+    if (rs != RB_OK) {
+        fprintf(stderr, "[rotation] could not open our entry from %s: %s\n",
+                sender, rb_strerror(rs));
+        return;
+    }
+
+    rk_install(&g_rk, view.key_version, k_new, (uint64_t)time(NULL));
+    sodium_memzero(k_new, sizeof k_new);
+    printf("[rotation] room key is now generation %u, from %s\n",
+           (unsigned)view.key_version, sender);
+    fflush(stdout);
+}
+
 static void chat_keyring(const uint8_t *k_room, cf_key_t *out) {
+    /* Before the first rotation - and in the GUI's short-lived helper
+     * processes, which never see one - the room key is generation zero and
+     * the store is empty. */
+    if (g_rk_ready) {
+        const cf_key_t *cur = rk_current(&g_rk);
+        if (cur) { *out = *cur; return; }
+    }
     out->version = 0;
     memcpy(out->key, k_room, KS_KEY_BYTES);
+}
+
+/**
+ * Every generation still readable, current first.
+ *
+ * A rotation does not stop what was already in flight under the generation
+ * it replaces, so the receive path asks for the set rather than the key.
+ */
+static size_t chat_keyring_all(const uint8_t *k_room, cf_key_t *out, size_t cap) {
+    if (g_rk_ready) {
+        rk_expire(&g_rk, (uint64_t)time(NULL));
+        size_t n = rk_ring(&g_rk, out, cap);
+        if (n > 0) return n;
+    }
+    if (cap == 0) return 0;
+    chat_keyring(k_room, &out[0]);
+    return 1;
 }
 
 int send_ciphertext_typed(sock_t s, const char *room, const char *name, const uint8_t *key,
@@ -1154,8 +1457,19 @@ static int send_identity_announce(sock_t s, const char *room, const char *name,
     if (!cipher) { return -1; }
 
     size_t clen = 0;
+    /* The founding key, not whatever generation is current.
+     *
+     * A member who has just joined holds nothing else, and cannot be handed
+     * the current key until the room knows who they are - which is what this
+     * message is for. Sealing it under the current generation would make
+     * joining a room that has ever rotated impossible.
+     *
+     * It costs nothing to secrecy: the contents are a public key and a
+     * signature over a name. Sealing it at all is so that the server does
+     * not get a list of who is in the room. */
     cf_key_t ck;
-    chat_keyring(key, &ck);
+    ck.version = 0;
+    memcpy(ck.key, key, KS_KEY_BYTES);
     if (cf_seal(&ck, room, name, plain, plen, nonce, cipher, cmax, &clen) != CF_OK) {
         free(cipher);
         return -1;
@@ -1330,7 +1644,11 @@ int recv_and_decrypt(sock_t s, const char *room, const uint8_t *key, const char 
     unsigned long long plen = 0;
     int ok = -1;
 
-    if (is_service_message && same_room && msg_type == MSG_TYPE_USER_LIST) {
+    if (is_service_message && same_room && msg_type == MSG_TYPE_ROTATION) {
+        rotation_handle_bundle(room_in, name, cipher, clen);
+        free(room_in); free(name); free(cipher); free(plain);
+        return 0;
+    } else if (is_service_message && same_room && msg_type == MSG_TYPE_USER_LIST) {
         // Служебное сообщение USER_LIST - не шифруется, просто копируем
         memcpy(plain, cipher, clen);
         plen = clen;
@@ -1354,9 +1672,20 @@ int recv_and_decrypt(sock_t s, const char *room, const uint8_t *key, const char 
          * anything, and binds those six bytes into the additional data so a
          * relay cannot move the message to another epoch. */
         size_t opened = 0;
-        cf_key_t ck;
-        chat_keyring(key, &ck);
-        cf_status_t st = cf_open(&ck, 1, room_in, name, cipher, clen, nonce,
+        cf_key_t ring[CF_MAX_KEYS];
+        size_t nring;
+        if (msg_type == MSG_TYPE_IDENTITY_ANNOUNCE) {
+            /* Sealed under the founding key - see send_identity_announce.
+             * Only this type: letting chat fall back to it would leave every
+             * message readable to anyone who ever held the room key, which is
+             * the thing rotation exists to prevent. */
+            ring[0].version = 0;
+            memcpy(ring[0].key, key, KS_KEY_BYTES);
+            nring = 1;
+        } else {
+            nring = chat_keyring_all(key, ring, CF_MAX_KEYS);
+        }
+        cf_status_t st = cf_open(ring, nring, room_in, name, cipher, clen, nonce,
                                  plain, clen, &opened);
         ok = (st == CF_OK) ? 0 : -1;
         plen = (unsigned long long)opened;
@@ -1467,6 +1796,11 @@ int recv_and_decrypt(sock_t s, const char *room, const uint8_t *key, const char 
                 tofu_result_t tofu = identity_tofu_check(g_known_keys_path, name, peer_pk);
                 char fp[IDENTITY_FINGERPRINT_LEN];
                 identity_pk_fingerprint(peer_pk, fp);
+                /* Rotation addresses a bundle to identity keys, so it needs
+                 * to know who is here now - the TOFU store is on disk and
+                 * says who was ever seen. A conflicting key is not recorded:
+                 * it is the case where we do not know who this is. */
+                if (tofu != TOFU_KEY_CONFLICT) roster_note_identity(name, peer_pk);
                 if (tofu == TOFU_NEW_KEY) {
                     printf("[TOFU] New identity for \"%s\": %s\n", name, fp);
                 } else if (tofu == TOFU_KEY_MATCH) {
@@ -1486,6 +1820,9 @@ int recv_and_decrypt(sock_t s, const char *room, const uint8_t *key, const char 
             const uint8_t *p = plain + 2;
             size_t remaining = plen - 2;
 
+            static char names[ROSTER_MAX][MAX_NAME];
+            int nnames = 0;
+
             printf("[USERS] Room participants (%u):", count);
             for (uint16_t i = 0; i < count && remaining >= 2; i++) {
                 uint16_t uname_len = rd_u16(p);
@@ -1497,11 +1834,41 @@ int recv_and_decrypt(sock_t s, const char *room, const uint8_t *key, const char 
                 printf(" %.*s", (int)uname_len, (char*)p);
                 if (i < count - 1) printf(",");
 
+                if (nnames < ROSTER_MAX && uname_len < MAX_NAME) {
+                    memcpy(names[nnames], p, uname_len);
+                    names[nnames][uname_len] = '\0';
+                    nnames++;
+                }
+
                 p += uname_len;
                 remaining -= uname_len;
             }
             printf("\n");
             fflush(stdout);
+
+            /* A membership change is the whole trigger: somebody joined, so
+             * they must not read what came before, or somebody left, so they
+             * must not read what comes after. Only the member the room agrees
+             * on rotates, and every member reaches that answer from this same
+             * list, so there is nothing to coordinate. */
+            int changed = roster_set_present(names, nnames);
+            if (changed && g_has_identity && g_rk_ready) {
+                /* Say who we are again. A member that just joined has never
+                 * heard our announcement - it was sent before they arrived -
+                 * and rotation has to address a bundle to them by identity
+                 * key. This is the same thing the call beacon does, for the
+                 * same reason. */
+                send_identity_announce(s, room, myname, key,
+                                       g_identity_sk, g_identity_pk);
+
+                uint64_t now = rot_now_ms();
+                g_rot_settle_at = now + ROT_SETTLE_MS;
+                /* The deadline is set once per pending rotation, not on every
+                 * change: a room somebody keeps joining and leaving would
+                 * otherwise never reach it. */
+                if (!g_rot_pending) g_rot_deadline = now + ROT_DEADLINE_MS;
+                g_rot_pending = 1;
+            }
         }
     } else if (msg_type >= MSG_TYPE_FILE_START && msg_type <= MSG_TYPE_FILE_END) {
         handle_file_message(plain, (size_t)plen, msg_type, room_in, name, key, myname);
@@ -1792,7 +2159,12 @@ void run_client(const char *host, uint16_t port, const char *room, const char *n
     }
 
     // Send identity announcement if we have an identity
+    /* Generation zero: what the room key exchange produced. Everything after
+     * it arrives in a rotation bundle. */
+    rk_init(&g_rk, 0, active_key);
+    g_rk_ready = 1;
     if (g_has_identity) {
+        roster_note_identity(name, g_identity_pk);
         send_identity_announce(s, room, name, active_key, g_identity_sk, g_identity_pk);
     }
 
@@ -1824,11 +2196,22 @@ void run_client(const char *host, uint16_t port, const char *room, const char *n
     HANDLE hThread = CreateThread(NULL, 0, input_thread, &ctx, 0, NULL);
     if (!hThread) { fprintf(stderr, "thread create failed\n"); exit(1); }
     for (;;) {
-        int rc = recv_and_decrypt(ctx.s, ctx.room, ctx.key, ctx.name);
-        if (rc < 0) {
-            printf("[client] disconnected\n");
-            break;
+        /* A timeout rather than a blocking read, so a pending rotation still
+         * fires in a room where nobody is saying anything. */
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(ctx.s, &rfds);
+        struct timeval tv = { 0, 250000 };
+        int r = select(0, &rfds, NULL, NULL, &tv);
+        if (r == SOCKET_ERROR) { printf("[client] disconnected\n"); break; }
+        if (r > 0) {
+            int rc = recv_and_decrypt(ctx.s, ctx.room, ctx.key, ctx.name);
+            if (rc < 0) {
+                printf("[client] disconnected\n");
+                break;
+            }
         }
+        rotation_tick(ctx.s, ctx.room, ctx.name, ctx.key);
     }
     WaitForSingleObject(hThread, INFINITE);
     CloseHandle(hThread);
@@ -1839,8 +2222,10 @@ void run_client(const char *host, uint16_t port, const char *room, const char *n
         FD_SET(s, &rfds);
         FD_SET(STDIN_FILENO, &rfds);
         int maxfd = (s > STDIN_FILENO ? s : STDIN_FILENO) + 1;
-        int r = select(maxfd, &rfds, NULL, NULL, NULL);
+        struct timeval tv = { 0, 250000 };
+        int r = select(maxfd, &rfds, NULL, NULL, &tv);
         if (r < 0) { if (errno == EINTR) continue; break; }
+        rotation_tick(s, room, name, active_key);
         if (FD_ISSET(s, &rfds)) {
             int rc = recv_and_decrypt(s, room, active_key, name);
             if (rc < 0) { printf("[client] disconnected\n"); break; }

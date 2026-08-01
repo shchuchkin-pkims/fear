@@ -129,6 +129,14 @@ typedef enum {
                                           the client is otherwise silent so the server's idle
                                           scan doesn't kick the connection. */
     /* ===== Phase C: call signalling ===== */
+    MSG_TYPE_ROTATION         = 33, /**< Room member -> room: K_room has a new
+                                     *   generation. Payload is a rotation
+                                     *   bundle (identity/rotation_bundle.h):
+                                     *   one entry per member, each sealed to
+                                     *   that member's identity key, so it is
+                                     *   safe to broadcast and the server
+                                     *   learns nothing from relaying it. */
+
     MSG_TYPE_CALL_INVITE      = 32, /**< Room member -> room: I am starting a call.
                                           Encrypted like any chat message, so the relay can
                                           neither read nor forge one, and every member of the

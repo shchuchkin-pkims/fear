@@ -101,10 +101,33 @@
       the switchover of the live media path on both platforms, group audio
       mixing, group video with a speaker view and a strip on both platforms,
       an incoming-call screen on Android, and the epoch key schedule under the
-      chat path on the desktop. Remaining: the same epoch schedule on Android
-      - until it lands the two platforms cannot read each other's chat - and
-      rotation bundles on a membership change, which is what actually closes
-      the forward-secrecy finding.
+      chat path on both platforms. The desktop client now rotates K_room on a
+      membership change, which is what actually closes the forward-secrecy
+      finding: a member cannot read what was said before it arrived, and a
+      member that leaves cannot read what is said after.
+
+      Three things made that work and are worth not undoing. The election
+      needs the rosters to agree, so a membership change arms a rotation
+      rather than performing one - without the wait every client elects
+      itself, since the server announces the change before the members have
+      said who they are. The bundle is broadcast unsealed, because every
+      entry in it is already sealed to one member's identity key and a member
+      who has just joined has no current K_room to open an envelope with.
+      And identity announcements ride the founding key rather than the
+      current generation, for the same reason - otherwise joining a room that
+      has ever rotated is impossible.
+
+      Remaining: rotation on Android, which has to speak the same wire format
+      or a mixed room splits in two.
+- [ ] **tests/smoke_rotation.sh is written but not in the suite.** It drives a
+      server and three clients through two joins and a departure and checks
+      the four properties end to end. It passes, but not always: in roughly
+      two runs out of three the third membership change (the departure)
+      produces no third generation. Whether that is the test's timing being
+      too tight or a rotation genuinely being lost is the open question - and
+      it matters, because a lost rotation on departure is exactly the case
+      the feature exists for. Diagnose, then register it in
+      tests/CMakeLists.txt where the registration is commented out.
 - [ ] Documentation updates and localization
 
 ## Planned

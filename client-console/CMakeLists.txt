@@ -33,6 +33,9 @@ set(SOURCES
     ${CMAKE_SOURCE_DIR}/identity/media_keys.c
     ${CMAKE_SOURCE_DIR}/identity/key_schedule.c
     ${CMAKE_SOURCE_DIR}/identity/chat_frame.c
+    ${CMAKE_SOURCE_DIR}/identity/room_keys.c
+    ${CMAKE_SOURCE_DIR}/identity/rotation_bundle.c
+    ${CMAKE_SOURCE_DIR}/identity/rotation.c
 )
 
 # Создание исполняемого файла
