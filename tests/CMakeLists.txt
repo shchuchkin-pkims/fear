@@ -42,6 +42,7 @@ add_fear_test(test_media_hello  test_media_hello.c  ${IDENTITY_DIR}/media_hello.
 add_fear_test(test_media_senders test_media_senders.c ${IDENTITY_DIR}/media_senders.c ${IDENTITY_DIR}/media_keys.c)
 add_fear_test(test_call_invite  test_call_invite.c  ${IDENTITY_DIR}/call_invite.c ${IDENTITY_DIR}/media_keys.c)
 add_fear_test(test_media_packet test_media_packet.c ${IDENTITY_DIR}/media_packet.c ${IDENTITY_DIR}/media_keys.c)
+add_fear_test(test_chat_frame   test_chat_frame.c   ${IDENTITY_DIR}/chat_frame.c ${IDENTITY_DIR}/key_schedule.c)
 
 # Интеграционный smoke-тест: сервер + два консольных клиента (ECDH create/join,
 # доставка сообщений в обе стороны). Требует собранного таргета fear.
