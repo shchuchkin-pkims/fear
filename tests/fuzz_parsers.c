@@ -36,6 +36,7 @@
 #include "media_hello.h"
 #include "media_keys.h"
 #include "media_packet.h"
+#include "rotation_bundle.h"
 #include "common.h"
 
 /** xorshift64*, so the sequence is ours and not the C library's. */
@@ -64,6 +65,29 @@ static uint32_t rnd_below(uint32_t n) {
  * "succeed" and the caller would walk off the end.
  */
 static unsigned long g_frames_parsed = 0;
+static unsigned long g_bundles_parsed = 0;
+
+/**
+ * A rotation bundle and the contract its reader depends on: the entries it
+ * points at have to be inside the buffer, and there have to be as many as it
+ * says. A count that disagreed with the length would walk a caller off the
+ * end while looking for its own slot.
+ */
+static void check_bundle_contract(const uint8_t *buf, size_t len) {
+    rb_view_t v;
+    if (rb_parse(buf, len, &v) != RB_OK) return;
+    g_bundles_parsed++;
+
+    const uint8_t *end = buf + len;
+    size_t span = (size_t)v.entry_count * ROTATION_ENTRY_BYTES;
+    if (v.sender_pk < buf || v.sender_pk + 32 > end ||
+        v.entries < buf || v.entries > end ||
+        (size_t)(end - v.entries) < span) {
+        fprintf(stderr, "fuzz_parsers: bundle view escapes the buffer\n");
+        abort();
+    }
+}
+
 
 static void check_frame_contract(const uint8_t *buf, size_t len) {
     fear_frame_t f;
@@ -121,6 +145,7 @@ static void feed(const uint8_t *buf, size_t len,
                      out, sizeof out, &out_len);
 
     check_frame_contract(buf, len);
+    check_bundle_contract(buf, len);
 }
 
 /**
@@ -157,6 +182,19 @@ static size_t build_frame(uint8_t *out, size_t cap) {
     *w++ = (uint8_t)((payload_len >> 16) & 0xFF);
     *w++ = (uint8_t)((payload_len >> 24) & 0xFF);
     memset(w, 0x22, payload_len);
+    return need;
+}
+
+/** A rotation bundle that would parse, for the same reason. */
+static size_t build_bundle(uint8_t *out, size_t cap) {
+    const size_t entries = 3;
+    size_t need = RB_HEADER_BYTES + entries * ROTATION_ENTRY_BYTES;
+    if (need > cap) return 0;
+
+    memset(out, 0x5C, need);
+    out[0] = RB_FORMAT_VERSION;
+    out[1] = 0x05; out[2] = 0x00;                 /* key_version */
+    out[35] = (uint8_t)entries; out[36] = 0x00;   /* entry count */
     return need;
 }
 
@@ -207,12 +245,33 @@ int main(int argc, char **argv) {
     uint8_t seed_frame[128];
     size_t seed_frame_len = build_frame(seed_frame, sizeof seed_frame);
 
+    uint8_t seed_bundle[512];
+    size_t seed_bundle_len = build_bundle(seed_bundle, sizeof seed_bundle);
+
     uint8_t buf[MAX_INPUT];
 
     for (unsigned long i = 0; i < rounds; i++) {
         size_t len;
 
-        if (seed_frame_len && (i % 3) == 1) {
+        if (seed_bundle_len && (i % 4) == 3) {
+            /* Near-valid bundle. Its entry count against its length is the
+             * pair that has to stay consistent. */
+            len = seed_bundle_len;
+            memcpy(buf, seed_bundle, len);
+
+            if ((rnd() & 3) == 0) {
+                len = rnd_below((uint32_t)seed_bundle_len + 16);
+                if (len > sizeof buf) len = sizeof buf;
+            }
+
+            unsigned flips = 1 + rnd_below(4);
+            for (unsigned f = 0; f < flips && len; f++) {
+                size_t at = ((rnd() & 1) && len > RB_HEADER_BYTES)
+                            ? rnd_below(RB_HEADER_BYTES)
+                            : rnd_below((uint32_t)len);
+                buf[at] ^= (uint8_t)(1u << rnd_below(8));
+            }
+        } else if (seed_frame_len && (i % 3) == 1) {
             /* Near-valid server frame. Its lengths are what the parser has to
              * survive being lied to about. */
             len = seed_frame_len;
@@ -267,12 +326,12 @@ int main(int argc, char **argv) {
         feed(buf, len, hello_key, k_call, k_room);
     }
 
-    printf("fuzz_parsers: %lu inputs, %lu reached the frame parser's body, no crash\n",
-           rounds, g_frames_parsed);
-    if (g_frames_parsed == 0) {
+    printf("fuzz_parsers: %lu inputs, %lu frames and %lu bundles parsed, no crash\n",
+           rounds, g_frames_parsed, g_bundles_parsed);
+    if (g_frames_parsed == 0 || g_bundles_parsed == 0) {
         /* Then the target was never actually exercised, and a clean run means
          * nothing. Better to fail than to report a success it did not earn. */
-        fprintf(stderr, "fuzz_parsers: no input ever parsed as a frame\n");
+        fprintf(stderr, "fuzz_parsers: a target was never actually reached\n");
         return 1;
     }
     return 0;
