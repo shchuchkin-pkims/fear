@@ -43,6 +43,7 @@ add_fear_test(test_media_senders test_media_senders.c ${IDENTITY_DIR}/media_send
 add_fear_test(test_call_invite  test_call_invite.c  ${IDENTITY_DIR}/call_invite.c ${IDENTITY_DIR}/media_keys.c)
 add_fear_test(test_media_packet test_media_packet.c ${IDENTITY_DIR}/media_packet.c ${IDENTITY_DIR}/media_keys.c)
 add_fear_test(test_chat_frame   test_chat_frame.c   ${IDENTITY_DIR}/chat_frame.c ${IDENTITY_DIR}/key_schedule.c)
+add_fear_test(test_room_keys    test_room_keys.c    ${IDENTITY_DIR}/room_keys.c ${IDENTITY_DIR}/chat_frame.c ${IDENTITY_DIR}/key_schedule.c ${IDENTITY_DIR}/identity.c)
 
 # Разборщики, которые видят сеть до всякой аутентификации. Санитайзеры
 # включены только для этой цели: собирать под ними весь проект дорого, а
