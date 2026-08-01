@@ -44,6 +44,28 @@ add_fear_test(test_call_invite  test_call_invite.c  ${IDENTITY_DIR}/call_invite.
 add_fear_test(test_media_packet test_media_packet.c ${IDENTITY_DIR}/media_packet.c ${IDENTITY_DIR}/media_keys.c)
 add_fear_test(test_chat_frame   test_chat_frame.c   ${IDENTITY_DIR}/chat_frame.c ${IDENTITY_DIR}/key_schedule.c)
 
+# Разборщики, которые видят сеть до всякой аутентификации. Санитайзеры
+# включены только для этой цели: собирать под ними весь проект дорого, а
+# ловить нечего - остальное не читает чужие байты вслепую.
+add_fear_test(fuzz_parsers fuzz_parsers.c
+    ${IDENTITY_DIR}/media_hello.c ${IDENTITY_DIR}/media_keys.c
+    ${IDENTITY_DIR}/media_packet.c ${IDENTITY_DIR}/call_invite.c
+    ${IDENTITY_DIR}/chat_frame.c ${IDENTITY_DIR}/key_schedule.c)
+# check_c_compiler_flag only compiles, and these flags need the runtime at
+# link time - it reported success while the binary came out without a trace
+# of a sanitizer in it.
+include(CheckCSourceCompiles)
+set(CMAKE_REQUIRED_FLAGS "-fsanitize=address,undefined")
+set(CMAKE_REQUIRED_LINK_OPTIONS "-fsanitize=address,undefined")
+check_c_source_compiles("int main(void){return 0;}" HAVE_ASAN_UBSAN)
+unset(CMAKE_REQUIRED_FLAGS)
+unset(CMAKE_REQUIRED_LINK_OPTIONS)
+if(HAVE_ASAN_UBSAN)
+    target_compile_options(fuzz_parsers PRIVATE -fsanitize=address,undefined -fno-omit-frame-pointer)
+    target_link_options(fuzz_parsers PRIVATE -fsanitize=address,undefined)
+endif()
+set_tests_properties(fuzz_parsers PROPERTIES TIMEOUT 120)
+
 # Интеграционный smoke-тест: сервер + два консольных клиента (ECDH create/join,
 # доставка сообщений в обе стороны). Требует собранного таргета fear.
 add_test(NAME integration_smoke
