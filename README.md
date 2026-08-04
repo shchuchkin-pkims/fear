@@ -8,7 +8,8 @@
 
 *Бояться - это нормально...*
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Server: AGPL v3](https://img.shields.io/badge/Server-AGPL%20v3-blue.svg)](LICENSE)
+[![Clients: GPL v3](https://img.shields.io/badge/Clients-GPL%20v3-blue.svg)](LICENSE.GPL-3.0)
 [![Platform](https://img.shields.io/badge/Platform-Linux%20%7C%20Windows%20%7C%20Android-blue.svg)]()
 [![Build Status](https://img.shields.io/badge/build-passing-brightgreen.svg)]()
 [![Language](https://img.shields.io/badge/Language-C11%20%7C%20C%2B%2B17-orange.svg)]()
@@ -244,7 +245,14 @@ Report bugs and security vulnerabilities via [GitHub Issues](https://github.com/
 
 ## License
 
-This project is licensed under the **MIT License** — see [LICENSE](LICENSE) for details.
+F.E.A.R. is free software.
+
+- **Server** (`client-console/`, `identity/`, `Dockerfile`, `web/server.js`) - **GNU AGPL-3.0-or-later**, see [LICENSE](LICENSE).
+- **Clients** (`gui/`, `audio_call/`, `video_call/`, `key-exchange/`, `updater/`, `web/public/`) - **GNU GPL-3.0-or-later**, see [LICENSE.GPL-3.0](LICENSE.GPL-3.0).
+
+The AGPL applies to the server because it is offered over a network: section 13 requires operators of a modified server to publish their changes, so users can verify that the server they connect to matches the published source.
+
+Full component-by-component mapping: [LICENSING.md](LICENSING.md).
 
 ## Acknowledgments
 
