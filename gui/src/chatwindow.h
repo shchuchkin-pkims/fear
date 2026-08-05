@@ -55,6 +55,8 @@ private:
      *  server endpoint or falls back to the saved profile defaults. */
     void promptAndConnectRoom(Backend::ConnectMode mode);
     void openPeerProfile(const QString &senderName);
+    /** Записать собеседника в контакты из его карточки. */
+    void addPeerToContacts(const QString &pkB64, const QString &displayName);
     /** «Delete chat» from sidebar context menu. Wipes local history for
      *  `roomId` and, for DMs, also removes the corresponding contact
      *  from ContactsStore + sends a fresh blob to the relay. */

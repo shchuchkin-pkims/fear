@@ -5,6 +5,10 @@
 #include "theme/theme.h"
 #include "connectiondialog.h"
 #include "backend.h"
+
+extern "C" {
+#include "server_proto.h"
+}
 #include "audiocalldialog.h"
 #include "videocalldialog.h"
 #include "settingsdialog.h"
@@ -700,7 +704,8 @@ void ChatWindow::onChatHeaderClicked() {
                     c.name.isEmpty() ? (c.handle.isEmpty() ? room : c.handle)
                                      : c.name;
                 PeerProfileDialog dlg(display, c.pk, fingerprint,
-                                      c.handle, c.server, c.verified, this);
+                                      c.handle, c.server, c.verified,
+                                      /*alreadyContact=*/true, this);
                 connect(&dlg, &PeerProfileDialog::openChatRequested, this,
                         &ChatWindow::switchToDmRoom);
                 dlg.exec();
@@ -728,15 +733,66 @@ void ChatWindow::onChatHeaderClicked() {
     dlg->open();
 }
 
+/**
+ * Записать собеседника в контакты прямо из карточки.
+ *
+ * Для контакта достаточно открытого ключа и имени: личная комната и её ключ
+ * выводятся из двух личных ключей, ник на сервере - только украшение. Ник
+ * всё же спрашиваем у ретранслятора по ключу, но неудача здесь не повод
+ * отказываться: контакт без ника работает точно так же.
+ */
+void ChatWindow::addPeerToContacts(const QString &pkB64, const QString &displayName) {
+    if (pkB64.isEmpty()) return;
+
+    auto *store = ContactsStore::instance();
+    QVector<ContactsStore::Record> all = store->all();
+    for (const auto &c : all) {
+        if (c.pk == pkB64) return;          // уже есть
+    }
+
+    ContactsStore::Record rec;
+    rec.name = displayName.trimmed();
+    rec.pk   = pkB64;
+
+    /* Ник по ключу - если ретранслятор его знает и до него сейчас можно
+     * достучаться. */
+    const QByteArray raw = QByteArray::fromBase64(
+        pkB64.toLatin1(),
+        QByteArray::Base64UrlEncoding | QByteArray::OmitTrailingEquals);
+    if (raw.size() == IDENTITY_PK_BYTES && !m_backend->serverHost.isEmpty()) {
+        char handle[64] = {0};
+        const QByteArray hb = m_backend->serverHost.toUtf8();
+        if (sp_lookup_handle_by_pk(hb.constData(), m_backend->serverPort,
+                                   reinterpret_cast<const uint8_t *>(raw.constData()),
+                                   handle, sizeof handle) == SP_OK) {
+            rec.handle = QString::fromUtf8(handle);
+            rec.server = m_backend->serverHost;
+        }
+    }
+
+    all.append(rec);
+    store->replaceAll(all);                 // сам сохранит и обновит список чатов
+
+    const QString who = rec.handle.isEmpty()
+        ? rec.name
+        : QString("%1 (@%2)").arg(rec.name, rec.handle);
+    QMessageBox::information(this, tr("Contacts"),
+        tr("%1 added. Their private chat is now in the list on the left.")
+            .arg(who));
+}
+
 void ChatWindow::openPeerProfile(const QString &senderName) {
     const QString sender = senderName.trimmed();
     if (sender.isEmpty() || sender == "system" || sender == "server") return;
 
-    // Read the known_keys.tsv that FearClient writes on TOFU.
-    QString cfgDir = QStandardPaths::writableLocation(QStandardPaths::AppConfigLocation);
-    if (cfgDir.isEmpty())
-        cfgDir = QDir::homePath() + "/.config/fear";
-    const QString knownKeysPath = cfgDir + "/known_keys.tsv";
+    /* Хранилище доверенных ключей спрашиваем у самой identity, а не
+     * складываем путь руками. Раньше здесь стоял "known_keys.tsv" в каталоге
+     * настроек Qt - файла с таким именем не существует, консольная часть
+     * пишет ~/.fear/known_keys. Из-за этого карточка собеседника не знала
+     * ничьего ключа: ни отпечатка показать, ни в контакты добавить. */
+    char kkbuf[512];
+    if (identity_default_known_keys_path(kkbuf, sizeof kkbuf) != 0) return;
+    const QString knownKeysPath = QString::fromUtf8(kkbuf);
 
     QString pkB64;
     bool verified = false;
@@ -779,11 +835,14 @@ void ChatWindow::openPeerProfile(const QString &senderName) {
 
     // Use the cached contacts list to fill handle/server when known.
     QString handle, server;
+    bool known = false;
     for (const auto &c : ContactsStore::instance()->all()) {
-        if (c.pk == pkB64) { handle = c.handle; server = c.server; break; }
+        if (c.pk == pkB64) { handle = c.handle; server = c.server; known = true; break; }
     }
     PeerProfileDialog dlg(sender, pkB64, fingerprint,
-                          handle, server, verified, this);
+                          handle, server, verified, known, this);
+    connect(&dlg, &PeerProfileDialog::addContactRequested, this,
+            &ChatWindow::addPeerToContacts);
     connect(&dlg, &PeerProfileDialog::openChatRequested, this,
             &ChatWindow::switchToDmRoom);
     dlg.exec();

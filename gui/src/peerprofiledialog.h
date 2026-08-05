@@ -24,12 +24,22 @@ public:
                       const QString &handle,       // empty when not a contact
                       const QString &server,       // empty when not a contact
                       bool verified,
+                      bool alreadyContact,
                       QWidget *parent = nullptr);
 
 signals:
     /** User clicked 'Open chat' — host should derive DM room id from pkB64
      *  and reconnect to that room. Only emitted when pkB64 is non-empty. */
     void openChatRequested(const QString &pkB64);
+
+    /**
+     * Пользователь нажал «Add to contacts».
+     *
+     * Карточка знает открытый ключ собеседника и его отображаемое имя - для
+     * записи в контакты этого достаточно. Всё остальное (поиск ника по
+     * ключу, запись на диск) делает хозяин: диалог не должен ходить в сеть.
+     */
+    void addContactRequested(const QString &pkB64, const QString &displayName);
 };
 
 }  // namespace fear

@@ -61,6 +61,7 @@ PeerProfileDialog::PeerProfileDialog(const QString &displayName,
                                      const QString &handle,
                                      const QString &server,
                                      bool verified,
+                                     bool alreadyContact,
                                      QWidget *parent)
     : QDialog(parent)
 {
@@ -133,6 +134,17 @@ PeerProfileDialog::PeerProfileDialog(const QString &displayName,
     // Buttons
     auto *btnRow = new QHBoxLayout();
     btnRow->addStretch(1);
+    if (!pkB64.isEmpty() && !alreadyContact) {
+        /* Кнопка есть только когда мы знаем ключ собеседника: без него
+         * контакт записать не из чего, а имя на проводе никого не
+         * опознаёт. */
+        auto *addBtn = new QPushButton(tr("Add to contacts"), this);
+        connect(addBtn, &QPushButton::clicked, this, [this, pkB64, displayName]() {
+            emit addContactRequested(pkB64, displayName);
+            accept();
+        });
+        btnRow->addWidget(addBtn);
+    }
     if (!pkB64.isEmpty()) {
         auto *openBtn = new QPushButton(tr("Open chat"), this);
         connect(openBtn, &QPushButton::clicked, this, [this, pkB64]() {
