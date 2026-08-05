@@ -29,6 +29,7 @@ set(SOURCES
     ${SRC_DIR}/server.c
     ${SRC_DIR}/server_db.c
     ${CMAKE_SOURCE_DIR}/identity/identity.c
+    ${CMAKE_SOURCE_DIR}/identity/tls.c
     ${CMAKE_SOURCE_DIR}/identity/identity_at_rest.c
     ${CMAKE_SOURCE_DIR}/identity/call_invite.c
     ${CMAKE_SOURCE_DIR}/identity/media_keys.c
@@ -41,6 +42,15 @@ set(SOURCES
 
 # Создание исполняемого файла
 add_executable(${TARGET_NAME} ${SOURCES})
+
+# TLS: где есть OpenSSL - собираем с ним, где нет - модуль остаётся заглушкой,
+# которая отказывает, а не соединяется открытым текстом молча.
+if(FEAR_HAVE_TLS)
+    target_compile_definitions(${TARGET_NAME} PRIVATE FEAR_HAVE_TLS=1)
+    # Без PRIVATE: остальной файл линкует эту цель в форме без ключевых
+    # слов, а смешивать две формы CMake не разрешает.
+    target_link_libraries(${TARGET_NAME} OpenSSL::SSL OpenSSL::Crypto)
+endif()
 
 # Хранилище секретов платформы для ключа личности (см. корневой CMakeLists).
 target_link_libraries(${TARGET_NAME} fear_secret_store)

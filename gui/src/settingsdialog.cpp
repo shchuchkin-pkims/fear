@@ -8,6 +8,7 @@
 #include <QHBoxLayout>
 #include <QFormLayout>
 #include <QSlider>
+#include <QCheckBox>
 #include <QGroupBox>
 #include <QFile>
 #include <QFileInfo>
@@ -75,6 +76,42 @@ void SettingsDialog::setupGeneralTab(QTabWidget *tabs) {
     cliLayout->addWidget(cliPathEdit);
     cliLayout->addWidget(browseBtn);
     form->addRow(cliGroup);
+
+    QGroupBox *tlsGroup = new QGroupBox("Connection to the relay");
+    QFormLayout *tlsForm = new QFormLayout(tlsGroup);
+
+    tlsCheck = new QCheckBox("Wrap the connection in TLS");
+    tlsForm->addRow(tlsCheck);
+
+    tlsPinEdit = new QLineEdit();
+    tlsPinEdit->setPlaceholderText("certificate SHA-256, optional");
+    tlsForm->addRow("Pin:", tlsPinEdit);
+
+    /* Что слой даёт и чего не даёт - обе половины, иначе человек решит, что
+     * купил больше, чем купил. */
+    QLabel *tlsNote = new QLabel(
+        "Hides the shape of the traffic from anyone watching the network - your "
+        "provider, the owner of the wifi. Without it they see frame sizes and "
+        "timing, which is enough to tell that this machine speaks F.E.A.R., "
+        "without reading a word.\n\n"
+        "It hides nothing from the relay itself: that sits at the far end of "
+        "the tunnel and sees what it always saw.\n\n"
+        "The pin is the server certificate's SHA-256. With it, certificate "
+        "authorities are not consulted at all - which suits a self-hosted relay "
+        "with a self-signed certificate, where trust is built by comparing "
+        "fingerprints anyway. Leave it empty to verify the usual way.\n\n"
+        "The relay must be started with --tls-cert and --tls-key, otherwise the "
+        "connection will simply fail.");
+    tlsNote->setWordWrap(true);
+    tlsNote->setStyleSheet("color: gray; font-size: 11px;");
+    tlsForm->addRow(tlsNote);
+
+    /* Поле отпечатка бессмысленно, пока TLS выключен. */
+    auto syncTls = [this]() { tlsPinEdit->setEnabled(tlsCheck->isChecked()); };
+    connect(tlsCheck, &QCheckBox::toggled, this, syncTls);
+    syncTls();
+
+    form->addRow(tlsGroup);
 
     QLabel *note = new QLabel("Path to the F.E.A.R. CLI executable used for chat, key generation, and identity.");
     note->setWordWrap(true);
@@ -460,6 +497,9 @@ void SettingsDialog::loadSettings() {
     /* Audio */
     QString audioIn = settings->value("audio/inputDevice", "System default").toString();
     QString audioOut = settings->value("audio/outputDevice", "System default").toString();
+    tlsCheck->setChecked(settings->value("relay/tls", false).toBool());
+    tlsPinEdit->setText(settings->value("relay/tlsPin", "").toString());
+    tlsPinEdit->setEnabled(tlsCheck->isChecked());
     stunServerEdit->setText(settings->value("call/stunServer", "").toString());
     micGainSlider->setValue(settings->value("audio/micGainDb", 0).toInt());
     micGainValue->setText(QString("%1%2 dB")
@@ -525,6 +565,8 @@ void SettingsDialog::saveSettings() {
     emit chatFontChanged(newFont);
 
     /* Audio */
+    settings->setValue("relay/tls", tlsCheck->isChecked());
+    settings->setValue("relay/tlsPin", tlsPinEdit->text().trimmed());
     settings->setValue("call/stunServer", stunServerEdit->text().trimmed());
     settings->setValue("audio/micGainDb", micGainSlider->value());
     settings->setValue("audio/noiseSuppress", noiseSuppressCombo->currentData().toString());

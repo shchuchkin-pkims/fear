@@ -93,6 +93,29 @@ option(FEAR_GUI_ONLY "Skip audio_call/video_call/key-exchange/updater subproject
 # Включение субмодулей
 include(${CMAKE_CURRENT_LIST_DIR}/cmake/FearSecretStore.cmake)
 
+# ── TLS поверх TCP ──────────────────────────────────────────────────────────
+#
+# Слой внешний: содержимое разговоров и так зашифровано между собеседниками.
+# TLS закрывает наблюдателя на пути - без него провайдер или хозяин точки
+# доступа видит структуру кадров, длины полей и ритм обмена, и этого хватает,
+# чтобы узнать протокол, не прочитав ни слова.
+#
+# Собирается, только если нашёлся OpenSSL. Где не нашёлся (сборка под Windows
+# берёт зависимости готовыми из lib/, и OpenSSL там нет) - функции остаются,
+# но честно отказывают: молча соединиться открытым текстом там, где человек
+# попросил TLS, хуже, чем не соединиться вовсе.
+option(FEAR_TLS "Build with TLS support (needs OpenSSL)" ON)
+set(FEAR_HAVE_TLS OFF)
+if(FEAR_TLS)
+    find_package(OpenSSL QUIET)
+    if(OpenSSL_FOUND)
+        set(FEAR_HAVE_TLS ON)
+        message(STATUS "TLS: OpenSSL ${OPENSSL_VERSION}")
+    else()
+        message(STATUS "TLS: OpenSSL not found - building without it")
+    endif()
+endif()
+
 add_subdirectory(client-console)
 if(NOT FEAR_GUI_ONLY)
     add_subdirectory(key-exchange)
@@ -113,6 +136,7 @@ if(FEAR_BUILD_ADMIN AND NOT WIN32)
 endif()
 
 option(FEAR_BUILD_TESTS "Build unit tests" ON)
+
 if(FEAR_BUILD_TESTS)
     enable_testing()
     add_subdirectory(tests)

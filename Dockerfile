@@ -12,7 +12,7 @@
 # ───── Build stage ─────
 FROM debian:bookworm-slim AS build
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      gcc libc6-dev libsodium-dev libsqlite3-dev pkg-config make \
+      gcc libc6-dev libsodium-dev libsqlite3-dev libssl-dev pkg-config make \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src
@@ -43,14 +43,15 @@ RUN mkdir -p /out && gcc -O2 -Wall -Wextra -pthread \
         identity/room_keys.c \
         identity/rotation_bundle.c \
         identity/rotation.c \
+        identity/tls.c \
         -I client-console/include \
         -I identity \
-        -lsodium -lsqlite3
+        -DFEAR_HAVE_TLS=1 -lssl -lcrypto -lsodium -lsqlite3
 
 # ───── Runtime stage ─────
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      libsodium23 libsqlite3-0 ca-certificates netcat-openbsd \
+      libsodium23 libsqlite3-0 libssl3 ca-certificates netcat-openbsd \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --no-create-home --shell /usr/sbin/nologin fear
 

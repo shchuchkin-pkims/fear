@@ -16,6 +16,7 @@
  * - File integrity verified with CRC32 checksums
  */
 
+#include "tls.h"
 #include "client.h"
 #include "network.h"
 #include "identity.h"
@@ -463,6 +464,29 @@ static const char *g_name = NULL;
  * собственные реплики в своём же окне.
  */
 static const char *g_display_name = NULL;
+
+/*
+ * Просить ли TLS и с каким отпечатком.
+ *
+ * Отпечаток вместо удостоверяющего центра - более уместная проверка для
+ * своего ретранслятора: доверие здесь и так строится на сверке отпечатков,
+ * а не на списке чужих центров.
+ */
+
+
+/**
+ * Попросить TLS для следующего соединения.
+ *
+ * @param pin_hex отпечаток сертификата (SHA-256, hex) или NULL. С
+ *        отпечатком удостоверяющие центры не спрашиваются вовсе - для
+ *        своего ретранслятора с самоподписанным сертификатом это не
+ *        послабление, а более уместная проверка.
+ */
+void client_set_tls(int want, const char *pin_hex) {
+    /* Хранит настройку сам модуль TLS: спрашивает о ней dial_tcp, а он ниже
+     * клиента и о клиенте ничего не знает. */
+    tls_want(want, pin_hex);
+}
 
 /* Phase B-8: heartbeat. The CLI runs an extra thread that sends a
  * MSG_TYPE_PING zero-nonce service frame every PING_INTERVAL_SEC. The
@@ -2605,6 +2629,8 @@ DWORD WINAPI input_thread(LPVOID param) {
 int probe_room_info(const char *host, uint16_t port, const char *room,
                     int timeout_ms) {
     sock_t s = dial_tcp(host, port);
+
+
     if (s < 0) return -1;
 
 #ifdef _WIN32

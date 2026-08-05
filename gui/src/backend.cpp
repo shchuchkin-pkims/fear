@@ -3,6 +3,7 @@
  * @brief Implementation of F.E.A.R. CLI backend
  */
 
+#include <QSettings>
 #include "backend.h"
 #include <sodium.h>
 #include <QFile>
@@ -104,6 +105,21 @@ bool Backend::connectToServer(const QString &host, int port, const QString &room
     // Pass identity file if available
     if (identityAvailable) {
         args << "--identity-file" << identityFilePath;
+
+    /*
+     * Внешний слой TLS для связи с ретранслятором.
+     *
+     * Пусто - как раньше, открытым текстом: включённый молча, он оборвал бы
+     * связь со всеми серверами, у которых TLS не настроен.
+     */
+    {
+        QSettings st;
+        if (st.value(QStringLiteral("relay/tls"), false).toBool()) {
+            const QString pin = st.value(QStringLiteral("relay/tlsPin")).toString().trimmed();
+            if (!pin.isEmpty()) args << QStringLiteral("--tls-pin") << pin;
+            else                args << QStringLiteral("--tls");
+        }
+    }
     }
 
     qDebug() << "Starting client:" << cliPath << "client --host" << host

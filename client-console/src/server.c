@@ -17,6 +17,7 @@
  * - Handle client disconnections
  */
 
+#include "tls.h"
 #include "server.h"
 #include "network.h"
 #include "server_db.h"
@@ -241,7 +242,8 @@ static void broadcast(client_t *clients, int *nclients, const char *room,
 
         /* Send frame to client; remove if send fails */
         if (send_all(clients[i].fd, frame, flen) < 0) {
-            close_socket(clients[i].fd);
+            tls_close((int)clients[i].fd);
+                close_socket(clients[i].fd);
             clients[i] = clients[*nclients - 1];
             (*nclients)--;
             i--;
@@ -1124,7 +1126,8 @@ void run_server_opts(uint16_t port, int64_t inbox_ttl) {
                 dropped_room[0] = '\0';
             }
             server_db_session_remove((int)clients[i].fd);
-            close_socket(clients[i].fd);
+            tls_close((int)clients[i].fd);
+                close_socket(clients[i].fd);
             clients[i] = clients[nclients - 1];
             nclients--;
             i--;
@@ -1240,6 +1243,20 @@ void run_server_opts(uint16_t port, int64_t inbox_ttl) {
                 } else if (nclients < MAX_CLIENTS) {
                     set_tcp_keepalive(c);
                     set_socket_timeouts(c);
+                    /*
+                     * Рукопожатие TLS - до всего остального.
+                     *
+                     * Не сложилось - соединение закрывается, а не
+                     * продолжается открытым текстом: клиент, попросивший
+                     * TLS, иначе счёл бы себя защищённым, ничего таковым не
+                     * будучи.
+                     */
+                    if (tls_enabled() && tls_server_wrap((int)c) != 0) {
+                        printf("[server] TLS handshake failed with %s: %s\n",
+                               inet_ntoa(cli.sin_addr), tls_last_error());
+                        close_socket(c);
+                        continue;
+                    }
                     clients[nclients].fd = c;
                     clients[nclients].ip = (uint32_t)cli.sin_addr.s_addr;
                     clients[nclients].room[0] = '\0';
@@ -1288,6 +1305,7 @@ void run_server_opts(uint16_t port, int64_t inbox_ttl) {
                 }
 
                 server_db_session_remove((int)clients[i].fd);
+                tls_close((int)clients[i].fd);
                 close_socket(clients[i].fd);
                 clients[i] = clients[nclients - 1];
                 nclients--;

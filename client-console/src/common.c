@@ -10,6 +10,7 @@
  * - AES-256-GCM encryption/decryption wrappers
  */
 
+#include "tls.h"
 #include "common.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -86,8 +87,17 @@ int recv_all(sock_t fd, void *buf, size_t len) {
     size_t got = 0;
     int n;
 
+    /*
+     * Единственная точка чтения из сокета на весь проект - и потому
+     * единственное место, где решается, идёт ли байт через TLS. Проверка
+     * здесь избавляет от правки сотни мест вызова, каждое из которых
+     * пришлось бы не забыть.
+     */
+    const int secure = tls_is_wrapped((int)fd);
+
     while (got < len) {
-        n = (int)recv(fd, (char*)p + got, (int)(len - got), 0);
+        n = secure ? tls_recv((int)fd, (char*)p + got, len - got)
+                   : (int)recv(fd, (char*)p + got, (int)(len - got), 0);
         if (n <= 0) {
             return -1; /* Connection closed or error */
         }
@@ -116,8 +126,11 @@ int send_all(sock_t fd, const void *buf, size_t len) {
     size_t sent = 0;
     int n;
 
+    const int secure = tls_is_wrapped((int)fd);
+
     while (sent < len) {
-        n = (int)send(fd, (const char*)p + sent, (int)(len - sent), 0);
+        n = secure ? tls_send((int)fd, (const char*)p + sent, len - sent)
+                   : (int)send(fd, (const char*)p + sent, (int)(len - sent), 0);
         if (n <= 0) {
             return -1; /* Connection closed or error */
         }

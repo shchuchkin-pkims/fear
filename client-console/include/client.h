@@ -44,4 +44,13 @@ void print_local_message(const char *name, const char *msg);
 int probe_room_info(const char *host, uint16_t port, const char *room,
                     int timeout_ms);
 
+/**
+ * Попросить TLS для соединения с ретранслятором.
+ *
+ * Внешний слой: содержимое и так зашифровано между собеседниками, TLS
+ * закрывает наблюдателя на пути. От самого ретранслятора он не прячет
+ * ничего - тот на другом конце туннеля.
+ */
+void client_set_tls(int want, const char *pin_hex);
+
 #endif

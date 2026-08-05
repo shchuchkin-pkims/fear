@@ -62,7 +62,11 @@ add_fear_test(fuzz_parsers fuzz_parsers.c
     ${IDENTITY_DIR}/media_packet.c ${IDENTITY_DIR}/call_invite.c
     ${IDENTITY_DIR}/chat_frame.c ${IDENTITY_DIR}/key_schedule.c
     ${IDENTITY_DIR}/rotation_bundle.c ${IDENTITY_DIR}/rotation.c
-    ${CMAKE_SOURCE_DIR}/client-console/src/common.c)
+    ${CMAKE_SOURCE_DIR}/client-console/src/common.c
+    # common.c спрашивает у слоя TLS, обёрнуто ли соединение. Фаззеру TLS не
+    # нужен, поэтому берём модуль без FEAR_HAVE_TLS - он собирается
+    # заглушкой и не тянет за собой OpenSSL.
+    ${IDENTITY_DIR}/tls.c)
 target_include_directories(fuzz_parsers PRIVATE ${CMAKE_SOURCE_DIR}/client-console/include)
 # check_c_compiler_flag only compiles, and these flags need the runtime at
 # link time - it reported success while the binary came out without a trace

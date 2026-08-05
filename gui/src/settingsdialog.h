@@ -72,6 +72,10 @@ private:
 
     /* Video tab */
     /* Сервер STUN: пусто - звонки идут через ретранслятор. */
+    /* Внешний слой TLS для связи с ретранслятором. */
+    QCheckBox *tlsCheck = nullptr;
+    QLineEdit *tlsPinEdit = nullptr;
+
     QLineEdit *stunServerEdit = nullptr;
 
     QComboBox *videoQualityCombo;
