@@ -132,10 +132,11 @@ ConnectionDialog::ConnectionDialog(ProfileSettings *profile,
     m_host = new QComboBox(this);
     m_host->setEditable(true);
     m_host->setInsertPolicy(QComboBox::NoInsert);
-    /* Меппел первым: это сервер по умолчанию. Первый пункт списка - и есть
-     * то, что увидит человек, никогда не открывавший этот список. */
-    m_host->addItem(tr("77.221.145.132 — Netherlands (Meppel)"), QStringLiteral("77.221.145.132"));
+    /* Порядок в списке и значение по умолчанию - разные вещи, и здесь они
+     * намеренно разведены. В списке первой идёт Москва; подставляется же в
+     * поле Меппел (см. ниже, при восстановлении настроек). */
     m_host->addItem(tr("fear-project.ru — Russia (Moscow)"),     QStringLiteral("fear-project.ru"));
+    m_host->addItem(tr("77.221.145.132 — Netherlands (Meppel)"), QStringLiteral("77.221.145.132"));
     m_host->insertSeparator(m_host->count());
     m_host->addItem(tr("Custom server… (type below)"),            QStringLiteral(""));
     m_host->lineEdit()->setPlaceholderText(tr("or type your own: host name or address"));
@@ -243,8 +244,11 @@ void ConnectionDialog::updateModeUi() {
 void ConnectionDialog::loadFromSettings() {
     QSettings s("fear-messenger", "fear-gui");
     s.beginGroup("connect");
-    /* Запомненный адрес важнее умолчания: человек, выбравший себе сервер,
-     * не должен возвращаться к чужому после каждого запуска. */
+    /* Подставляется Меппел - это сервер по умолчанию, независимо от того,
+     * каким по счёту он стоит в списке.
+     *
+     * Запомненный адрес важнее: человек, выбравший себе сервер, не должен
+     * возвращаться к чужому после каждого запуска. */
     m_host->setCurrentText(s.value("host", "77.221.145.132").toString());
     m_port->setText(s.value("port", 8888).toString());
     m_room->setText(s.value("room", "general").toString());
