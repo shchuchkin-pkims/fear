@@ -466,6 +466,21 @@ static const char *g_name = NULL;
 static const char *g_display_name = NULL;
 
 /*
+ * Сколько анонсов личности не открылось.
+ *
+ * Анонс запечатан ключом-родоначальником комнаты, и открыть его должен уметь
+ * каждый, кто в этой комнате. Не открылся - значит у нас с отправителем
+ * разные ключи: мы формально в одной комнате, а на деле в двух разных, и это
+ * состояние ничем себя не выдаёт. Собеседники просто не появляются, имена
+ * остаются огрызками меток, сообщения не приходят - три разные на вид
+ * поломки с одной причиной.
+ *
+ * Поэтому говорим прямо и один раз.
+ */
+static int g_announce_failed = 0;
+static int g_keysplit_warned = 0;
+
+/*
  * Просить ли TLS и с каким отпечатком.
  *
  * Отпечаток вместо удостоверяющего центра - более уместная проверка для
@@ -2240,6 +2255,21 @@ int recv_and_decrypt(sock_t s, const char *room, const uint8_t *key, const char 
     }
 
     if (!same_room || ok != 0 || strcmp(name, myname) == 0) {
+        /* Не открылся именно анонс - самый говорящий признак того, что
+         * ключи разошлись: он и заведён так, чтобы открываться у всех. */
+        if (same_room && ok != 0 && msg_type == MSG_TYPE_IDENTITY_ANNOUNCE &&
+            strcmp(name, myname) != 0) {
+            g_announce_failed++;
+            if (!g_keysplit_warned && g_announce_failed >= 2) {
+                g_keysplit_warned = 1;
+                printf("[WARNING] Cannot read who else is here: %d identity "
+                       "announcements did not open. You are in this room with a "
+                       "different room key, so you will see no messages and no "
+                       "names. Everyone should leave and rejoin, or pick a room "
+                       "name nobody is using yet.\n", g_announce_failed);
+                fflush(stdout);
+            }
+        }
         free(room_in); free(name); free(cipher); free(plain);
         return 0;
     }
