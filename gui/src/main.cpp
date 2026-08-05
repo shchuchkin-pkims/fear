@@ -6,7 +6,6 @@
  * the Qt application and shows the main window.
  */
 
-#include "mainwindow.h"
 #include "chatwindow.h"
 #include <QApplication>
 #include <QCommandLineParser>
@@ -82,19 +81,20 @@ int main(int argc, char **argv) {
     // Clean up old backup files from previous updates
     cleanupOldFiles();
 
-    // Parse CLI: --classic-ui falls back to legacy MainWindow during transition
+    /*
+     * Окно теперь одно.
+     *
+     * Старое (MainWindow) держали за ключом --classic-ui на время перехода,
+     * и держали слишком долго: два окна - это два места, где чинить каждую
+     * ошибку, и два набора возможностей, расходящихся тем сильнее, чем
+     * дольше живут оба. Всё, что было только в старом, - свой ретранслятор,
+     * ручной обмен ключами, выбор шрифта, ссылка на руководство и значок в
+     * лотке - перенесено в новое, а не выброшено вместе с окном.
+     */
     QCommandLineParser parser;
-    QCommandLineOption classicUi(QStringList() << "classic-ui",
-        QStringLiteral("Use legacy GUI instead of the new Telegram-style window."));
-    parser.addOption(classicUi);
     parser.addHelpOption();
+    parser.addVersionOption();
     parser.process(app);
-
-    if (parser.isSet(classicUi)) {
-        MainWindow w;
-        w.show();
-        return app.exec();
-    }
 
     fear::ChatWindow w;
     w.show();

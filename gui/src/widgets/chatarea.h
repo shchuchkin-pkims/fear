@@ -1,6 +1,7 @@
 #ifndef FEAR_CHATAREA_H
 #define FEAR_CHATAREA_H
 
+#include <QFont>
 #include <QWidget>
 #include <QString>
 #include <QDate>
@@ -35,6 +36,17 @@ public:
     void appendMessage(const Message &m);
     void showEmptyState(const QString &hint = QString());
 
+    /**
+     * Шрифт переписки.
+     *
+     * Не украшательство: у людей разное зрение и разные экраны, а читать
+     * приходится подолгу. Меняется на лету и применяется в том числе к уже
+     * показанным сообщениям - иначе выбор вступал бы в силу только со
+     * следующей реплики, и человек решил бы, что настройка не работает.
+     */
+    QFont messageFont() const { return m_messageFont; }
+    void  setMessageFont(const QFont &f);
+
 signals:
     void sendRequested(const QString &text);
     void audioCallRequested();
@@ -64,6 +76,7 @@ protected:
     void paintEvent(QPaintEvent *event) override;
 
 private:
+    QFont m_messageFont;   ///< шрифт текста сообщений
     /* День последнего показанного сообщения: по нему решается, нужен
      * ли новый разделитель с датой. QDate() значит «лента пуста». */
     QDate m_lastMessageDay;

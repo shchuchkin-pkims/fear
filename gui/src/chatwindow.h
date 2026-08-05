@@ -1,6 +1,8 @@
 #ifndef FEAR_CHATWINDOW_H
 #define FEAR_CHATWINDOW_H
 
+#include <QCloseEvent>
+#include <QSystemTrayIcon>
 #include <QMainWindow>
 #include <QStringList>
 #include <QDateTime>
@@ -40,6 +42,27 @@ private:
     void onSidebarMenu(const QPoint &globalPos);
     void openSettings();
     void openTrustedKeys();
+
+    /* Перенесено из старого окна при сведении интерфейса к одному. Всё это
+     * там было и работало; удалять окно, не перенеся, значило бы отнять
+     * возможности под видом уборки. */
+    void runLocalServer();      ///< поднять ретранслятор на этой машине
+    void openKeyExchange();     ///< ручной обмен ключами (Диффи-Хеллман)
+    void chooseChatFont();      ///< шрифт переписки
+    void openDocumentation();   ///< руководство
+    void setupTray();           ///< значок в системном лотке
+
+protected:
+    /**
+     * Закрытие окна прячет его в лоток, а не завершает программу.
+     *
+     * Соединение и приём сообщений продолжаются: иначе закрытое окно
+     * означало бы пропущенный разговор, о котором человек узнал бы задним
+     * числом. Выход - отдельным пунктом, в меню и в лотке.
+     */
+    void closeEvent(QCloseEvent *e) override;
+
+private:
     void openIdentityBackup(bool exportMode);
     void toggleTheme();
     void checkForUpdates(bool silent);
@@ -85,6 +108,11 @@ private:
     Sidebar   *m_sidebar;
     ChatArea  *m_chatArea;
     Backend         *m_backend  = nullptr;
+
+    /* Значок в лотке: приложение продолжает принимать сообщения, когда окно
+     * закрыто. Без него «закрыть» означало бы «выйти», и человек пропускал
+     * бы всё сказанное, пока окна нет. */
+    QSystemTrayIcon *m_tray = nullptr;
     History         *m_history  = nullptr;
     ProfileSettings *m_profile  = nullptr;
     bool       m_connectShown = false;

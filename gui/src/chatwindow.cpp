@@ -1,3 +1,8 @@
+#include <QFontDialog>
+#include <QSystemTrayIcon>
+#include <QDesktopServices>
+#include <QUrl>
+#include "keyexchangedialog.h"
 #include "chatwindow.h"
 #include "widgets/sidebar.h"
 #include "widgets/chatarea.h"
@@ -162,6 +167,29 @@ ChatWindow::ChatWindow(QWidget *parent) : QMainWindow(parent) {
     // (cached contacts + previous group rooms). Identity may not be loaded
     // yet, in which case DM entries get filled in after the first connect.
     rebuildSidebarChats();
+
+    /* Выбранный когда-то шрифт переписки. Восстанавливаем до первого
+     * сообщения, иначе человек увидит чужой размер и решит, что настройка
+     * не сохранилась. */
+    {
+        QSettings st;
+        const QString saved = st.value(QStringLiteral("chat/font")).toString();
+        QFont f;
+        if (!saved.isEmpty() && f.fromString(saved)) m_chatArea->setMessageFont(f);
+    }
+
+    setupTray();
+}
+
+void ChatWindow::closeEvent(QCloseEvent *e) {
+    /* В лоток, а не наружу - но только если лоток вообще есть. Иначе окно
+     * исчезло бы навсегда вместе с единственным способом его вернуть. */
+    if (m_tray && m_tray->isVisible()) {
+        hide();
+        e->ignore();
+        return;
+    }
+    QMainWindow::closeEvent(e);
 }
 
 void ChatWindow::showEvent(QShowEvent *e) {
@@ -573,6 +601,11 @@ void ChatWindow::onSidebarMenu(const QPoint &globalPos) {
     menu.addSeparator();
     /* Search messages / clear chat history относятся к текущему чату и
      * вызываются из меню «⋮» в шапке ChatArea — здесь больше не дублируются. */
+    QAction *serverAct     = menu.addAction(tr("Run a relay here…"));
+    QAction *keyExchAct    = menu.addAction(tr("Key exchange…"));
+    QAction *fontAct       = menu.addAction(tr("Chat font…"));
+    menu.addSeparator();
+    QAction *docAct        = menu.addAction(tr("Documentation"));
     QAction *updateAct     = menu.addAction(tr("Check for updates"));
     QAction *aboutAct      = menu.addAction(tr("About F.E.A.R."));
     menu.addSeparator();
@@ -596,9 +629,135 @@ void ChatWindow::onSidebarMenu(const QPoint &globalPos) {
             QMessageBox::information(this, tr("Identity"),
                 tr("New identity created. Its public key was copied to the clipboard."));
     }
+    else if (picked == serverAct)     runLocalServer();
+    else if (picked == keyExchAct)    openKeyExchange();
+    else if (picked == fontAct)       chooseChatFont();
+    else if (picked == docAct)        openDocumentation();
     else if (picked == updateAct)     checkForUpdates(/*silent=*/false);
     else if (picked == aboutAct)      showAbout();
     else if (picked == quitAct)       close();
+}
+
+// ───────── Перенесено из старого окна ─────────
+
+/**
+ * Поднять ретранслятор прямо здесь.
+ *
+ * Смысл ровно один: не зависеть от чужого сервера. Своя машина - свой
+ * ретранслятор, и никто посторонний не видит даже того немногого, что
+ * ретранслятору положено видеть.
+ *
+ * Порт запоминается: человек, поднявший сервер однажды, поднимет его на том
+ * же порту и завтра.
+ */
+void ChatWindow::runLocalServer() {
+    QSettings st;
+    bool ok = false;
+    const int port = QInputDialog::getInt(
+        this, tr("Run a relay here"),
+        tr("Port to listen on:"),
+        st.value(QStringLiteral("last/port"), 7777).toInt(),
+        1, 65535, 1, &ok);
+    if (!ok) return;
+
+    /* Запуск может упереться в занятый порт или права, поэтому курсор
+     * ожидания, а не молчание: процесс поднимается не мгновенно. */
+    QApplication::setOverrideCursor(Qt::WaitCursor);
+    const bool started = m_backend->createServer(port, QStringLiteral("Server"));
+    QApplication::restoreOverrideCursor();
+
+    if (started) {
+        st.setValue(QStringLiteral("last/port"), port);
+        QMessageBox::information(this, tr("Run a relay here"),
+            tr("The relay is listening on port %1.\n\n"
+               "Others reach it at this machine's address; from here it is "
+               "127.0.0.1.").arg(port));
+    } else {
+        QMessageBox::warning(this, tr("Run a relay here"),
+            tr("Could not start the relay on port %1. It may already be in "
+               "use, or the port may need privileges.").arg(port));
+    }
+}
+
+/**
+ * Ручной обмен ключами.
+ *
+ * Обычный вход в комнату делает то же самое сам. Это - для случая, когда
+ * ключ нужно получить, не подключаясь: договориться о ключе заранее и
+ * другим каналом.
+ */
+void ChatWindow::openKeyExchange() {
+    KeyExchangeDialog dlg(this);
+    dlg.exec();
+}
+
+/**
+ * Шрифт переписки.
+ *
+ * Не украшательство: у людей разное зрение и разные экраны, а читать
+ * приходится подолгу. Выбор запоминается.
+ */
+void ChatWindow::chooseChatFont() {
+    QSettings st;
+    QFont current = m_chatArea->messageFont();
+    bool ok = false;
+    const QFont chosen = QFontDialog::getFont(&ok, current, this, tr("Chat font"));
+    if (!ok) return;
+    m_chatArea->setMessageFont(chosen);
+    st.setValue(QStringLiteral("chat/font"), chosen.toString());
+}
+
+/** Руководство. Лежит рядом с программой, открывается системным средством. */
+void ChatWindow::openDocumentation() {
+    const QStringList candidates = {
+        QCoreApplication::applicationDirPath() + QStringLiteral("/doc/README.md"),
+        QCoreApplication::applicationDirPath() + QStringLiteral("/README.md"),
+        QStringLiteral("doc/README.md"),
+    };
+    for (const QString &c : candidates) {
+        if (QFile::exists(c)) {
+            QDesktopServices::openUrl(QUrl::fromLocalFile(QFileInfo(c).absoluteFilePath()));
+            return;
+        }
+    }
+    QDesktopServices::openUrl(QUrl(QStringLiteral("https://github.com/shchuchkin-pkims/fear")));
+}
+
+/**
+ * Значок в системном лотке.
+ *
+ * Закрытое окно не должно означать пропущенный разговор: соединение живёт
+ * дальше, и о новом сообщении говорит значок. Если лотка в системе нет,
+ * молча обходимся без него - окно закрывается как обычно.
+ */
+void ChatWindow::setupTray() {
+    if (!QSystemTrayIcon::isSystemTrayAvailable()) return;
+
+    m_tray = new QSystemTrayIcon(windowIcon(), this);
+    m_tray->setToolTip(QStringLiteral("F.E.A.R."));
+
+    QMenu *menu = new QMenu(this);
+    QAction *showAct = menu->addAction(tr("Show"));
+    menu->addSeparator();
+    QAction *quitAct = menu->addAction(tr("Quit"));
+    m_tray->setContextMenu(menu);
+
+    connect(showAct, &QAction::triggered, this, [this]() {
+        showNormal();
+        raise();
+        activateWindow();
+    });
+    /* Выход именно отсюда, а не close(): close() прячет окно в лоток, и без
+     * отдельного пункта программу нельзя было бы закрыть вовсе. */
+    connect(quitAct, &QAction::triggered, qApp, &QCoreApplication::quit);
+    connect(m_tray, &QSystemTrayIcon::activated, this,
+            [this](QSystemTrayIcon::ActivationReason r) {
+        if (r == QSystemTrayIcon::Trigger || r == QSystemTrayIcon::DoubleClick) {
+            if (isVisible()) hide();
+            else { showNormal(); raise(); activateWindow(); }
+        }
+    });
+    m_tray->show();
 }
 
 void ChatWindow::openContacts() {

@@ -82,7 +82,6 @@ set(SOURCES
     updatedialog.cpp
     settingsdialog.cpp
     knownkeysdialog.cpp
-    mainwindow.cpp
     # New Telegram-style UI (Phase 1)
     chatwindow.cpp
     connectiondialog.cpp
@@ -122,7 +121,6 @@ set(HEADERS
     updatedialog.h
     settingsdialog.h
     knownkeysdialog.h
-    mainwindow.h
     chatwindow.h
     connectiondialog.h
     registerhandledialog.h

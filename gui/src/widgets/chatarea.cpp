@@ -578,6 +578,12 @@ void ChatArea::appendMessage(const Message &m) {
     };
     auto *bubble = new MessageBubble(m, onSenderClick, m_messagesContainer);
     bubble->setMinimumHeight(34);
+    /* Выбранный шрифт применяется и к только что созданному пузырю: иначе
+     * настройка действовала бы лишь на сообщения, пришедшие после неё. */
+    if (m_messageFont.family() != QFont().family() ||
+        m_messageFont.pointSize() != QFont().pointSize()) {
+        for (QTextEdit *t : bubble->findChildren<QTextEdit *>()) t->setFont(m_messageFont);
+    }
     m_messagesLayout->insertWidget(m_messagesLayout->count() - 1, bubble);
 
     // Scroll to bottom on next event loop pass
@@ -585,6 +591,20 @@ void ChatArea::appendMessage(const Message &m) {
         auto *bar = m_scroll->verticalScrollBar();
         bar->setValue(bar->maximum());
     }, Qt::QueuedConnection);
+}
+
+void ChatArea::setMessageFont(const QFont &f) {
+    m_messageFont = f;
+    /* Применяем к уже показанным сообщениям. Высота пузыря считается через
+     * heightForWidth по документу, поэтому после смены шрифта её нужно
+     * пересчитать - иначе текст либо обрежется, либо оставит пустоту. */
+    for (QTextEdit *t : findChildren<QTextEdit *>()) {
+        t->setFont(f);
+        t->document()->adjustSize();
+        t->updateGeometry();
+    }
+    if (m_messagesContainer) m_messagesContainer->updateGeometry();
+    update();
 }
 
 void ChatArea::showEmptyState(const QString &hint) {
