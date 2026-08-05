@@ -38,6 +38,31 @@ static int ensure_schema(void) {
         "  PRIMARY KEY (identity_pk, blob_type)"
         ")") < 0) return -1;
 
+    if (exec_or_log(
+        "CREATE TABLE IF NOT EXISTS blocked_keys ("
+        "  identity_pk BLOB PRIMARY KEY,"
+        "  reason      TEXT,"
+        "  blocked_at  INTEGER NOT NULL"
+        ")") < 0) return -1;
+
+    /* Not persistent state so much as a window into memory: cleared at
+     * startup, because rows left by a run that crashed describe nobody. */
+    if (exec_or_log(
+        "CREATE TABLE IF NOT EXISTS live_sessions ("
+        "  fd           INTEGER PRIMARY KEY,"
+        "  name         TEXT,"
+        "  room         TEXT,"
+        "  addr         TEXT,"
+        "  is_media     INTEGER NOT NULL DEFAULT 0,"
+        "  connected_at INTEGER NOT NULL"
+        ")") < 0) return -1;
+
+    if (exec_or_log(
+        "CREATE TABLE IF NOT EXISTS server_state ("
+        "  key   TEXT PRIMARY KEY,"
+        "  value TEXT NOT NULL"
+        ")") < 0) return -1;
+
     return 0;
 }
 
@@ -274,4 +299,118 @@ int server_db_get_blob(const uint8_t pk[32], const char *blob_type,
     }
     sqlite3_finalize(q);
     return result;
+}
+
+/* ------------------------------------------------------------------ *
+ * Administration
+ * ------------------------------------------------------------------ */
+
+int server_db_block_key(const uint8_t pk[32], const char *reason) {
+    if (!g_db || !pk) return -1;
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(g_db,
+            "INSERT OR REPLACE INTO blocked_keys(identity_pk, reason, blocked_at)"
+            " VALUES (?, ?, ?)", -1, &st, NULL) != SQLITE_OK) {
+        return -1;
+    }
+    sqlite3_bind_blob(st, 1, pk, 32, SQLITE_STATIC);
+    if (reason) sqlite3_bind_text(st, 2, reason, -1, SQLITE_STATIC);
+    else        sqlite3_bind_null(st, 2);
+    sqlite3_bind_int64(st, 3, (sqlite3_int64)time(NULL));
+    int rc = sqlite3_step(st);
+    sqlite3_finalize(st);
+    return (rc == SQLITE_DONE) ? 0 : -1;
+}
+
+int server_db_unblock_key(const uint8_t pk[32]) {
+    if (!g_db || !pk) return -1;
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(g_db, "DELETE FROM blocked_keys WHERE identity_pk = ?",
+                           -1, &st, NULL) != SQLITE_OK) {
+        return -1;
+    }
+    sqlite3_bind_blob(st, 1, pk, 32, SQLITE_STATIC);
+    int rc = sqlite3_step(st);
+    sqlite3_finalize(st);
+    if (rc != SQLITE_DONE) return -1;
+    return sqlite3_changes(g_db) > 0 ? 1 : 0;
+}
+
+int server_db_is_blocked(const uint8_t pk[32]) {
+    if (!g_db || !pk) return 0;
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(g_db, "SELECT 1 FROM blocked_keys WHERE identity_pk = ?",
+                           -1, &st, NULL) != SQLITE_OK) {
+        /* A database that cannot be read must not lock everybody out. */
+        return 0;
+    }
+    sqlite3_bind_blob(st, 1, pk, 32, SQLITE_STATIC);
+    int blocked = (sqlite3_step(st) == SQLITE_ROW);
+    sqlite3_finalize(st);
+    return blocked;
+}
+
+static void state_set(const char *key, const char *value) {
+    if (!g_db) return;
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(g_db,
+            "INSERT OR REPLACE INTO server_state(key, value) VALUES (?, ?)",
+            -1, &st, NULL) != SQLITE_OK) {
+        return;
+    }
+    sqlite3_bind_text(st, 1, key, -1, SQLITE_STATIC);
+    sqlite3_bind_text(st, 2, value, -1, SQLITE_STATIC);
+    sqlite3_step(st);
+    sqlite3_finalize(st);
+}
+
+void server_db_sessions_reset(long pid) {
+    if (!g_db) return;
+    exec_or_log("DELETE FROM live_sessions");
+    char buf[64];
+    snprintf(buf, sizeof buf, "%lld", (long long)time(NULL));
+    state_set("started_at", buf);
+    snprintf(buf, sizeof buf, "%ld", pid);
+    state_set("pid", buf);
+    snprintf(buf, sizeof buf, "%d", SERVER_HEARTBEAT_SEC);
+    state_set("heartbeat_period", buf);
+    server_db_heartbeat();
+}
+
+void server_db_heartbeat(void) {
+    char buf[64];
+    snprintf(buf, sizeof buf, "%lld", (long long)time(NULL));
+    state_set("heartbeat_at", buf);
+}
+
+void server_db_session_add(int fd, const char *name, const char *room,
+                           const char *addr, int is_media) {
+    if (!g_db) return;
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(g_db,
+            "INSERT OR REPLACE INTO live_sessions"
+            "(fd, name, room, addr, is_media, connected_at) VALUES (?, ?, ?, ?, ?, ?)",
+            -1, &st, NULL) != SQLITE_OK) {
+        return;
+    }
+    sqlite3_bind_int  (st, 1, fd);
+    sqlite3_bind_text (st, 2, name ? name : "", -1, SQLITE_STATIC);
+    sqlite3_bind_text (st, 3, room ? room : "", -1, SQLITE_STATIC);
+    sqlite3_bind_text (st, 4, addr ? addr : "", -1, SQLITE_STATIC);
+    sqlite3_bind_int  (st, 5, is_media ? 1 : 0);
+    sqlite3_bind_int64(st, 6, (sqlite3_int64)time(NULL));
+    sqlite3_step(st);
+    sqlite3_finalize(st);
+}
+
+void server_db_session_remove(int fd) {
+    if (!g_db) return;
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(g_db, "DELETE FROM live_sessions WHERE fd = ?",
+                           -1, &st, NULL) != SQLITE_OK) {
+        return;
+    }
+    sqlite3_bind_int(st, 1, fd);
+    sqlite3_step(st);
+    sqlite3_finalize(st);
 }

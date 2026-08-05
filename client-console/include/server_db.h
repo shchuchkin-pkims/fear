@@ -92,4 +92,64 @@ int  server_db_put_blob(const uint8_t pk[32], const char *blob_type,
 int  server_db_get_blob(const uint8_t pk[32], const char *blob_type,
                         uint8_t **out, size_t *out_len);
 
+/* ------------------------------------------------------------------ *
+ * Administration
+ *
+ * Two tables the relay itself only writes, and the admin tool reads.
+ * ------------------------------------------------------------------ */
+
+/**
+ * Refuse to serve an identity key.
+ *
+ * What this can and cannot do is worth being precise about. The relay sees
+ * an identity key only where the protocol hands it one: registering a
+ * handle, looking one up by key, and the signed challenge that guards a
+ * blob. It never sees the key of an ordinary chat connection - that is the
+ * point of the design, and it is why a member's identity is announced inside
+ * the room's own encryption rather than to the server.
+ *
+ * So a block stops the key from claiming a name, being found by one, or
+ * keeping anything in the blob store. It does not stop whoever holds it from
+ * joining a room, because the relay cannot tell that they have. Making it
+ * able to tell would mean every client proving its identity to the server on
+ * connect, which would hand the operator exactly the list of who is talking
+ * that the rest of this design goes out of its way not to produce.
+ */
+int server_db_block_key(const uint8_t pk[32], const char *reason);
+
+/** Lift a block. Returns 1 if there was one, 0 if not, -1 on error. */
+int server_db_unblock_key(const uint8_t pk[32]);
+
+/** 1 if blocked, 0 if not. Errors read as "not blocked" so that a database
+ *  problem cannot lock everybody out. */
+int server_db_is_blocked(const uint8_t pk[32]);
+
+/**
+ * Start a fresh record of who is connected.
+ *
+ * Live state lives in the server's memory, so the table is a projection of
+ * it, cleared at startup: rows from a run that crashed describe nobody. The
+ * heartbeat is what lets a reader tell a busy relay from a dead one.
+ */
+void server_db_sessions_reset(long pid);
+
+/** Note a connection that has told us its name and room. */
+void server_db_session_add(int fd, const char *name, const char *room,
+                           const char *addr, int is_media);
+
+/** Forget one. Called wherever a client leaves the array. */
+void server_db_session_remove(int fd);
+
+/**
+ * Как часто ретранслятор отмечается живым, в секундах.
+ *
+ * Значение попадает и в саму базу, чтобы утилите не приходилось его
+ * угадывать: разъехавшись, эти два числа сделали бы работающий сервер
+ * «мёртвым» на экране администратора.
+ */
+#define SERVER_HEARTBEAT_SEC 10
+
+/** Say the relay is still alive. Cheap; called from the idle scan. */
+void server_db_heartbeat(void);
+
 #endif

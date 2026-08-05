@@ -124,6 +124,16 @@ if(NOT FEAR_GUI_ONLY)
 endif()
 
 # Юнит-тесты (ctest). Отключаются -DFEAR_BUILD_TESTS=OFF.
+# Утилита администрирования ретранслятора. Работает на той машине, где живёт
+# сервер, а сервер живёт под Linux (Dockerfile, systemd), поэтому под Windows
+# она не подключается: тамошняя сборка собирает минимальный набор клиента, и
+# тащить в неё Qt6::Sql ради утилиты, которую там некому запускать, незачем.
+# Сам код платформенно-нейтрален - если понадобится, это одна строка.
+option(FEAR_BUILD_ADMIN "Build the relay administration utility (needs Qt6)" ON)
+if(FEAR_BUILD_ADMIN AND NOT WIN32)
+    add_subdirectory(admin)
+endif()
+
 option(FEAR_BUILD_TESTS "Build unit tests" ON)
 if(FEAR_BUILD_TESTS)
     enable_testing()

@@ -74,6 +74,14 @@ set_tests_properties(fuzz_parsers PROPERTIES TIMEOUT 120)
 
 # Интеграционный smoke-тест: сервер + два консольных клиента (ECDH create/join,
 # доставка сообщений в обе стороны). Требует собранного таргета fear.
+# Чёрный список ключей и витрина живых сессий: то, чем управляет утилита
+# администрирования, и то, по чему сервер отказывает в обслуживании.
+add_fear_test(test_server_admin test_server_admin.c
+              ${CMAKE_SOURCE_DIR}/client-console/src/server_db.c)
+target_include_directories(test_server_admin PRIVATE
+                           ${CMAKE_SOURCE_DIR}/client-console/include)
+target_link_libraries(test_server_admin PRIVATE ${SQLITE3_LIBRARIES} sqlite3)
+
 add_test(NAME integration_smoke
          COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/smoke_chat.sh $<TARGET_FILE:fear>)
 set_tests_properties(integration_smoke PROPERTIES TIMEOUT 60)

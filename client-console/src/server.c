@@ -437,6 +437,15 @@ static int try_handle_command(client_t *cl, const uint8_t *frame, size_t flen) {
             return 1;
         }
 
+        /* После проверки подписи, а не до неё: отказ по ключу без подписи
+         * позволил бы кому угодно выяснить, заблокирован ли ключ, просто
+         * назвав его. */
+        if (server_db_is_blocked(pk)) {
+            send_handle_result(fd, room, room_len, 2, "key is blocked", NULL);
+            printf("[server] blocked key tried to register handle '%s'\n", handle);
+            return 1;
+        }
+
         handle_register_result_t rc = server_db_register_handle(handle, pk);
         switch (rc) {
             case HANDLE_REGISTER_OK:
@@ -582,6 +591,11 @@ static int try_handle_command(client_t *cl, const uint8_t *frame, size_t flen) {
             return 1;
         }
 
+        if (server_db_is_blocked(pk)) {
+            send_blob_result(fd, room, room_len, 2, "key is blocked");
+            return 1;
+        }
+
         /* server_db expects a NUL-terminated blob_type string. */
         char type_str[64];
         if (type_len >= sizeof(type_str)) type_len = sizeof(type_str) - 1;
@@ -665,6 +679,11 @@ static int try_handle_command(client_t *cl, const uint8_t *frame, size_t flen) {
         if (type_len >= sizeof(type_str)) type_len = sizeof(type_str) - 1;
         memcpy(type_str, cipher + 32 + 64 + 1, type_len);
         type_str[type_len] = '\0';
+
+        if (server_db_is_blocked(pk)) {
+            send_blob_result(fd, room, room_len, 2, "key is blocked");
+            return 1;
+        }
 
         uint8_t *blob = NULL; size_t blob_len = 0;
         int rc = server_db_get_blob(pk, type_str, &blob, &blob_len);
@@ -867,6 +886,14 @@ void run_server(uint16_t port) {
         printf("[server] WARN: server-db unavailable, handle commands will be rejected\n");
     }
 
+    /* Живые сессии - проекция памяти сервера, а не сохраняемое состояние:
+     * строки от упавшего прогона не описывают никого. */
+#ifdef _WIN32
+    server_db_sessions_reset((long)GetCurrentProcessId());
+#else
+    server_db_sessions_reset((long)getpid());
+#endif
+
     /* Create UDP socket for relay, bound to same port */
     sock_t udp_sock = (sock_t)socket(AF_INET, SOCK_DGRAM, 0);
     if (udp_sock < 0) {
@@ -902,10 +929,13 @@ void run_server(uint16_t port) {
             FD_SET(clients[i].fd, &rfds);
             if (clients[i].fd > maxfd) maxfd = clients[i].fd;
         }
-        /* Wake up at least once per minute so the idle scan below runs even
-         * when nobody is sending traffic. */
+        /* Wake up regularly so the idle scan below runs even when nobody is
+         * sending traffic, and so the heartbeat the admin utility reads stays
+         * fresh. Ten seconds rather than a minute: six wake-ups a minute on
+         * an idle relay cost nothing, and a minute-old heartbeat cannot tell
+         * a stopped relay from a quiet one. */
         struct timeval tv;
-        tv.tv_sec = 60;
+        tv.tv_sec = SERVER_HEARTBEAT_SEC;
         tv.tv_usec = 0;
         int r = select((int)(maxfd + 1), &rfds, NULL, NULL, &tv);
         if (r < 0) { perror("select"); break; }
@@ -916,6 +946,11 @@ void run_server(uint16_t port) {
          * crashes, gets killed, or its NAT silently drops the flow we
          * release the slot here without waiting for TCP keepalive. */
         time_t now = time(NULL);
+        static time_t last_beat = 0;
+        if (now - last_beat >= SERVER_HEARTBEAT_SEC) {
+            last_beat = now;
+            server_db_heartbeat();
+        }
         for (int i = 0; i < nclients; i++) {
             if (now - clients[i].last_seen <= IDLE_TIMEOUT_SEC) continue;
             printf("[server] idle kick: %s@%s silent for %lds\n",
@@ -929,6 +964,7 @@ void run_server(uint16_t port) {
             } else {
                 dropped_room[0] = '\0';
             }
+            server_db_session_remove((int)clients[i].fd);
             close_socket(clients[i].fd);
             clients[i] = clients[nclients - 1];
             nclients--;
@@ -1092,6 +1128,7 @@ void run_server(uint16_t port) {
                     dropped_room[0] = '\0';
                 }
 
+                server_db_session_remove((int)clients[i].fd);
                 close_socket(clients[i].fd);
                 clients[i] = clients[nclients - 1];
                 nclients--;
@@ -1159,6 +1196,7 @@ void run_server(uint16_t port) {
                            (int)name_len, name, (int)room_len, room);
                     send_error_and_close(clients[i].fd, room, room_len,
                                          "Name already taken in this room");
+                    server_db_session_remove((int)clients[i].fd);
                     clients[i] = clients[nclients - 1];
                     nclients--;
                     i--;
@@ -1175,6 +1213,22 @@ void run_server(uint16_t port) {
                     printf("[server] media relay registered: name='%s', room='%s'\n",
                            clients[i].name, clients[i].room);
                 } else {
+                    /* Живые сессии - проекция того, что и так лежит в
+                     * памяти сервера: только имя, комната и адрес, то есть
+                     * ровно то, по чему сервер и так маршрутизирует. */
+                    {
+                        struct sockaddr_in peer;
+                        socklen_t plen = sizeof peer;
+                        char addrbuf[32] = "";
+                        if (getpeername(clients[i].fd, (struct sockaddr *)&peer,
+                                        &plen) == 0) {
+                            snprintf(addrbuf, sizeof addrbuf, "%s",
+                                     inet_ntoa(peer.sin_addr));
+                        }
+                        server_db_session_add((int)clients[i].fd, clients[i].name,
+                                              clients[i].room, addrbuf,
+                                              clients[i].is_media_relay);
+                    }
                     printf("[server] client registered: name='%s', room='%s'\n",
                            clients[i].name, clients[i].room);
                     // Отправляем обновленный список участников всем в комнате
