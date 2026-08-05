@@ -2424,8 +2424,27 @@ int recv_and_decrypt(sock_t s, const char *room, const uint8_t *key, const char 
                     int was_unnamed = roster_display(name) == NULL;
                     if (tofu != TOFU_KEY_CONFLICT)
                         roster_note_identity(name, peer_pk, display);
-                    if (was_unnamed && roster_display(name) != NULL)
+                    if (was_unnamed && roster_display(name) != NULL) {
                         roster_print_users();
+                        /*
+                         * Назовись в ответ.
+                         *
+                         * Вошедший получает ключ комнаты не мгновенно, а
+                         * анонс запечатан ключом-родоначальником: наш анонс,
+                         * посланный на смену состава, приходит к нему раньше
+                         * ключа и открыть его нечем. Второго повода
+                         * объявиться нет - смена состава уже прошла, - и он
+                         * остаётся с огрызком метки вместо имени навсегда.
+                         *
+                         * Услышали незнакомую метку - значит её хозяин уже с
+                         * ключом и наш анонс теперь откроет. Отвечаем ровно
+                         * один раз на метку: was_unnamed бывает истинным
+                         * только при первом её опознании, так что перезвон
+                         * здесь невозможен.
+                         */
+                        send_identity_announce(s, room, myname, key,
+                                               g_identity_sk, g_identity_pk);
+                    }
                     if (tofu == TOFU_NEW_KEY) {
                         printf("[TOFU] New identity for \"%s\": %s\n", display, fp);
                     } else if (tofu == TOFU_KEY_MATCH) {
