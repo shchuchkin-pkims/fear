@@ -16,6 +16,10 @@
 
 #define _POSIX_C_SOURCE 200809L
 
+#if defined(__linux__)
+#  include <linux/sockios.h>   /* SIOCOUTQ */
+#  include <sys/ioctl.h>
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -470,6 +474,37 @@ static int send_udp_registration(AudioCall *c) {
 #define MSG_TYPE_MEDIA_RELAY 17
 #define TCP_NONCE_LEN 12
 
+
+/*
+ * Сколько наших байт ещё не ушло.
+ *
+ * Где спросить нельзя - отвечаем 0: лучше не знать, чем угадывать, а
+ * поведение остаётся прежним.
+ */
+static long relay_pending_bytes(socket_t fd) {
+#if defined(__linux__)
+    int n = 0;
+    if (ioctl((int)fd, SIOCOUTQ, &n) == 0) return (long)n;
+#else
+    (void)fd;
+#endif
+    return 0;
+}
+
+/*
+ * Порог, за которым кадр выбрасывается, а не становится в очередь.
+ *
+ * Кодировщик выдаёт кадры равномерно, канал - как получится. Пиши мы их в
+ * сокет без оглядки, при узком канале очередь растёт неограниченно: на
+ * живом звонке набралось 662 КБ неотправленного, и собеседник смотрел
+ * видео четырёхсекундной давности. Устаревший кадр не нужен никому, а
+ * место перед свежим занимает.
+ *
+ * 96 КБ - это примерно полторы секунды при 500 кбит/с: достаточно, чтобы
+ * пережить короткий затор, и мало, чтобы разговор оставался разговором.
+ */
+#define RELAY_BACKLOG_LIMIT (96 * 1024)
+
 static int tcp_send_all(socket_t fd, const void *buf, size_t len) {
     const uint8_t *p = (const uint8_t *)buf;
     size_t sent = 0;
@@ -602,6 +637,23 @@ static int tcp_relay_register(AudioCall *c) {
 }
 
 static int tcp_relay_send_media(AudioCall *c, const uint8_t *media, int media_len) {
+    /*
+     * Затор - роняем кадр.
+     *
+     * Иначе он встанет в хвост очереди, которая и так не разгребается, и
+     * доедет до собеседника устаревшим. Дальше только хуже: очередь растёт,
+     * задержка вместе с ней. Лучше пропуск в картинке сейчас, чем верная
+     * картинка с опозданием на секунды.
+     */
+    if (relay_pending_bytes(c->tcp_sock) > RELAY_BACKLOG_LIMIT) {
+        static long dropped = 0;
+        if (++dropped % 100 == 1) {
+            fprintf(stderr, "[relay] link is backed up, dropping media "
+                            "(%ld frames so far)\n", dropped);
+        }
+        return 0;
+    }
+
     uint16_t room_len = (uint16_t)strlen(c->relay_room);
     uint16_t name_len = (uint16_t)strlen(c->relay_name);
     size_t frame_len = 2 + room_len + 2 + name_len + 2 + TCP_NONCE_LEN + 1 + 4 + (size_t)media_len;

@@ -17,6 +17,10 @@
  * - Handle client disconnections
  */
 
+#if defined(__linux__)
+#  include <linux/sockios.h>   /* SIOCOUTQ: сколько байт ещё не ушло */
+#  include <sys/ioctl.h>
+#endif
 #include "tls.h"
 #include "server.h"
 #include "network.h"
@@ -213,8 +217,35 @@ static int read_frame(sock_t fd, uint8_t **out, size_t *outlen) {
  *
  * @note Automatically removes clients if send fails
  */
+/*
+ * Сколько байт ещё не ушло получателю.
+ *
+ * Нужно ровно для одного решения: не тащить ли мы за собой очередь. Где
+ * спросить нельзя (Windows, экзотика) - отвечаем 0, и поведение остаётся
+ * прежним: лучше не знать, чем угадывать.
+ */
+static long pending_bytes(sock_t fd) {
+#if defined(__linux__)
+    int n = 0;
+    if (ioctl((int)fd, SIOCOUTQ, &n) == 0) return (long)n;
+#else
+    (void)fd;
+#endif
+    return 0;
+}
+
+/*
+ * Сколько невыгруженного терпим у получателя, прежде чем ронять медиа.
+ *
+ * Это не про память, а про время. При 500 кбит/с четверть мегабайта - это
+ * четыре секунды видео, ждущего своей очереди; кадр такого возраста не
+ * нужен никому. Показания живого звонка: 662 КБ неотправленного и окно
+ * приёма, схлопнувшееся до 512 байт.
+ */
+#define MEDIA_BACKLOG_LIMIT (128 * 1024)
+
 static void broadcast(client_t *clients, int *nclients, const char *room,
-                     const uint8_t *frame, size_t flen, sock_t from) {
+                     const uint8_t *frame, size_t flen, sock_t from, int is_media) {
     /* Extract frame fields to validate structure */
     if (flen < 2) return;
     uint16_t room_len = rd_u16(frame);
@@ -237,6 +268,29 @@ static void broadcast(client_t *clients, int *nclients, const char *room,
 
         /* Only send to clients in same room */
         if (strcmp(clients[i].room, room) != 0) {
+            continue;
+        }
+
+        /*
+         * Медиа роняем, а не задерживаем.
+         *
+         * send_all блокирующий: пока он ждёт медленного получателя, сервер
+         * не читает ни у кого. Окна приёма схлопываются, очереди у всех
+         * отправителей растут, и задержка звонка идёт на секунды - при том
+         * что тормозит один участник. Классическая блокировка головы
+         * очереди, и на живом звонке она давала RTT в четыре секунды.
+         *
+         * Терять кадры мультимедиа допустимо - задерживать нет: устаревшее
+         * видео бесполезно, а место в очереди оно занимает. Переписку это
+         * не касается: она мелкая, и потеря там невосполнима.
+         */
+        if (is_media && pending_bytes(clients[i].fd) > MEDIA_BACKLOG_LIMIT) {
+            static long dropped = 0;
+            if (++dropped % 200 == 1) {
+                printf("[server] dropping media for a backed-up client "
+                       "(%ld frames so far)\n", dropped);
+                fflush(stdout);
+            }
             continue;
         }
 
@@ -1448,7 +1502,16 @@ void run_server_opts(uint16_t port, int64_t inbox_ttl) {
                 continue;
             }
 
-            broadcast(clients, &nclients, clients[i].room, frame, flen, clients[i].fd);
+            {
+                /* Тип кадра лежит за комнатой, именем и nonce. Он же решает,
+                 * можно ли этот кадр ронять. */
+                const uint16_t nl = rd_u16(frame + 2 + room_len);
+                const uint16_t npl = rd_u16(frame + 2 + room_len + 2 + nl);
+                const size_t at = 2 + (size_t)room_len + 2 + nl + 2 + npl;
+                const int media = (at < flen && frame[at] == MSG_TYPE_MEDIA_RELAY);
+                broadcast(clients, &nclients, clients[i].room, frame, flen,
+                          clients[i].fd, media);
+            }
             free(frame);
         }
     }
