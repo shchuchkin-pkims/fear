@@ -43,6 +43,12 @@ add_fear_test(test_media_hello  test_media_hello.c  ${IDENTITY_DIR}/media_hello.
 add_fear_test(test_media_senders test_media_senders.c ${IDENTITY_DIR}/media_senders.c ${IDENTITY_DIR}/media_keys.c)
 add_fear_test(test_call_invite  test_call_invite.c  ${IDENTITY_DIR}/call_invite.c ${IDENTITY_DIR}/media_keys.c)
 add_fear_test(test_media_packet test_media_packet.c ${IDENTITY_DIR}/media_packet.c ${IDENTITY_DIR}/media_keys.c)
+add_fear_test(test_mic_dsp test_mic_dsp.c ${IDENTITY_DIR}/mic_dsp.c)
+# Обработка микрофона считает в плавающей точке - нужна libm там, где она
+# не входит в libc.
+if(NOT WIN32)
+    target_link_libraries(test_mic_dsp PRIVATE m)
+endif()
 add_fear_test(test_chat_frame   test_chat_frame.c   ${IDENTITY_DIR}/chat_frame.c ${IDENTITY_DIR}/key_schedule.c)
 add_fear_test(test_room_keys    test_room_keys.c    ${IDENTITY_DIR}/room_keys.c ${IDENTITY_DIR}/chat_frame.c ${IDENTITY_DIR}/key_schedule.c ${IDENTITY_DIR}/identity.c ${IDENTITY_DIR}/identity_at_rest.c)
 add_fear_test(test_rotation_bundle test_rotation_bundle.c ${IDENTITY_DIR}/rotation_bundle.c ${IDENTITY_DIR}/rotation.c)

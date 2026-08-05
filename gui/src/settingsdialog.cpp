@@ -7,6 +7,7 @@
 #include <QVBoxLayout>
 #include <QHBoxLayout>
 #include <QFormLayout>
+#include <QSlider>
 #include <QGroupBox>
 #include <QFile>
 #include <QFileInfo>
@@ -165,6 +166,45 @@ void SettingsDialog::setupAudioTab(QTabWidget *tabs) {
     devForm->addRow("Output device:", audioOutputCombo);
     form->addRow(devGroup);
 
+    QGroupBox *micGroup = new QGroupBox("Microphone");
+    QFormLayout *micForm = new QFormLayout(micGroup);
+
+    micGainSlider = new QSlider(Qt::Horizontal);
+    micGainSlider->setRange(-24, 24);
+    micGainSlider->setTickPosition(QSlider::TicksBelow);
+    micGainSlider->setTickInterval(6);
+    micGainValue = new QLabel("0 dB");
+    micGainValue->setMinimumWidth(48);
+    connect(micGainSlider, &QSlider::valueChanged, this, [this](int v) {
+        micGainValue->setText(QString("%1%2 dB").arg(v > 0 ? "+" : "").arg(v));
+    });
+    QWidget *gainRow = new QWidget();
+    QHBoxLayout *gainLay = new QHBoxLayout(gainRow);
+    gainLay->setContentsMargins(0, 0, 0, 0);
+    gainLay->addWidget(micGainSlider, 1);
+    gainLay->addWidget(micGainValue, 0);
+    micForm->addRow("Sensitivity:", gainRow);
+
+    noiseSuppressCombo = new QComboBox();
+    noiseSuppressCombo->addItem("Off", "off");
+    noiseSuppressCombo->addItem("Low", "low");
+    noiseSuppressCombo->addItem("Medium", "medium");
+    noiseSuppressCombo->addItem("High - noisy room", "high");
+    micForm->addRow("Noise suppression:", noiseSuppressCombo);
+
+    /* Обещать надо ровно то, что программа делает. Здесь не спектральная
+     * чистка: шум из-под голоса не вычитается, и пока человек говорит, фон
+     * слышен таким, какой он есть. Уходит то, что слышно в паузах. */
+    QLabel *micNote = new QLabel(
+        "Suppression silences steady background - fans, hum, street noise - "
+        "in the gaps between words. It does not strip noise from under your "
+        "voice while you speak. \"High\" can clip quiet speech.");
+    micNote->setWordWrap(true);
+    micNote->setStyleSheet("color: gray; font-size: 11px;");
+    micForm->addRow(micNote);
+
+    form->addRow(micGroup);
+
     QLabel *note = new QLabel("Device selection is applied when starting audio/video calls.");
     note->setWordWrap(true);
     note->setStyleSheet("color: gray; font-size: 11px;");
@@ -185,7 +225,41 @@ void SettingsDialog::setupVideoTab(QTabWidget *tabs) {
     videoQualityCombo->addItem("Medium (640x480, 25 fps)", "medium");
     videoQualityCombo->addItem("High (1280x720, 30 fps)", "high");
 
+    videoQualityCombo->addItem("Manual", "manual");
     qualForm->addRow("Quality preset:", videoQualityCombo);
+
+    manualVideoBox = new QWidget();
+    QFormLayout *manForm = new QFormLayout(manualVideoBox);
+    manForm->setContentsMargins(0, 0, 0, 0);
+
+    videoWidthSpin = new QSpinBox();
+    videoWidthSpin->setRange(160, 3840);
+    videoWidthSpin->setSingleStep(16);
+    videoHeightSpin = new QSpinBox();
+    videoHeightSpin->setRange(120, 2160);
+    videoHeightSpin->setSingleStep(16);
+    videoFpsSpin = new QSpinBox();
+    videoFpsSpin->setRange(5, 60);
+    videoBitrateSpin = new QSpinBox();
+    videoBitrateSpin->setRange(64, 8000);
+    videoBitrateSpin->setSingleStep(64);
+    videoBitrateSpin->setSuffix(" kbit/s");
+
+    manForm->addRow("Width:", videoWidthSpin);
+    manForm->addRow("Height:", videoHeightSpin);
+    manForm->addRow("Frame rate:", videoFpsSpin);
+    manForm->addRow("Bitrate:", videoBitrateSpin);
+    qualForm->addRow(manualVideoBox);
+
+    /* Ручные поля показываются только когда они действуют: видимое, но
+     * ничего не меняющее поле - худший вид настройки. */
+    auto syncManual = [this]() {
+        manualVideoBox->setVisible(
+            videoQualityCombo->currentData().toString() == "manual");
+    };
+    connect(videoQualityCombo, &QComboBox::currentTextChanged, this, syncManual);
+    syncManual();
+
     form->addRow(qualGroup);
 
     /* Default camera device */
@@ -356,6 +430,23 @@ void SettingsDialog::loadSettings() {
     /* Audio */
     QString audioIn = settings->value("audio/inputDevice", "System default").toString();
     QString audioOut = settings->value("audio/outputDevice", "System default").toString();
+    micGainSlider->setValue(settings->value("audio/micGainDb", 0).toInt());
+    micGainValue->setText(QString("%1%2 dB")
+        .arg(micGainSlider->value() > 0 ? "+" : "").arg(micGainSlider->value()));
+    {
+        const QString ns = settings->value("audio/noiseSuppress", "medium").toString();
+        for (int i = 0; i < noiseSuppressCombo->count(); i++) {
+            if (noiseSuppressCombo->itemData(i).toString() == ns) {
+                noiseSuppressCombo->setCurrentIndex(i);
+                break;
+            }
+        }
+    }
+    videoWidthSpin->setValue(settings->value("video/width", 640).toInt());
+    videoHeightSpin->setValue(settings->value("video/height", 480).toInt());
+    videoFpsSpin->setValue(settings->value("video/fps", 25).toInt());
+    videoBitrateSpin->setValue(settings->value("video/bitrate", 800).toInt());
+
     int idx = audioInputCombo->findText(audioIn);
     if (idx >= 0) audioInputCombo->setCurrentIndex(idx);
     idx = audioOutputCombo->findText(audioOut);
@@ -403,6 +494,13 @@ void SettingsDialog::saveSettings() {
     emit chatFontChanged(newFont);
 
     /* Audio */
+    settings->setValue("audio/micGainDb", micGainSlider->value());
+    settings->setValue("audio/noiseSuppress", noiseSuppressCombo->currentData().toString());
+    settings->setValue("video/width", videoWidthSpin->value());
+    settings->setValue("video/height", videoHeightSpin->value());
+    settings->setValue("video/fps", videoFpsSpin->value());
+    settings->setValue("video/bitrate", videoBitrateSpin->value());
+
     settings->setValue("audio/inputDevice", audioInputCombo->currentText());
     settings->setValue("audio/outputDevice", audioOutputCombo->currentText());
 

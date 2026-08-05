@@ -95,6 +95,7 @@ static int g_have_call_id = 0;
 
 /* Identity */
 #include "identity.h"
+#include "mic_dsp.h"
 
 /* ===== Configuration ===== */
 
@@ -320,6 +321,10 @@ typedef struct VideoCall {
 
     /* Relay mode */
     int relay_mode;
+    /* Обработка микрофона - та же, что и в звуковом звонке: в видеозвонке
+     * микрофон тот же самый, и фон в паузах слышен ровно так же. */
+    mic_dsp_t mic;
+
     char relay_room[256];
     char relay_name[256];
     socket_t tcp_sock;      /* TCP socket for relay (0 = unused) */
@@ -459,6 +464,10 @@ static int tcp_relay_connect(VideoCall *vc, const char *ip, uint16_t port) {
     printf("TCP relay connected to %s:%u\n", ip, port);
     return 0;
 }
+
+/* См. audio_call: настройка запуска, а не отдельного звонка. */
+static float          g_mic_gain_db = 0.0f;
+static mic_ns_level_t g_mic_ns      = MIC_NS_MEDIUM;
 
 static int tcp_relay_register(VideoCall *vc) {
     /* Send first message to register room+name with server */
@@ -1460,6 +1469,9 @@ static THREAD_RET th_asend_func(void *arg) {
             if (pe != paNoError) { msleep(2); continue; }
         }
 
+        /* Между микрофоном и кодировщиком - см. mic_dsp.h. */
+        mic_dsp_process(&vc->mic, pcm, VC_FRAME_SAMPLES);
+
         int enc_bytes = opus_encode(vc->enc, pcm, VC_FRAME_SAMPLES,
                                      opus_buf, (opus_int32)sizeof(opus_buf));
         if (enc_bytes < 0) continue;
@@ -1928,6 +1940,8 @@ static int audio_init_codec(VideoCall *vc) {
     int err = 0;
     vc->enc = opus_encoder_create(VC_SAMPLE_RATE, VC_CHANNELS, OPUS_APPLICATION_VOIP, &err);
     if (!vc->enc || err != OPUS_OK) return -1;
+
+    mic_dsp_init(&vc->mic, g_mic_gain_db, g_mic_ns, VC_SAMPLE_RATE);
 
     opus_encoder_ctl(vc->enc, OPUS_SET_BITRATE(128000));
     opus_encoder_ctl(vc->enc, OPUS_SET_COMPLEXITY(5));
@@ -2656,6 +2670,19 @@ static int start_video_call(const char *remote_ip, uint16_t remote_port,
 }
 
 int main(int argc, char **argv) {
+    /* Настройки микрофона разбираются раньше выбора режима - см. audio_call. */
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--mic-gain") == 0 && i + 1 < argc) {
+            g_mic_gain_db = (float)atof(argv[i + 1]);
+        } else if (strcmp(argv[i], "--noise-suppress") == 0 && i + 1 < argc) {
+            if (mic_ns_from_string(argv[i + 1], &g_mic_ns) != 0) {
+                fprintf(stderr, "unknown noise suppression level: %s "
+                                "(off, low, medium, high)\n", argv[i + 1]);
+                return 1;
+            }
+        }
+    }
+
     if (argc < 2) {
         print_usage(argv[0]);
         return 1;

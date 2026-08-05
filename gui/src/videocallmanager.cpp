@@ -3,6 +3,7 @@
  * @brief Implementation of video call process manager
  */
 
+#include <QSettings>
 #include "videocallmanager.h"
 #include <QApplication>
 #include <QFile>
@@ -79,6 +80,22 @@ QStringList VideoCallManager::buildArgs(const QString &quality, bool adaptive,
     if (audioOutput >= 0) args << "--audio-output" << QString::number(audioOutput);
     if (noVideo) args << "--no-video";
     if (noAudio) args << "--no-audio";
+
+    /*
+     * Настройки микрофона из общих настроек программы.
+     *
+     * Читаются здесь, а не запоминаются при старте: человек может открыть
+     * настройки и подвинуть ползунок между звонками, и следующий звонок
+     * должен пойти уже с новым значением, без перезапуска программы.
+     */
+    {
+        QSettings st;
+        const int gain = st.value(QStringLiteral("audio/micGainDb"), 0).toInt();
+        const QString ns = st.value(QStringLiteral("audio/noiseSuppress"),
+                                    QStringLiteral("medium")).toString();
+        if (gain != 0) args << QStringLiteral("--mic-gain") << QString::number(gain);
+        args << QStringLiteral("--noise-suppress") << ns;
+    }
 
     return args;
 }

@@ -3,6 +3,7 @@
  * @brief Implementation of audio call process manager
  */
 
+#include <QSettings>
 #include "audiocallmanager.h"
 #include <QApplication>
 #include <QFile>
@@ -94,6 +95,22 @@ bool AudioCallManager::startCall(const QString &remoteIp, quint16 remotePort, co
         args << "--identity-file" << identityFilePath;
     }
 
+    /*
+     * Настройки микрофона из общих настроек программы.
+     *
+     * Читаются здесь, а не запоминаются при старте: человек может открыть
+     * настройки и подвинуть ползунок между звонками, и следующий звонок
+     * должен пойти уже с новым значением, без перезапуска программы.
+     */
+    {
+        QSettings st;
+        const int gain = st.value(QStringLiteral("audio/micGainDb"), 0).toInt();
+        const QString ns = st.value(QStringLiteral("audio/noiseSuppress"),
+                                    QStringLiteral("medium")).toString();
+        if (gain != 0) args << QStringLiteral("--mic-gain") << QString::number(gain);
+        args << QStringLiteral("--noise-suppress") << ns;
+    }
+
     if (localPort > 0) {
         args << QString::number(localPort);
     } else {
@@ -173,6 +190,22 @@ bool AudioCallManager::startListening(quint16 localPort, const QString &key,
         args << "--identity-file" << identityFilePath;
     }
 
+    /*
+     * Настройки микрофона из общих настроек программы.
+     *
+     * Читаются здесь, а не запоминаются при старте: человек может открыть
+     * настройки и подвинуть ползунок между звонками, и следующий звонок
+     * должен пойти уже с новым значением, без перезапуска программы.
+     */
+    {
+        QSettings st;
+        const int gain = st.value(QStringLiteral("audio/micGainDb"), 0).toInt();
+        const QString ns = st.value(QStringLiteral("audio/noiseSuppress"),
+                                    QStringLiteral("medium")).toString();
+        if (gain != 0) args << QStringLiteral("--mic-gain") << QString::number(gain);
+        args << QStringLiteral("--noise-suppress") << ns;
+    }
+
     // Add device parameters
     if (inputDevice >= 0) {
         args << QString::number(inputDevice);
@@ -242,6 +275,22 @@ bool AudioCallManager::startRelay(const QString &serverIp, quint16 serverPort,
 
     if (!identityFilePath.isEmpty() && QFile::exists(identityFilePath)) {
         args << "--identity-file" << identityFilePath;
+    }
+
+    /*
+     * Настройки микрофона из общих настроек программы.
+     *
+     * Читаются здесь, а не запоминаются при старте: человек может открыть
+     * настройки и подвинуть ползунок между звонками, и следующий звонок
+     * должен пойти уже с новым значением, без перезапуска программы.
+     */
+    {
+        QSettings st;
+        const int gain = st.value(QStringLiteral("audio/micGainDb"), 0).toInt();
+        const QString ns = st.value(QStringLiteral("audio/noiseSuppress"),
+                                    QStringLiteral("medium")).toString();
+        if (gain != 0) args << QStringLiteral("--mic-gain") << QString::number(gain);
+        args << QStringLiteral("--noise-suppress") << ns;
     }
 
     if (inputDevice >= 0) {

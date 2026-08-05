@@ -71,6 +71,7 @@ typedef int socket_t;
 #include "media_senders.h"
 #include "media_packet.h"
 #include "identity.h"
+#include "mic_dsp.h"
 
 /* -------------------------- Конфигурация --------------------------------- */
 
@@ -192,6 +193,12 @@ typedef struct AudioCall {
 
     /* Relay mode */
     int relay_mode;
+    /* Обработка микрофона: чувствительность и ворота против фона.
+     * Состояние живёт весь звонок - оценка фона набирается постепенно. */
+    mic_dsp_t mic;
+    float     mic_gain_db;
+    mic_ns_level_t mic_ns;
+
     char relay_room[256];
     char relay_name[256];
     socket_t tcp_sock;      /* TCP socket for relay (0 = unused) */
@@ -887,6 +894,11 @@ static THREAD_RET th_send_func(void *arg) {
             }
         }
 
+        /* Между микрофоном и кодировщиком: срез низов, ворота против фона
+         * и чувствительность. Именно здесь, а не после кодирования, -
+         * кодировщику достаётся уже то, что услышит собеседник. */
+        mic_dsp_process(&c->mic, pcm, AC_FRAME_SAMPLES);
+
         int enc_bytes = opus_encode(c->enc, pcm, AC_FRAME_SAMPLES, opus, (opus_int32)sizeof(opus));
         if (enc_bytes < 0) {
             continue;
@@ -1292,6 +1304,8 @@ static int audio_init_codec(AudioCall *c) {
         fprintf(stderr, "opus_encoder_create error: %d\n", err);
         return -1;
     }
+    mic_dsp_init(&c->mic, c->mic_gain_db, c->mic_ns, AC_SAMPLE_RATE);
+
     opus_encoder_ctl(c->enc, OPUS_SET_BITRATE(AC_OPUS_BITRATE));
     opus_encoder_ctl(c->enc, OPUS_SET_COMPLEXITY(AC_OPUS_COMPLEXITY));
     opus_encoder_ctl(c->enc, OPUS_SET_SIGNAL(OPUS_SIGNAL_VOICE));
@@ -1434,6 +1448,20 @@ static void ac_free_wiped(AudioCall *c) {
     free(c);
 }
 
+/*
+ * Настройки микрофона - свойство запуска, а не отдельного звонка: человек
+ * выставляет их под свой микрофон один раз. Держим их здесь, а не тянем
+ * двумя лишними параметрами через всю цепочку вызовов, каждый из которых
+ * пришлось бы править в четырёх местах.
+ */
+static float          g_mic_gain_db = 0.0f;
+static mic_ns_level_t g_mic_ns      = MIC_NS_MEDIUM;
+
+static void audio_call_set_mic(float gain_db, mic_ns_level_t ns) {
+    g_mic_gain_db = gain_db;
+    g_mic_ns      = ns;
+}
+
 int audio_call_start(AudioCall **out_call,
                      const char *remote_ip, uint16_t remote_port,
                      uint16_t bind_port,
@@ -1506,6 +1534,9 @@ int audio_call_start(AudioCall **out_call,
            c->own_sid[0], c->own_sid[1], c->own_sid[2]);
 
     /* Relay mode setup */
+    c->mic_gain_db = g_mic_gain_db;
+    c->mic_ns      = g_mic_ns;
+
     c->relay_mode = relay_mode;
     /*
      * Комната ретранслятору называется меткой, а не именем.
@@ -1803,6 +1834,29 @@ static void setup_signal(void) {
 }
 
 int main(int argc, char **argv) {
+    /*
+     * Настройки микрофона разбираются раньше выбора режима: они одинаково
+     * нужны и прямому звонку, и звонку через ретранслятор, а режимов у
+     * запуска четыре. Разбор в одном месте избавляет от четырёх копий,
+     * которые разошлись бы при первой же правке.
+     */
+    {
+        float          mic_gain_db = 0.0f;
+        mic_ns_level_t mic_ns      = MIC_NS_MEDIUM;
+        for (int i = 1; i < argc; i++) {
+            if (strcmp(argv[i], "--mic-gain") == 0 && i + 1 < argc) {
+                mic_gain_db = (float)atof(argv[i + 1]);
+            } else if (strcmp(argv[i], "--noise-suppress") == 0 && i + 1 < argc) {
+                if (mic_ns_from_string(argv[i + 1], &mic_ns) != 0) {
+                    fprintf(stderr, "unknown noise suppression level: %s "
+                                    "(off, low, medium, high)\n", argv[i + 1]);
+                    return 1;
+                }
+            }
+        }
+        audio_call_set_mic(mic_gain_db, mic_ns);
+    }
+
     if (argc < 2) {
         fprintf(stderr,
                 "Usage:\n"
@@ -2043,7 +2097,7 @@ int main(int argc, char **argv) {
 
     if (strcmp(argv[1], "listen") == 0) {
         if (argc < 3) {
-            fprintf(stderr, "Usage: %s listen <local_bind_port> --call-id HEX [--key-file FILE] [--identity-file FILE] [--no-sign] [input_dev] [output_dev]\n", argv[0]);
+            fprintf(stderr, "Usage: %s listen <local_bind_port> --call-id HEX [--key-file FILE] [--identity-file FILE] [--no-sign] [--mic-gain dB] [--noise-suppress off|low|medium|high] [input_dev] [output_dev]\n", argv[0]);
             return 1;
         }
         uint16_t lport = (uint16_t)atoi(argv[2]);
@@ -2187,7 +2241,7 @@ int main(int argc, char **argv) {
 
     if (strcmp(argv[1], "relay") == 0) {
         if (argc < 4) {
-            fprintf(stderr, "Usage: %s relay <server_ip> <server_port> --room ROOM --name NAME --call-id HEX [--key-file FILE] [--identity-file FILE] [--no-sign] [input_dev] [output_dev]\n", argv[0]);
+            fprintf(stderr, "Usage: %s relay <server_ip> <server_port> --room ROOM --name NAME --call-id HEX [--key-file FILE] [--identity-file FILE] [--no-sign] [--mic-gain dB] [--noise-suppress off|low|medium|high] [input_dev] [output_dev]\n", argv[0]);
             return 1;
         }
         const char *ip = argv[2];

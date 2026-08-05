@@ -59,7 +59,16 @@ VideoCallDialog::VideoCallDialog(VideoCallManager *videoManager, Backend *backen
     if (quality == "low") qIdx = 0;
     else if (quality == "medium") qIdx = 1;
     else if (quality == "high") qIdx = 2;
+    else if (quality == "manual") qIdx = 3;
     qualityCombo->setCurrentIndex(qIdx);
+
+    /* Ручные числа берём из настроек всегда, а не только когда выбран
+     * ручной режим: человек может переключиться на него прямо здесь, и
+     * поля должны показывать его собственные значения, а не заводские. */
+    widthSpin->setValue(settings.value("video/width", widthSpin->value()).toInt());
+    heightSpin->setValue(settings.value("video/height", heightSpin->value()).toInt());
+    fpsSpin->setValue(settings.value("video/fps", fpsSpin->value()).toInt());
+    bitrateSpin->setValue(settings.value("video/bitrate", bitrateSpin->value()).toInt());
 
     QString audioIn = settings.value("audio/inputDevice", "").toString();
     if (!audioIn.isEmpty() && audioIn != "System default") {
