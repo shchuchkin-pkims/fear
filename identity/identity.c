@@ -96,6 +96,26 @@ static void identity_warn_plaintext_once(void) {
             "stored unencrypted (file mode 0600 only)\n");
 }
 
+int identity_wire_room(const char *room_name, char out[IDENTITY_WIRE_ROOM_LEN]) {
+    if (!room_name || !out) return -1;
+    const size_t len = strlen(room_name);
+
+    static const char ctx[] = "fear.room.v1";
+    crypto_generichash_state st;
+    if (crypto_generichash_init(&st, NULL, 0, 16) != 0) return -1;
+    crypto_generichash_update(&st, (const uint8_t *)ctx, sizeof(ctx) - 1);
+    crypto_generichash_update(&st, (const uint8_t *)room_name, len);
+    uint8_t digest[16];
+    if (crypto_generichash_final(&st, digest, sizeof digest) != 0) return -1;
+
+    out[0] = 'r';
+    out[1] = ':';
+    return sodium_bin2base64(out + 2, IDENTITY_WIRE_ROOM_LEN - 2,
+                             digest, sizeof digest,
+                             sodium_base64_VARIANT_URLSAFE_NO_PADDING)
+           ? 0 : -1;
+}
+
 int identity_pm_room_id_v2(const uint8_t k_pm[32],
                            char out[IDENTITY_PM_ROOM_ID_LEN]) {
     if (!k_pm || !out) return -1;

@@ -163,6 +163,11 @@ typedef struct {
     uint8_t addr[IDENTITY_INBOX_ADDR_BYTES]; /**< слепой адрес */
 } inbox_watch_t;
 
+/* Метка комнаты на проводе - её несут все кадры этого соединения. Ящик
+ * тоже: иначе идентификатор личной комнаты, который мы только что убрали
+ * из заголовка, вернулся бы туда через почту. */
+static const char *g_wire_room = NULL;
+
 static inbox_watch_t g_inbox[INBOX_MAX_WATCH];
 static int g_inbox_count = 0;
 static uint64_t g_inbox_next_poll = 0;
@@ -1380,7 +1385,7 @@ static int inbox_send(sock_t s, const inbox_watch_t *w, const char *myname,
     memcpy(body + IDENTITY_INBOX_ADDR_BYTES + CRYPTO_NPUBBYTES, cipher, clen);
     free(cipher);
 
-    int rc = send_service_frame(s, w->room, myname,
+    int rc = send_service_frame(s, g_wire_room ? g_wire_room : w->room, myname,
                                 (uint8_t)MSG_TYPE_INBOX_PUT, body, blen);
     free(body);
     return rc;
@@ -1415,8 +1420,8 @@ static void inbox_ack(sock_t s, const char *myname, const inbox_watch_t *w,
     for (size_t i = 0; i < n; i++) {
         for (int b = 0; b < 8; b++) *p++ = (uint8_t)((ids[i] >> (8 * b)) & 0xFF);
     }
-    send_service_frame(s, w->room, myname, (uint8_t)MSG_TYPE_INBOX_DELETE,
-                       body, blen);
+    send_service_frame(s, g_wire_room ? g_wire_room : w->room, myname,
+                       (uint8_t)MSG_TYPE_INBOX_DELETE, body, blen);
     free(body);
 }
 
@@ -2485,6 +2490,28 @@ void run_client(const char *host, uint16_t port, const char *room, const char *n
                 int join_mode) {
     if (sodium_init() < 0) { fprintf(stderr, "libsodium init failed\n"); exit(1); }
 
+    /*
+     * Дальше «room» - это метка на проводе, а не название.
+     *
+     * Ретранслятору незачем видеть в своём журнале, кто в какой комнате
+     * сидит: маршрутизировать он может по хешу ровно так же. Заодно
+     * исчезает приставка «pm:», по которой личные комнаты отличались от
+     * общих с одного взгляда.
+     *
+     * Настоящее название остаётся в room_local - оно нужно там, где речь о
+     * нашей собственной стороне: почтовые ящики, история, выбор личной
+     * комнаты.
+     */
+    const char *room_local = room;
+    char wire_room[IDENTITY_WIRE_ROOM_LEN];
+    if (identity_wire_room(room_local, wire_room) != 0) {
+        fprintf(stderr, "[client] cannot derive the wire room\n");
+        return;
+    }
+    room = wire_room;
+    g_wire_room = wire_room;
+
+
     /* Store identity in module globals */
     if (id_pk && id_sk) {
         g_has_identity = 1;
@@ -2677,11 +2704,11 @@ void run_client(const char *host, uint16_t port, const char *room, const char *n
             }
 
             int rc;
-            if (inbox_should_use(room)) {
+            if (inbox_should_use(room_local)) {
                 /* Ответ сервера скажет, легло ли письмо: он же сообщит, что
                  * хранение выключено, и тогда пользователь узнает правду, а
                  * не увидит две галочки. */
-                rc = inbox_send(s, inbox_find_room(room), name,
+                rc = inbox_send(s, inbox_find_room(room_local), name,
                                 (const uint8_t *)line, len);
             } else if (g_has_identity) {
                 rc = send_signed_ciphertext(s, room, name, active_key,

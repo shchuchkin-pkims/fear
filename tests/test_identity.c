@@ -86,6 +86,24 @@ int main(void) {
     CHECK(identity_pm_room_id_v1(pk, pk_c, id_ac) == 0);
     CHECK(strcmp(id_ab, id_ac) != 0);
 
+    /* --- метка комнаты на проводе -----------------------------------------
+     *
+     * Ретранслятор видит её вместо названия. Вектор закреплён, потому что то
+     * же самое вычисляет Android: разойдясь, две стороны оказались бы в
+     * разных комнатах и молча не видели друг друга.
+     */
+    {
+        char wr[IDENTITY_WIRE_ROOM_LEN];
+        CHECK(identity_wire_room("general", wr) == 0);
+        CHECK(strcmp(wr, "r:z6fjUIe2RRC26KwaOZ3Gpg") == 0);
+        CHECK(identity_wire_room("", wr) == 0);
+        CHECK(strcmp(wr, "r:XoI6MSrHqeZYdQA_Q2HegQ") == 0);
+
+        char wr2[IDENTITY_WIRE_ROOM_LEN];
+        CHECK(identity_wire_room("work", wr2) == 0);
+        CHECK(strcmp(wr, wr2) != 0);
+    }
+
     /* --- идентификатор ЛС, выведенный под ключом пары ---------------------
      *
      * Старый вывод считался из двух открытых ключей и без секрета, поэтому
