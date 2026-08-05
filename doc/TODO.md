@@ -106,28 +106,34 @@
       finding: a member cannot read what was said before it arrived, and a
       member that leaves cannot read what is said after.
 
-      Three things made that work and are worth not undoing. The election
-      needs the rosters to agree, so a membership change arms a rotation
-      rather than performing one - without the wait every client elects
-      itself, since the server announces the change before the members have
-      said who they are. The bundle is broadcast unsealed, because every
-      entry in it is already sealed to one member's identity key and a member
-      who has just joined has no current K_room to open an envelope with.
-      And identity announcements ride the founding key rather than the
-      current generation, for the same reason - otherwise joining a room that
-      has ever rotated is impossible.
+      Four things made that work and are worth not undoing, each of them
+      found by a room that split rather than by reasoning.
+
+      The election needs the rosters to agree, so a membership change arms a
+      rotation rather than performing one - without the wait every client
+      elects itself, since the server announces the change before the members
+      have said who they are.
+
+      The bundle is broadcast unsealed, because every entry in it is already
+      sealed to one member's identity key and a member who has just joined
+      has no current K_room to open an envelope with. Identity announcements
+      ride the founding key rather than the current generation for the same
+      reason - otherwise joining a room that has ever rotated is impossible.
+
+      Only a member that was in the room before the change and is still in it
+      after may be elected. This one is arithmetic, not principle: a member
+      that has just arrived holds generation zero and cannot know the room is
+      on generation four, so the "next" generation it draws is one the room
+      has already used - everyone else discards it as a replay while the
+      newcomer installs it and stops being able to read anything.
+
+      And a member's own arrival is not a change it witnessed, so it takes no
+      part in that election and accepts whichever rotator the room picked.
+      Counting itself as having been present is what made two members rotate
+      at once and the room split in two.
 
       Remaining: rotation on Android, which has to speak the same wire format
       or a mixed room splits in two.
-- [ ] **tests/smoke_rotation.sh is written but not in the suite.** It drives a
-      server and three clients through two joins and a departure and checks
-      the four properties end to end. It passes, but not always: in roughly
-      two runs out of three the third membership change (the departure)
-      produces no third generation. Whether that is the test's timing being
-      too tight or a rotation genuinely being lost is the open question - and
-      it matters, because a lost rotation on departure is exactly the case
-      the feature exists for. Diagnose, then register it in
-      tests/CMakeLists.txt where the registration is commented out.
 - [ ] Documentation updates and localization
 
 ## Planned

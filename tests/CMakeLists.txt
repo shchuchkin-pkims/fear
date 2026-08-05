@@ -83,15 +83,9 @@ set_tests_properties(integration_smoke PROPERTIES TIMEOUT 60)
 # (test_room_keys, test_rotation_bundle); этот ловит неверную сборку их
 # вместе - ротацию, которую начали двое, или конверт, который никто кроме
 # отправителя не открывает.
-# ПОКА НЕ В НАБОРЕ. Тест проходит не всегда: примерно в двух прогонах из
-# трёх третья смена состава (уход участника) не даёт третьего поколения.
-# Что именно - слишком тесные паузы в самом тесте или действительно
-# теряемая ротация - не выяснено, а регистрировать тест, который иногда
-# красный, значит приучить не смотреть на набор. Разбор - следующая задача,
-# см. doc/TODO.md.
-#add_test(NAME integration_rotation
-#         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/smoke_rotation.sh $<TARGET_FILE:fear>)
-#set_tests_properties(integration_rotation PROPERTIES TIMEOUT 120)
+add_test(NAME integration_rotation
+         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/smoke_rotation.sh $<TARGET_FILE:fear>)
+set_tests_properties(integration_rotation PROPERTIES TIMEOUT 120)
 
 # Трёхсторонний медиа-loopback: три процесса через hub, каждый расшифровывает
 # двух других. Единственный тест, способный поймать инверсию ролей или

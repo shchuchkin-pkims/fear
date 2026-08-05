@@ -103,6 +103,12 @@ gens=$(grep -c "room key is now generation" "$WORK/a.log" 2>/dev/null || true)
 grep -q "room key is now generation 3" "$WORK/c.log" \
     || fail "c did not follow the room to generation 3"
 
+# The message sent right after c arrived is the one a mis-elected joiner
+# silently loses: it rotates to a generation the room has already used, so
+# everyone else discards its bundle and it can no longer read them.
+grep -q "after-c-arrived" "$WORK/c.log" \
+    || fail "c could not read the room straight after joining it"
+
 grep -q "after-b-left" "$WORK/c.log" \
     || fail "c stopped receiving after a rotation"
 

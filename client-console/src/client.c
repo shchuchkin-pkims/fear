@@ -180,10 +180,30 @@ typedef struct {
     uint8_t pk[IDENTITY_PK_BYTES];
     int     has_identity;
     int     present;
+    int     was_present;   /**< here before the change now being handled */
 } roster_entry_t;
 
 static roster_entry_t g_roster[ROSTER_MAX];
 static int g_roster_count = 0;
+static int g_saw_first_user_list = 0;
+
+/*
+ * Whether we have a "before" to compare against.
+ *
+ * The list that greets us on arrival is not a change we witnessed - we have
+ * no idea what the room looked like a moment earlier, so we cannot say who
+ * was already in it, and the members who were will not count us either. Until
+ * a change happens with us watching, we take no part in electing a rotator
+ * and we accept the one the room picked.
+ */
+static int g_have_before = 0;
+
+/** Freeze the present set as the "before" of the next membership change. */
+static void roster_snapshot_present(void) {
+    for (int i = 0; i < g_roster_count; i++) {
+        g_roster[i].was_present = g_roster[i].present;
+    }
+}
 
 /** Remember, or update, one member's identity key. */
 static void roster_note_identity(const char *name, const uint8_t *pk) {
@@ -237,17 +257,30 @@ static int roster_identities_complete(void) {
     return 1;
 }
 
-/** Everyone present, as room_keys wants to see them. */
-static size_t roster_members(rk_member_t *out, size_t cap) {
+/**
+ * The members eligible to rotate: here before the change, and still here.
+ *
+ * A member that has just arrived must not be elected, and the reason is
+ * arithmetic rather than principle. It holds generation zero and has no way
+ * to know the room is on generation four, so the "next" generation it would
+ * draw is one the room has already used - and everyone else discards it as a
+ * replay while the newcomer installs it and stops being able to read
+ * anything. A member that was already here knows what generation this is.
+ *
+ * Every continuing member computes the same set from the same sequence of
+ * user lists, so the election still has exactly one answer.
+ */
+static size_t roster_continuing(rk_member_t *out, size_t cap) {
     size_t n = 0;
     for (int i = 0; i < g_roster_count && n < cap; i++) {
-        if (!g_roster[i].present) continue;
+        if (!g_roster[i].present || !g_roster[i].was_present) continue;
         memcpy(out[n].pk, g_roster[i].pk, IDENTITY_PK_BYTES);
         out[n].has_identity = g_roster[i].has_identity;
         n++;
     }
     return n;
 }
+
 
 static sock_t g_sock = -1;
 static const char *g_room = NULL;
@@ -1225,7 +1258,7 @@ static void rotation_tick(sock_t s, const char *room, const char *myname,
     g_rot_pending = 0;
 
     rk_member_t members[ROSTER_MAX];
-    size_t nmem = roster_members(members, ROSTER_MAX);
+    size_t nmem = roster_continuing(members, ROSTER_MAX);
     /* Every member reaches this same answer from the same roster, so exactly
      * one of them goes on. */
     if (rk_is_rotator(members, nmem, g_identity_pk)) {
@@ -1251,20 +1284,18 @@ static void rotation_handle_bundle(const char *room, const char *sender,
      * denial of service dressed as a key update - and with two members
      * rotating at once the room would split. rb_open_for authenticates the
      * sender; this decides whether that sender had the right. */
-    rk_member_t members[ROSTER_MAX];
-    size_t nmem = roster_members(members, ROSTER_MAX);
-    size_t known = 0;
-    for (size_t i = 0; i < nmem; i++) if (members[i].has_identity) known++;
-
     /* An election needs a roster, and a member who has just arrived may not
      * have one yet - the announcements that build it can have been made
-     * before it was listening. Refusing then would lock it out of the room
-     * it just joined, so a member that knows nobody but itself takes what it
-     * is given: the entry is sealed to its identity key and authenticated as
-     * coming from the sender, and the only thing going unchecked is whether
-     * that sender was the member the room elected - which is not something
-     * it is in any position to check. */
-    if (known > 1 && !rk_is_rotator(members, nmem, view.sender_pk)) {
+     * before it was listening. Refusing then would lock it out of the room it
+     * has just joined, so the check is made only when we actually know who is
+     * in the room. Until then the entry being sealed to our identity key and
+     * authenticated as coming from its sender is what we have, and the only
+     * thing going unchecked is whether that sender was the member the room
+     * elected - which is not something we are in any position to check. */
+    rk_member_t members[ROSTER_MAX];
+    size_t nmem = roster_continuing(members, ROSTER_MAX);
+    if (g_have_before && roster_identities_complete() &&
+        !rk_is_rotator(members, nmem, view.sender_pk)) {
         fprintf(stderr, "[rotation] ignoring a bundle from %s: not this room's rotator\n",
                 sender);
         return;
@@ -1851,8 +1882,25 @@ int recv_and_decrypt(sock_t s, const char *room, const uint8_t *key, const char 
              * must not read what comes after. Only the member the room agrees
              * on rotates, and every member reaches that answer from this same
              * list, so there is nothing to coordinate. */
+            /* Taken before the new list is applied, and not again while a
+             * rotation is already pending - a burst of arrivals is one
+             * change, from the room as it stood before any of them. */
+            if (g_saw_first_user_list && !g_rot_pending) {
+                roster_snapshot_present();
+                g_have_before = 1;
+            }
+
             int changed = roster_set_present(names, nnames);
-            if (changed && g_has_identity && g_rk_ready) {
+
+            if (!g_saw_first_user_list) {
+                /* Our own arrival. Somebody who was already here rotates for
+                 * it; we take this list as our starting point and leave the
+                 * "before" set empty, because we did not see one. Marking
+                 * ourselves as having been here would put us in an election
+                 * the members who really were here are running without us -
+                 * and two members rotating at once splits the room. */
+                g_saw_first_user_list = 1;
+            } else if (changed && g_has_identity && g_rk_ready) {
                 /* Say who we are again. A member that just joined has never
                  * heard our announcement - it was sent before they arrived -
                  * and rotation has to address a bundle to them by identity
