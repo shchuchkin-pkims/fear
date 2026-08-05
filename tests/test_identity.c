@@ -104,6 +104,58 @@ int main(void) {
         CHECK(strcmp(wr, wr2) != 0);
     }
 
+    /* --- метка сессии ----------------------------------------------------
+     *
+     * Метка случайна, поэтому проверяем не значение, а свойства: она нужной
+     * длины, годится для base64url и каждый раз новая. Повторись она между
+     * подключениями - вся затея теряет смысл: связать два сеанса одного
+     * человека стало бы так же просто, как раньше по имени.
+     */
+    {
+        char t1[IDENTITY_SESSION_TAG_LEN], t2[IDENTITY_SESSION_TAG_LEN];
+        CHECK(identity_session_tag(t1) == 0);
+        CHECK(identity_session_tag(t2) == 0);
+        CHECK(strlen(t1) == IDENTITY_SESSION_TAG_LEN - 1);
+        CHECK(strcmp(t1, t2) != 0);
+        for (size_t i = 0; t1[i]; i++) {
+            int ok = (t1[i] >= 'A' && t1[i] <= 'Z') || (t1[i] >= 'a' && t1[i] <= 'z') ||
+                     (t1[i] >= '0' && t1[i] <= '9') || t1[i] == '-' || t1[i] == '_';
+            CHECK(ok);
+        }
+    }
+
+    /* --- что подписывает анонс личности -----------------------------------
+     *
+     * Подпись покрывает метку сессии вместе с именем, а не одно имя: иначе
+     * чужой анонс можно было бы взять целиком и повторить под своей меткой,
+     * забрав вместе с ним и имя.
+     *
+     * Вектор закреплён, потому что ровно те же байты подписывает Android.
+     * Разойдись склейка хоть на байт - подписи перестали бы сходиться, и
+     * каждая сторона показывала бы собеседника неизвестным, ничего при этом
+     * не сломав вслух.
+     */
+    {
+        uint8_t buf[128];
+        size_t n = identity_announce_signed_bytes("AAAAAAAAAAAAAAAAAAAAAA", "alice",
+                                                  buf, sizeof buf);
+        const char *want = "fear.announce.v2AAAAAAAAAAAAAAAAAAAAAAalice";
+        CHECK(n == strlen(want));
+        CHECK(memcmp(buf, want, n) == 0);
+
+        /* Метка постоянной длины, поэтому склейка читается однозначно:
+         * подмена части метки частью имени невозможна. */
+        size_t n2 = identity_announce_signed_bytes("AAAAAAAAAAAAAAAAAAAAAB", "alice",
+                                                   buf, sizeof buf);
+        CHECK(n2 == n);
+        CHECK(memcmp(buf, want, n) != 0);
+
+        /* Не помещается - честный отказ, а не обрезанная подпись. */
+        uint8_t tiny[8];
+        CHECK(identity_announce_signed_bytes("AAAAAAAAAAAAAAAAAAAAAA", "alice",
+                                             tiny, sizeof tiny) == 0);
+    }
+
     /* --- идентификатор ЛС, выведенный под ключом пары ---------------------
      *
      * Старый вывод считался из двух открытых ключей и без секрета, поэтому

@@ -1507,8 +1507,24 @@ int audio_call_start(AudioCall **out_call,
 
     /* Relay mode setup */
     c->relay_mode = relay_mode;
+    /*
+     * Комната ретранслятору называется меткой, а не именем.
+     *
+     * Звонок идёт отдельным процессом и подключается к тому же серверу
+     * своим соединением. Передай он название как есть - на ретрансляторе
+     * снова появилась бы строка «general», ровно та, которую чат уже
+     * перестал показывать: достаточно одного звонка, чтобы свести на нет
+     * всю скрытность комнаты.
+     *
+     * Метка выводится тем же хешем, что и в чате, поэтому сходится и с
+     * собеседником, и с записью нашего чат-клиента на сервере - по ней
+     * сервер привязывает UDP-адрес звонка к нужному соединению.
+     */
     if (relay_mode && relay_room && relay_name) {
-        strncpy(c->relay_room, relay_room, sizeof(c->relay_room) - 1);
+        char wire[IDENTITY_WIRE_ROOM_LEN];
+        const char *routed = relay_room;
+        if (identity_wire_room(relay_room, wire) == 0) routed = wire;
+        strncpy(c->relay_room, routed, sizeof(c->relay_room) - 1);
         c->relay_room[sizeof(c->relay_room) - 1] = '\0';
         strncpy(c->relay_name, relay_name, sizeof(c->relay_name) - 1);
         c->relay_name[sizeof(c->relay_name) - 1] = '\0';

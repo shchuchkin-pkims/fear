@@ -106,7 +106,7 @@ void AudioCallDialog::onStartCall() {
     if (relayCheck->isChecked() && backend) {
         // Relay mode: route through server
         if (audioManager->startRelay(remoteIp, remotePort,
-                                      backend->currentRoom, backend->currentName, key,
+                                      backend->currentRoom, backend->currentTag, key,
                                       inputDevice, outputDevice)) {
             statusLabel->setText("Relay call started");
         }

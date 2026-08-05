@@ -2425,9 +2425,25 @@ static int start_video_call(const char *remote_ip, uint16_t remote_port,
     }
 
     /* Relay mode: if room+name provided, connect via TCP to server */
+    /*
+     * Комната ретранслятору называется меткой, а не именем.
+     *
+     * Звонок идёт отдельным процессом и подключается к тому же серверу
+     * своим соединением. Передай он название как есть - на ретрансляторе
+     * снова появилась бы строка «general», ровно та, которую чат уже
+     * перестал показывать: достаточно одного звонка, чтобы свести на нет
+     * всю скрытность комнаты.
+     *
+     * Метка выводится тем же хешем, что и в чате, поэтому сходится и с
+     * собеседником, и с записью нашего чат-клиента на сервере - по ней
+     * сервер привязывает UDP-адрес звонка к нужному соединению.
+     */
     if (opts->relay_room && opts->relay_name) {
         vc->relay_mode = 1;
-        strncpy(vc->relay_room, opts->relay_room, sizeof(vc->relay_room) - 1);
+        char wire[IDENTITY_WIRE_ROOM_LEN];
+        const char *routed = opts->relay_room;
+        if (identity_wire_room(opts->relay_room, wire) == 0) routed = wire;
+        strncpy(vc->relay_room, routed, sizeof(vc->relay_room) - 1);
         vc->relay_room[sizeof(vc->relay_room) - 1] = '\0';
         strncpy(vc->relay_name, opts->relay_name, sizeof(vc->relay_name) - 1);
         vc->relay_name[sizeof(vc->relay_name) - 1] = '\0';

@@ -64,6 +64,15 @@ public:
     int serverPort;               ///< Server port from last connection
     QString currentRoom;          ///< Current room name
     QString currentName;          ///< Current user name
+    /**
+     * Метка этой сессии на проводе.
+     *
+     * Имя ретранслятор больше не видит, поэтому там, где раньше подошло бы
+     * имя - регистрация звонка на сервере, - теперь нужна метка. Приходит
+     * строкой [SESSION] из консольного клиента; пока её нет, звонок через
+     * ретранслятор регистрировать не по чему.
+     */
+    QString currentTag;
 
     /**
      * @brief Sets the path to the CLI executable

@@ -5,8 +5,8 @@
  * This server acts as a relay for encrypted messages between clients.
  * It NEVER has access to message plaintext - all messages are end-to-end
  * encrypted by clients using room keys. The server only sees metadata:
- * - Room names
- * - User names
+ * - Room labels (хеш названия, самого названия сервер не видит)
+ * - Session tags (случайная метка соединения, не имя человека)
  * - Message sizes
  *
  * Server responsibilities:
@@ -44,7 +44,7 @@ typedef struct {
     sock_t fd;              /**< Socket descriptor for this client */
     uint32_t ip;            /**< Source IPv4 address, for the per-IP connection cap */
     char room[MAX_ROOM];    /**< Room name (empty until first message) */
-    char name[MAX_NAME];    /**< User name (empty until first message) */
+    char name[MAX_NAME];    /**< Session tag (empty until first message) */
     struct sockaddr_in udp_addr; /**< UDP address for relay */
     int udp_registered;     /**< Whether UDP relay address is set */
     int is_media_relay;     /**< Whether this is a media relay connection (allows duplicate name) */
@@ -1332,7 +1332,21 @@ void run_server_opts(uint16_t port, int64_t inbox_ttl) {
                 uint8_t msg_type = frame[2 + room_len + 2 + name_len + 2 + nonce_len_val];
                 int is_media = (msg_type == MSG_TYPE_MEDIA_RELAY);
 
-                // Проверяем уникальность имени в той же комнате (skip for media relay)
+                /*
+                 * Две живые метки не должны совпасть - и это больше не
+                 * удобство, а защита.
+                 *
+                 * Раньше здесь отклонялся повтор имени, чтобы в комнате не
+                 * было двух «alice». Теперь в поле метка, и повтор означает
+                 * другое: кто-то назвался чужой меткой. Метка случайна и до
+                 * первого кадра неизвестна, но сосед по комнате её видит -
+                 * и без этой проверки мог бы переподключиться под ней и
+                 * заговорить от чужого лица.
+                 *
+                 * Уникальность самих имён сервер больше не сторожит: он их
+                 * не видит. Тёзок в комнате разводят клиенты, показывая
+                 * отпечаток ключа рядом с повторяющимся именем.
+                 */
                 int name_exists = 0;
                 if (!is_media) {
                     for (int j = 0; j < nclients; j++) {
@@ -1351,10 +1365,10 @@ void run_server_opts(uint16_t port, int64_t inbox_ttl) {
                 }
 
                 if (name_exists) {
-                    printf("[server] client rejected: name '%.*s' already exists in room '%.*s'\n",
+                    printf("[server] client rejected: tag '%.*s' already in use in room '%.*s'\n",
                            (int)name_len, name, (int)room_len, room);
                     send_error_and_close(clients[i].fd, room, room_len,
-                                         "Name already taken in this room");
+                                         "Session tag already in use in this room");
                     server_db_session_remove((int)clients[i].fd);
                     clients[i] = clients[nclients - 1];
                     nclients--;
@@ -1394,18 +1408,24 @@ void run_server_opts(uint16_t port, int64_t inbox_ttl) {
                     send_user_list(clients, nclients, clients[i].room);
                 }
             }
-            /* Anti-spoofing: room and display name are pinned to this connection
-             * at registration, but the frame carries its own copies and those are
-             * what receivers render. Without this check a client registered as
-             * "alice" could relay frames claiming to be "bob" and impersonate him
-             * for every unsigned message in the room. Drop mismatches rather than
-             * forwarding them. */
+            /* Anti-spoofing: комната и метка сессии закреплены за этим
+             * соединением при регистрации, но кадр несёт собственные копии
+             * обеих. Без этой проверки участник мог бы слать кадры под чужой
+             * меткой - а получатели разворачивают метку в имя и показали бы
+             * чужое.
+             *
+             * Проверка та же, что и была, и держится на том же: сервер
+             * сравнивает кадр с тем, чем это соединение представилось.
+             * Изменилось только, что закрепляется - не имя, которого сервер
+             * больше не видит, а метка. Кому какая метка принадлежит,
+             * получатели узнают из подписанного анонса, и подделать это уже
+             * не в силах ни сосед по комнате, ни сам ретранслятор. */
             if (strlen(clients[i].room) != room_len ||
                 memcmp(clients[i].room, room, room_len) != 0 ||
                 strlen(clients[i].name) != name_len ||
                 memcmp(clients[i].name, name, name_len) != 0) {
                 printf("[server] dropped frame with mismatched identity from '%s'\n",
-                       clients[i].name);
+                       clients[i].name);   /* метка, не имя */
                 free(frame);
                 continue;
             }

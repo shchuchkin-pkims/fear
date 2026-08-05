@@ -258,6 +258,8 @@ bool Backend::disconnect() {
     serverPort = 0;
     currentRoom.clear();
     currentName.clear();
+    // Метка живёт ровно столько, сколько соединение: следующее получит новую.
+    currentTag.clear();
     emit disconnected();
     return true;
 }
@@ -547,6 +549,12 @@ void Backend::parseClientOutput(const QString &s) {
         if (!isConnected && t.startsWith("[client] connected to")) {
             isConnected = true;
             emit connected();
+        }
+
+        // Метка сессии: единственное, чем нас теперь называет ретранслятор.
+        if (t.startsWith("[SESSION] ")) {
+            currentTag = t.mid(10).trimmed();
+            continue;
         }
 
         // Capture room key from CLI output (CREATE or JOIN mode)

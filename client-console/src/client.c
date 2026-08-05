@@ -212,8 +212,16 @@ static uint64_t rot_now_ms(void) {
 
 #define ROSTER_MAX 64
 
+/*
+ * Кто в комнате, под какой меткой и с каким именем.
+ *
+ * Ключ здесь - метка сессии, а не имя: имя ретранслятор больше не видит, и
+ * список участников он присылает метками. Имя приходит отдельно, в анонсе
+ * личности, вместе с подписью, которая привязывает его к этой метке.
+ */
 typedef struct {
-    char    name[MAX_NAME];
+    char    tag[IDENTITY_SESSION_TAG_LEN];  /**< метка на проводе */
+    char    display[MAX_NAME];              /**< имя из анонса, пусто пока не объявился */
     uint8_t pk[IDENTITY_PK_BYTES];
     int     has_identity;
     int     present;
@@ -242,48 +250,172 @@ static void roster_snapshot_present(void) {
     }
 }
 
-/** Remember, or update, one member's identity key. */
-static void roster_note_identity(const char *name, const uint8_t *pk) {
-    if (!name || !pk) return;
+/** Remember, or update, one member's identity key and announced name. */
+static void roster_note_identity(const char *tag, const uint8_t *pk, const char *display) {
+    if (!tag || !pk) return;
     for (int i = 0; i < g_roster_count; i++) {
-        if (strcmp(g_roster[i].name, name) != 0) continue;
+        if (strcmp(g_roster[i].tag, tag) != 0) continue;
         memcpy(g_roster[i].pk, pk, IDENTITY_PK_BYTES);
         g_roster[i].has_identity = 1;
+        if (display && display[0]) snprintf(g_roster[i].display, MAX_NAME, "%s", display);
         return;
     }
     if (g_roster_count >= ROSTER_MAX) return;
-    snprintf(g_roster[g_roster_count].name, MAX_NAME, "%s", name);
+    snprintf(g_roster[g_roster_count].tag, IDENTITY_SESSION_TAG_LEN, "%s", tag);
+    snprintf(g_roster[g_roster_count].display, MAX_NAME, "%s", display ? display : "");
     memcpy(g_roster[g_roster_count].pk, pk, IDENTITY_PK_BYTES);
     g_roster[g_roster_count].has_identity = 1;
     g_roster[g_roster_count].present = 1;
     g_roster_count++;
 }
 
+/**
+ * Имя, под которым показывать эту метку.
+ *
+ * NULL значит «этот участник ещё не объявился». Придумывать за него имя
+ * нельзя: приписать сообщение не тому - хуже, чем показать, что отправитель
+ * пока неизвестен.
+ */
+static const char *roster_display(const char *tag) {
+    if (!tag) return NULL;
+    for (int i = 0; i < g_roster_count; i++) {
+        if (strcmp(g_roster[i].tag, tag) != 0) continue;
+        return g_roster[i].display[0] ? g_roster[i].display : NULL;
+    }
+    return NULL;
+}
+
+/**
+ * Сколько присутствующих участников зовутся так же.
+ *
+ * Уникальность имён в комнате раньше держал ретранслятор - он их видел.
+ * Теперь не видит, и двое могут объявиться одним именем. Совпадение не
+ * запрещаем (люди действительно бывают тёзками), но показываем: имя,
+ * встречающееся дважды, идёт вместе с отпечатком ключа.
+ */
+static int roster_display_collisions(const char *display) {
+    if (!display || !display[0]) return 0;
+    int n = 0;
+    for (int i = 0; i < g_roster_count; i++) {
+        if (g_roster[i].present && strcmp(g_roster[i].display, display) == 0) n++;
+    }
+    return n;
+}
+
 /** Mark who the server says is here. Returns 1 if the set changed. */
-static int roster_set_present(char names[][MAX_NAME], int count) {
+static int roster_set_present(char tags[][IDENTITY_SESSION_TAG_LEN], int count) {
     int changed = 0;
 
     for (int i = 0; i < g_roster_count; i++) {
         int here = 0;
         for (int j = 0; j < count; j++) {
-            if (strcmp(g_roster[i].name, names[j]) == 0) { here = 1; break; }
+            if (strcmp(g_roster[i].tag, tags[j]) == 0) { here = 1; break; }
         }
-        if (g_roster[i].present != here) { g_roster[i].present = here; changed = 1; }
+        if (g_roster[i].present != here) {
+            g_roster[i].present = here;
+            changed = 1;
+            /*
+             * Ушёл - забываем, кем он был.
+             *
+             * Метка освобождается вместе с соединением, и следующее
+             * подключение может её занять: ретранслятор сторожит только то,
+             * чтобы две живые метки не совпали. Сохрани мы привязку, кадры
+             * нового владельца показались бы под именем прежнего - причём
+             * без единой подделанной подписи, просто по устаревшей записи.
+             * Вернувшийся обязан объявиться заново.
+             */
+            if (!here) {
+                g_roster[i].display[0] = 0;
+                g_roster[i].has_identity = 0;
+            }
+        }
     }
 
     for (int j = 0; j < count; j++) {
         int known = 0;
         for (int i = 0; i < g_roster_count; i++) {
-            if (strcmp(g_roster[i].name, names[j]) == 0) { known = 1; break; }
+            if (strcmp(g_roster[i].tag, tags[j]) == 0) { known = 1; break; }
         }
         if (known || g_roster_count >= ROSTER_MAX) continue;
-        snprintf(g_roster[g_roster_count].name, MAX_NAME, "%s", names[j]);
+        snprintf(g_roster[g_roster_count].tag, IDENTITY_SESSION_TAG_LEN, "%s", tags[j]);
+        g_roster[g_roster_count].display[0] = 0;
         g_roster[g_roster_count].has_identity = 0;
         g_roster[g_roster_count].present = 1;
         g_roster_count++;
         changed = 1;
     }
     return changed;
+}
+
+/** Сколько участников сейчас в комнате по версии ретранслятора. */
+static int roster_present_count(void) {
+    int n = 0;
+    for (int i = 0; i < g_roster_count; i++) if (g_roster[i].present) n++;
+    return n;
+}
+
+/** Место участника в реестре по метке, или -1. */
+static int roster_find(const char *tag) {
+    if (!tag) return -1;
+    for (int i = 0; i < g_roster_count; i++) {
+        if (strcmp(g_roster[i].tag, tag) == 0) return i;
+    }
+    return -1;
+}
+
+/** Сколько знаков метки показывать, когда показать больше нечего. */
+#define TAG_STUB_CHARS 8
+
+/**
+ * Как подписать отправителя кадра.
+ *
+ * Метка - не имя, и превратить одно в другое мы вправе только после анонса,
+ * подпись которого сошлась. Пока участник не объявился, показываем огрызок
+ * метки с вопросительным знаком: «пришло, от кого - пока неизвестно» честнее
+ * правдоподобного имени, взятого непонятно откуда.
+ *
+ * Тёзки в одной комнате возможны: уникальность имён держал ретранслятор, а он
+ * их больше не видит. Поэтому имя, встречающееся в комнате дважды, идёт
+ * вместе с отпечатком ключа - различать собеседников по нему всё равно
+ * надёжнее, чем по имени.
+ */
+static const char *sender_label(const char *tag, char *buf, size_t cap) {
+    int i = roster_find(tag);
+    const char *d = (i >= 0 && g_roster[i].display[0]) ? g_roster[i].display : NULL;
+    if (!d) {
+        snprintf(buf, cap, "?%.*s", TAG_STUB_CHARS, tag ? tag : "");
+        return buf;
+    }
+    if (roster_display_collisions(d) > 1 && g_roster[i].has_identity) {
+        char fp[IDENTITY_FINGERPRINT_LEN];
+        identity_pk_fingerprint(g_roster[i].pk, fp);
+        snprintf(buf, cap, "%s [%s]", d, fp);
+        return buf;
+    }
+    snprintf(buf, cap, "%s", d);
+    return buf;
+}
+
+/**
+ * Напечатать список участников так, как его читают люди и графический клиент.
+ *
+ * Печатается из реестра, а не прямо из кадра: в кадре метки, а имена
+ * приезжают отдельными анонсами и позже. Поэтому строка выводится и когда
+ * пришёл новый список, и когда очередной анонс превратил метку в имя -
+ * иначе тот, кто объявился после списка, так и остался бы огрызком метки.
+ */
+static void roster_print_users(void) {
+    int shown = 0;
+    printf("[USERS] Room participants (%d):", roster_present_count());
+    for (int i = 0; i < g_roster_count; i++) {
+        if (!g_roster[i].present) continue;
+        char label[MAX_NAME + IDENTITY_FINGERPRINT_LEN + 8];
+        sender_label(g_roster[i].tag, label, sizeof label);
+        printf("%s %s", shown ? "," : "", label);
+        shown++;
+    }
+    printf("\n");
+    fflush(stdout);
 }
 
 /** True once every member the server lists has told us who they are. */
@@ -322,6 +454,15 @@ static size_t roster_continuing(rk_member_t *out, size_t cap) {
 static sock_t g_sock = -1;
 static const char *g_room = NULL;
 static const char *g_name = NULL;
+
+/*
+ * Наше отображаемое имя - то, которое видят люди, а не ретранслятор.
+ *
+ * На проводе вместо него едет метка сессии (g_name), поэтому настоящее имя
+ * нужно держать отдельно: его кладут в анонс личности и им же подписываются
+ * собственные реплики в своём же окне.
+ */
+static const char *g_display_name = NULL;
 
 /* Phase B-8: heartbeat. The CLI runs an extra thread that sends a
  * MSG_TYPE_PING zero-nonce service frame every PING_INTERVAL_SEC. The
@@ -517,7 +658,9 @@ static int ecdh_join_room(sock_t s, const char *room, const char *name, uint8_t 
                              * is gone. Without recording them here the first
                              * thing we do in the room is refuse their
                              * rotation, having no idea who else is in it. */
-                            if (sig_verified) roster_note_identity(sender, id_pk); else if (tofu == TOFU_KEY_CONFLICT) {
+                            /* Имени тут ещё нет: ключ приехал в ответе на обмен, а не в анонсе.
+                             * Придёт анонсом - тогда и подпишем. */
+                            if (sig_verified) roster_note_identity(sender, id_pk, NULL); else if (tofu == TOFU_KEY_CONFLICT) {
                                 /* Blocking: a changed identity key is exactly what an
                                  * active MITM looks like, so we must not proceed. */
                                 fprintf(stderr,
@@ -1069,6 +1212,9 @@ void handle_file_message(const uint8_t *plain, size_t plen, message_type_t type,
             char temp_path[MAX_FILENAME];
             snprintf(temp_path, sizeof(temp_path), "Downloads/.fear_temp_%s", basename);
 
+            char who[MAX_NAME + IDENTITY_FINGERPRINT_LEN + 8];
+            sender_label(sender_name, who, sizeof who);
+
             /* Print offer for user (console) and GUI parsing */
             char size_str[64];
             if (file_size >= 1048576) {
@@ -1079,7 +1225,7 @@ void handle_file_message(const uint8_t *plain, size_t plen, message_type_t type,
                 snprintf(size_str, sizeof(size_str), "%zu B", file_size);
             }
             printf("[FILE_OFFER] %s wants to send \"%s\" (%s). Type /accept [path] or /reject\n",
-                   sender_name, basename, size_str);
+                   who, basename, size_str);
             fflush(stdout);
 
             receive_file(temp_path, file_size, NULL, 0);
@@ -1561,7 +1707,7 @@ static int inbox_should_use(const char *room) {
     if (strncmp(room, "pm:", 3) != 0) return 0;
     if (!inbox_find_room(room)) return 0;
     for (int i = 0; i < g_roster_count; i++) {
-        if (g_roster[i].present && strcmp(g_roster[i].name, g_name ? g_name : "") != 0) {
+        if (g_roster[i].present && strcmp(g_roster[i].tag, g_name ? g_name : "") != 0) {
             return 0;                    /* кто-то тут есть - доставим живьём */
         }
     }
@@ -1765,26 +1911,48 @@ static int send_signed_ciphertext(sock_t s, const char *room, const char *name,
 }
 
 /**
- * Send identity announcement on room join.
- * Plaintext layout: [pk(32)][sig_over_name(64)]
+ * Say who we are, inside the room encryption.
+ *
+ * Раскладка: [pk(32)][sig(64)][name_len(2)][name].
+ *
+ * Это единственное место, где отображаемое имя вообще уезжает с машины, и
+ * уезжает оно уже запечатанным. Подпись покрывает не одно имя, а метку
+ * сессии вместе с ним: иначе чужой анонс можно было бы взять целиком и
+ * повторить под своей меткой, получив вместе с ним и имя.
+ *
+ * Имя берётся из g_display_name, а не из аргумента, намеренно. Метка и имя
+ * здесь оба const char *, и передай вызывающий одно вместо другого - код
+ * собрался бы, а комната увидела бы нас под меткой. Своё имя у процесса
+ * ровно одно, спрашивать его у места вызова незачем.
  */
 static int send_identity_announce(sock_t s, const char *room, const char *name,
                                   const uint8_t *key,
                                   const uint8_t id_sk[IDENTITY_SK_BYTES],
                                   const uint8_t id_pk[IDENTITY_PK_BYTES]) {
-    uint8_t plain[IDENTITY_PK_BYTES + IDENTITY_SIG_BYTES];
+    const char *display = g_display_name ? g_display_name : "";
+    const size_t dlen = strlen(display);
+    if (dlen >= MAX_NAME) return -1;
+
+    uint8_t signed_bytes[64 + IDENTITY_SESSION_TAG_LEN + MAX_NAME];
+    size_t slen = identity_announce_signed_bytes(name, display,
+                                                 signed_bytes, sizeof signed_bytes);
+    if (slen == 0) return -1;
+
+    uint8_t plain[IDENTITY_PK_BYTES + IDENTITY_SIG_BYTES + 2 + MAX_NAME];
     memcpy(plain, id_pk, IDENTITY_PK_BYTES);
-    if (identity_sign((const uint8_t*)name, strlen(name), id_sk,
+    if (identity_sign(signed_bytes, slen, id_sk,
                       plain + IDENTITY_PK_BYTES) != 0) {
         return -1;
     }
+    wr_u16(plain + IDENTITY_PK_BYTES + IDENTITY_SIG_BYTES, (uint16_t)dlen);
+    memcpy(plain + IDENTITY_PK_BYTES + IDENTITY_SIG_BYTES + 2, display, dlen);
 
     uint16_t room_len = (uint16_t)strlen(room);
     uint16_t name_len = (uint16_t)strlen(name);
     uint8_t nonce[CRYPTO_NPUBBYTES];
     randombytes_buf(nonce, sizeof nonce);
 
-    size_t plen = sizeof(plain);
+    size_t plen = IDENTITY_PK_BYTES + IDENTITY_SIG_BYTES + 2 + dlen;
     size_t cmax = plen + CF_OVERHEAD_BYTES;
     uint8_t *cipher = (uint8_t*)malloc(cmax);
     if (!cipher) { return -1; }
@@ -2064,14 +2232,16 @@ int recv_and_decrypt(sock_t s, const char *room, const uint8_t *key, const char 
          * checks - in particular the host, which would otherwise reach a
          * connect call straight from another party. */
         ci_invite_t inv;
+        char who[MAX_NAME + IDENTITY_FINGERPRINT_LEN + 8];
+        sender_label(name, who, sizeof who);
         ci_status_t st = ci_parse(plain, (size_t)plen, &inv);
         if (st != CI_OK) {
-            printf("[invite] dropped an invite from %s: %s\n", name, ci_strerror(st));
+            printf("[invite] dropped an invite from %s: %s\n", who, ci_strerror(st));
         } else {
             char hex[2 * MK_CALLID_BYTES + 1];
             for (size_t i = 0; i < MK_CALLID_BYTES; i++)
                 snprintf(hex + 2 * i, 3, "%02x", inv.call_id[i]);
-            printf("[CALL_INVITE] %s %s %s %u %s\n", name, hex,
+            printf("[CALL_INVITE] %s %s %s %u %s\n", who, hex,
                    inv.host[0] ? inv.host : "-", inv.port,
                    (inv.flags & CI_FLAG_VIDEO) ? "video" : "audio");
         }
@@ -2094,7 +2264,9 @@ int recv_and_decrypt(sock_t s, const char *room, const uint8_t *key, const char 
             char tbuf[32];
             strftime(tbuf, sizeof tbuf, "%H:%M:%S", tm);
             sanitize_display_inplace((char*)plain, (size_t)plen);
-            printf("[%s] [?] %s: %.*s\n", tbuf, name, (int)plen, (char*)plain);
+            char who[MAX_NAME + IDENTITY_FINGERPRINT_LEN + 8];
+            sender_label(name, who, sizeof who);
+            printf("[%s] [?] %s: %.*s\n", tbuf, who, (int)plen, (char*)plain);
             fflush(stdout);
         }
     } else if (msg_type == MSG_TYPE_SIGNED_TEXT) {
@@ -2106,15 +2278,29 @@ int recv_and_decrypt(sock_t s, const char *room, const uint8_t *key, const char 
             size_t actual_len = (size_t)plen - IDENTITY_PK_BYTES - IDENTITY_SIG_BYTES;
 
             int sig_ok = identity_verify(actual_msg, actual_len, sig, peer_pk);
-            tofu_result_t tofu = identity_tofu_check(g_known_keys_path, name, peer_pk);
+            /* Хранилище TOFU ведётся по имени, а имя приезжает анонсом.
+             * Пока отправитель не объявился, сверять нечего с чем: записать
+             * ключ под меткой значило бы засорить хранилище мусором, который
+             * назавтра ничего не значит. */
+            const char *announced = roster_display(name);
+            tofu_result_t tofu = announced
+                ? identity_tofu_check(g_known_keys_path, announced, peer_pk)
+                : TOFU_NEW_KEY;
+
+            char who[MAX_NAME + IDENTITY_FINGERPRINT_LEN + 8];
+            sender_label(name, who, sizeof who);
 
             const char *prefix = "[!]";
-            if (sig_ok == 0) {
+            if (sig_ok == 0 && announced) {
                 if (tofu == TOFU_KEY_MATCH_VERIFIED) {
                     prefix = "[V]";  /* Verified (manually confirmed) */
                 } else if (tofu != TOFU_KEY_CONFLICT) {
                     prefix = "[T]";  /* TOFU trusted (not manually verified) */
                 }
+            } else if (sig_ok == 0) {
+                /* Подпись сошлась, но чья - мы ещё не знаем: анонс не пришёл.
+                 * Метка ключа тут была бы обещанием, которого мы не давали. */
+                prefix = "[?]";
             }
 
             if (message_is_blank(actual_msg, actual_len)) {
@@ -2122,15 +2308,15 @@ int recv_and_decrypt(sock_t s, const char *room, const uint8_t *key, const char 
                 return 1;
             }
 
-            if (tofu == TOFU_NEW_KEY && sig_ok == 0) {
+            if (announced && tofu == TOFU_NEW_KEY && sig_ok == 0) {
                 char fp[IDENTITY_FINGERPRINT_LEN];
                 identity_pk_fingerprint(peer_pk, fp);
-                printf("[TOFU] New identity for \"%s\": %s\n", name, fp);
+                printf("[TOFU] New identity for \"%s\": %s\n", announced, fp);
                 fflush(stdout);
-            } else if (tofu == TOFU_KEY_CONFLICT) {
+            } else if (announced && tofu == TOFU_KEY_CONFLICT) {
                 char fp[IDENTITY_FINGERPRINT_LEN];
                 identity_pk_fingerprint(peer_pk, fp);
-                printf("[WARNING] KEY CHANGED for \"%s\"! Fingerprint: %s\n", name, fp);
+                printf("[WARNING] KEY CHANGED for \"%s\"! Fingerprint: %s\n", announced, fp);
                 fflush(stdout);
             }
 
@@ -2142,36 +2328,62 @@ int recv_and_decrypt(sock_t s, const char *room, const uint8_t *key, const char 
              * to neutralise control bytes before display. */
             sanitize_display_inplace((char*)plain + IDENTITY_PK_BYTES + IDENTITY_SIG_BYTES,
                                      actual_len);
-            printf("[%s] %s %s: %.*s\n", tbuf, prefix, name,
+            printf("[%s] %s %s: %.*s\n", tbuf, prefix, who,
                    (int)actual_len, (char*)actual_msg);
             fflush(stdout);
         }
     } else if (msg_type == MSG_TYPE_IDENTITY_ANNOUNCE) {
-        /* Identity announcement: [pk(32)][sig_over_name(64)] */
-        if (plen >= IDENTITY_PK_BYTES + IDENTITY_SIG_BYTES) {
+        /* Identity announcement: [pk(32)][sig(64)][name_len(2)][name] */
+        const size_t ann_min = IDENTITY_PK_BYTES + IDENTITY_SIG_BYTES + 2;
+        if (plen >= ann_min) {
             const uint8_t *peer_pk = plain;
             const uint8_t *sig = plain + IDENTITY_PK_BYTES;
-            uint16_t recv_name_len = (uint16_t)strlen(name);
-            int sig_ok = identity_verify((const uint8_t*)name, recv_name_len, sig, peer_pk);
-            if (sig_ok == 0) {
-                tofu_result_t tofu = identity_tofu_check(g_known_keys_path, name, peer_pk);
-                char fp[IDENTITY_FINGERPRINT_LEN];
-                identity_pk_fingerprint(peer_pk, fp);
-                /* Rotation addresses a bundle to identity keys, so it needs
-                 * to know who is here now - the TOFU store is on disk and
-                 * says who was ever seen. A conflicting key is not recorded:
-                 * it is the case where we do not know who this is. */
-                if (tofu != TOFU_KEY_CONFLICT) roster_note_identity(name, peer_pk);
-                if (tofu == TOFU_NEW_KEY) {
-                    printf("[TOFU] New identity for \"%s\": %s\n", name, fp);
-                } else if (tofu == TOFU_KEY_MATCH) {
-                    printf("[IDENTITY] \"%s\" trusted (TOFU): %s\n", name, fp);
-                } else if (tofu == TOFU_KEY_MATCH_VERIFIED) {
-                    printf("[VERIFIED] \"%s\" verified: %s\n", name, fp);
-                } else if (tofu == TOFU_KEY_CONFLICT) {
-                    printf("[WARNING] KEY CHANGED for \"%s\"! Fingerprint: %s\n", name, fp);
+            uint16_t dlen = rd_u16(plain + IDENTITY_PK_BYTES + IDENTITY_SIG_BYTES);
+            /* Длина пришла по проводу, значит выбрана не нами. Всё, что за
+             * пределами буфера или не влезает в имя, - молча в корзину. */
+            if ((size_t)dlen + ann_min <= (size_t)plen && dlen < MAX_NAME) {
+                char display[MAX_NAME];
+                memcpy(display, plain + ann_min, dlen);
+                display[dlen] = 0;
+                /* Имя показывают людям, а пришло оно снаружи: перевод строки
+                 * внутри него подделал бы целую строку журнала. */
+                sanitize_display_inplace(display, dlen);
+
+                uint8_t signed_bytes[64 + IDENTITY_SESSION_TAG_LEN + MAX_NAME];
+                size_t slen = identity_announce_signed_bytes(name, display,
+                                                             signed_bytes,
+                                                             sizeof signed_bytes);
+                int sig_ok = slen ? identity_verify(signed_bytes, slen, sig, peer_pk) : -1;
+                if (sig_ok == 0 && display[0]) {
+                    tofu_result_t tofu = identity_tofu_check(g_known_keys_path,
+                                                             display, peer_pk);
+                    char fp[IDENTITY_FINGERPRINT_LEN];
+                    identity_pk_fingerprint(peer_pk, fp);
+                    /* Rotation addresses a bundle to identity keys, so it needs
+                     * to know who is here now - the TOFU store is on disk and
+                     * says who was ever seen. A conflicting key is not recorded:
+                     * it is the case where we do not know who this is. */
+                    /* Список участников печатается из реестра, и до этого
+                     * анонса этот участник стоял в нём огрызком метки.
+                     * Перепечатываем - иначе тот, кто объявился после
+                     * списка, так и остался бы неизвестным в окне. */
+                    int was_unnamed = roster_display(name) == NULL;
+                    if (tofu != TOFU_KEY_CONFLICT)
+                        roster_note_identity(name, peer_pk, display);
+                    if (was_unnamed && roster_display(name) != NULL)
+                        roster_print_users();
+                    if (tofu == TOFU_NEW_KEY) {
+                        printf("[TOFU] New identity for \"%s\": %s\n", display, fp);
+                    } else if (tofu == TOFU_KEY_MATCH) {
+                        printf("[IDENTITY] \"%s\" trusted (TOFU): %s\n", display, fp);
+                    } else if (tofu == TOFU_KEY_MATCH_VERIFIED) {
+                        printf("[VERIFIED] \"%s\" verified: %s\n", display, fp);
+                    } else if (tofu == TOFU_KEY_CONFLICT) {
+                        printf("[WARNING] KEY CHANGED for \"%s\"! Fingerprint: %s\n",
+                               display, fp);
+                    }
+                    fflush(stdout);
                 }
-                fflush(stdout);
             }
         }
     } else if (msg_type == MSG_TYPE_USER_LIST) {
@@ -2181,31 +2393,28 @@ int recv_and_decrypt(sock_t s, const char *room, const uint8_t *key, const char 
             const uint8_t *p = plain + 2;
             size_t remaining = plen - 2;
 
-            static char names[ROSTER_MAX][MAX_NAME];
-            int nnames = 0;
+            /* В списке метки, а не имена: ретранслятор имён не видит.
+             * Разворачивать их в имена будем из реестра, ниже, когда он
+             * уже учтёт этот самый список. */
+            static char tags[ROSTER_MAX][IDENTITY_SESSION_TAG_LEN];
+            int ntags = 0;
 
-            printf("[USERS] Room participants (%u):", count);
             for (uint16_t i = 0; i < count && remaining >= 2; i++) {
-                uint16_t uname_len = rd_u16(p);
+                uint16_t utag_len = rd_u16(p);
                 p += 2;
                 remaining -= 2;
 
-                if (uname_len > remaining) break;
+                if (utag_len > remaining) break;
 
-                printf(" %.*s", (int)uname_len, (char*)p);
-                if (i < count - 1) printf(",");
-
-                if (nnames < ROSTER_MAX && uname_len < MAX_NAME) {
-                    memcpy(names[nnames], p, uname_len);
-                    names[nnames][uname_len] = '\0';
-                    nnames++;
+                if (ntags < ROSTER_MAX && utag_len < IDENTITY_SESSION_TAG_LEN) {
+                    memcpy(tags[ntags], p, utag_len);
+                    tags[ntags][utag_len] = 0;
+                    ntags++;
                 }
 
-                p += uname_len;
-                remaining -= uname_len;
+                p += utag_len;
+                remaining -= utag_len;
             }
-            printf("\n");
-            fflush(stdout);
 
             /* A membership change is the whole trigger: somebody joined, so
              * they must not read what came before, or somebody left, so they
@@ -2220,7 +2429,8 @@ int recv_and_decrypt(sock_t s, const char *room, const uint8_t *key, const char 
                 g_have_before = 1;
             }
 
-            int changed = roster_set_present(names, nnames);
+            int changed = roster_set_present(tags, ntags);
+            roster_print_users();
 
             if (!g_saw_first_user_list) {
                 /* Our own arrival. Somebody who was already here rotates for
@@ -2511,6 +2721,28 @@ void run_client(const char *host, uint16_t port, const char *room, const char *n
     room = wire_room;
     g_wire_room = wire_room;
 
+    /*
+     * Дальше «name» - это метка сессии, а не имя человека.
+     *
+     * В это поле кадра раньше уезжало отображаемое имя, и ретранслятор вёл
+     * из него готовый список: кто, где, откуда. Имена устойчивы между
+     * сеансами, так что по ним складывался и граф знакомств. Теперь там 16
+     * случайных байт, новых на каждое подключение: закрепить кадр за
+     * отправителем ретранслятору этого хватает, связать два сеанса одного
+     * человека - уже нет.
+     *
+     * Настоящее имя остаётся в name_local и уезжает внутрь шифра, анонсом
+     * личности, с подписью, привязывающей его к этой метке.
+     */
+    const char *name_local = name;
+    char session_tag[IDENTITY_SESSION_TAG_LEN];
+    if (identity_session_tag(session_tag) != 0) {
+        fprintf(stderr, "[client] cannot derive the session tag\n");
+        return;
+    }
+    name = session_tag;
+    g_display_name = name_local;
+
 
     /* Store identity in module globals */
     if (id_pk && id_sk) {
@@ -2534,7 +2766,20 @@ void run_client(const char *host, uint16_t port, const char *room, const char *n
         mkdir("Downloads", 0755);
     #endif
     sock_t s = dial_tcp(host, port);
-    printf("[client] connected to %s:%u, Room name: %s\n", host, port, room);
+    /* Своё название, не метка: строку читает хозяин машины, а не
+     * ретранслятор. */
+    printf("[client] connected to %s:%u, Room name: %s\n", host, port, room_local);
+    /*
+     * Метку публикуем наружу намеренно.
+     *
+     * Секрета в ней нет - её и так видит ретранслятор, для него она и
+     * заведена. А вот процессу звонка она нужна: он подключается своим
+     * соединением, и сервер связывает его UDP-адрес с нашим чат-соединением
+     * по паре «комната + метка». Без неё пара не сходится и голос через
+     * ретранслятор не идёт.
+     */
+    printf("[SESSION] %s\n", session_tag);
+    fflush(stdout);
 
     /* Use a local copy of the key so we can overwrite it in join mode */
     uint8_t active_key[CRYPTO_KEYBYTES];
@@ -2566,7 +2811,7 @@ void run_client(const char *host, uint16_t port, const char *room, const char *n
      * сообщение для этого не нужно. А видно его было всем: сервер раздавал
      * его в комнату, и у собеседников оставался пустой пузырь. */
     if (g_has_identity) {
-        roster_note_identity(name, g_identity_pk);
+        roster_note_identity(name, g_identity_pk, name_local);
         if (send_identity_announce(s, room, name, active_key,
                                    g_identity_sk, g_identity_pk) < 0) {
             fprintf(stderr, "[client] failed to register with server\n");
@@ -2708,7 +2953,9 @@ void run_client(const char *host, uint16_t port, const char *room, const char *n
                 /* Ответ сервера скажет, легло ли письмо: он же сообщит, что
                  * хранение выключено, и тогда пользователь узнает правду, а
                  * не увидит две галочки. */
-                rc = inbox_send(s, inbox_find_room(room_local), name,
+                /* Имя, а не метка: письмо распечатают, когда нас уже не
+                 * будет в комнате, и разворачивать метку будет не по чему. */
+                rc = inbox_send(s, inbox_find_room(room_local), name_local,
                                 (const uint8_t *)line, len);
             } else if (g_has_identity) {
                 rc = send_signed_ciphertext(s, room, name, active_key,
@@ -2722,7 +2969,8 @@ void run_client(const char *host, uint16_t port, const char *room, const char *n
                 free(line);
                 break;
             }
-            print_local_message(name, line);
+            /* Своё окно - не провод: здесь нужно имя, а не метка. */
+            print_local_message(name_local, line);
             free(line);
         }
     }

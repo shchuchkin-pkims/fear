@@ -128,7 +128,7 @@ void VideoCallDialog::onStartCall() {
     if (relayCheck->isChecked() && backend) {
         // Relay mode: route through server
         if (videoManager->startRelay(remoteIp, remotePort,
-                                      backend->currentRoom, backend->currentName, key,
+                                      backend->currentRoom, backend->currentTag, key,
                                       quality, adaptive, width, height, fps, bitrate,
                                       camera, audioInput, audioOutput, false, false)) {
             statusLabel->setText("Relay call started");

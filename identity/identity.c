@@ -96,6 +96,32 @@ static void identity_warn_plaintext_once(void) {
             "stored unencrypted (file mode 0600 only)\n");
 }
 
+int identity_session_tag(char out[IDENTITY_SESSION_TAG_LEN]) {
+    if (!out) return -1;
+    uint8_t raw[16];
+    randombytes_buf(raw, sizeof raw);
+    return sodium_bin2base64(out, IDENTITY_SESSION_TAG_LEN,
+                             raw, sizeof raw,
+                             sodium_base64_VARIANT_URLSAFE_NO_PADDING)
+           ? 0 : -1;
+}
+
+size_t identity_announce_signed_bytes(const char *session_tag, const char *display_name,
+                                      uint8_t *out, size_t cap) {
+    if (!session_tag || !display_name || !out) return 0;
+    static const char ctx[] = "fear.announce.v2";
+    const size_t tag_len = strlen(session_tag);
+    const size_t name_len = strlen(display_name);
+    const size_t total = (sizeof ctx - 1) + tag_len + name_len;
+    if (total > cap) return 0;
+
+    uint8_t *w = out;
+    memcpy(w, ctx, sizeof ctx - 1); w += sizeof ctx - 1;
+    memcpy(w, session_tag, tag_len); w += tag_len;
+    memcpy(w, display_name, name_len);
+    return total;
+}
+
 int identity_wire_room(const char *room_name, char out[IDENTITY_WIRE_ROOM_LEN]) {
     if (!room_name || !out) return -1;
     const size_t len = strlen(room_name);

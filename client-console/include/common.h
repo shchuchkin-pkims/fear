@@ -69,7 +69,13 @@ typedef enum {
     MSG_TYPE_SIGNED_FILE_START = 6, /**< Signed file start */
     MSG_TYPE_SIGNED_FILE_CHUNK = 7, /**< Signed file chunk */
     MSG_TYPE_SIGNED_FILE_END = 8,   /**< Signed file end */
-    MSG_TYPE_IDENTITY_ANNOUNCE = 9, /**< Identity announcement: [pk(32)][sig(64)] */
+    MSG_TYPE_IDENTITY_ANNOUNCE = 9, /**< Identity announcement:
+                                          [pk(32)][sig(64)][name_len(2)][name].
+                                          Единственное место, где отображаемое
+                                          имя уходит с машины, и уходит уже
+                                          запечатанным. Подпись покрывает метку
+                                          сессии вместе с именем - иначе чужой
+                                          анонс повторили бы под своей меткой. */
     MSG_TYPE_KEY_REQUEST  = 15,     /**< ECDH key request: [x25519_pk(32)] (zero nonce service msg) */
     MSG_TYPE_KEY_RESPONSE = 16,     /**< ECDH key response: [target_name_len(2)][target_name][responder_pk(32)][box_nonce(24)][crypto_box(room_key)(48)] */
     MSG_TYPE_MEDIA_RELAY  = 17,     /**< Media relay: payload is raw encrypted media packet (audio/video/hello) */

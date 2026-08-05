@@ -309,6 +309,11 @@ void ChatWindow::handleContactsUpdated(const QStringList &users) {
     // GroupParticipantsDialog as a phantom "online" user.
     m_seenPeers.clear();
     for (const QString &u : users) {
+        // «?метка» - это участник, который ещё не объявился: сервер назвал
+        // его меткой, а имя приходит отдельным анонсом мгновением позже.
+        // В список собеседников такой огрызок попадать не должен - строка
+        // перепечатается сама, как только имя станет известно.
+        if (u.startsWith(QLatin1Char('?'))) continue;
         if (u != m_backend->currentName) m_seenPeers.insert(u);
     }
     updateOnlineStatus();
