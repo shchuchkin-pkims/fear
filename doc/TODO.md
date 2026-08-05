@@ -132,8 +132,14 @@
       Counting itself as having been present is what made two members rotate
       at once and the room split in two.
 
-      Remaining: rotation on Android, which has to speak the same wire format
-      or a mixed room splits in two.
+      Android speaks it too now, and the binding is pinned as a frozen vector
+      on both sides so that either one drifting fails its own test rather
+      than a room quietly splitting. Verified live: a phone and two console
+      clients on one relay, two membership changes, one rotation each, and
+      the member that joined last unable to read what came before it.
+
+      Remaining in Phase C: nothing on rotation. What is still open under
+      metadata privacy and the offline inbox is listed separately below.
 - [ ] Documentation updates and localization
 
 ## Planned

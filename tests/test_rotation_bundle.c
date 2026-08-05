@@ -48,6 +48,32 @@ int main(void) {
     uint8_t bundle[4096];
     size_t blen = 0;
 
+    /* --- the binding, frozen -----------------------------------------------
+     *
+     * Android computes this too, from the same inputs, and a room with both
+     * in it rotates only if the bytes match. Nothing announces a mismatch:
+     * each side simply stops being able to read the other, so the vector is
+     * pinned on both sides and either one drifting fails its own test.
+     *
+     * Version 258 is 0x0102, so a big-endian slip shows; the second room id
+     * is not ASCII, so a platform hashing UTF-16 shows too.
+     */
+    {
+        uint8_t bind[32];
+        char hex[65];
+
+        CHECK(rotation_binding(ROOM, 5, alice.pk, bob.pk, bind) == 0);
+        sodium_bin2hex(hex, sizeof hex, bind, sizeof bind);
+        CHECK(strcmp(hex,
+            "eec1a881cf95bcab46ffa70d341249fdaccb26240acad02cf216f00382d9ea73") == 0);
+
+        CHECK(rotation_binding("ÐºÐ¾Ð¼Ð½Ð°ÑÐ°",
+                               258, alice.pk, bob.pk, bind) == 0);
+        sodium_bin2hex(hex, sizeof hex, bind, sizeof bind);
+        CHECK(strcmp(hex,
+            "c5a5d34c2feb013b389232d1c2b2f04d86c819630d4a161d7f8cc23a70b6f0f8") == 0);
+    }
+
     /* --- build and read back ---------------------------------------------- */
     CHECK(rb_build(ROOM, 5, k_new, alice.sk, alice.pk,
                    recipients, 3, bundle, sizeof bundle, &blen) == RB_OK);
