@@ -91,29 +91,7 @@ endif()
 option(FEAR_GUI_ONLY "Skip audio_call/video_call/key-exchange/updater subprojects" OFF)
 
 # Включение субмодулей
-# Хранилище секретов платформы, которым обёрнут ключ личности на диске
-# (identity/identity_at_rest.c). Зависимость необязательная: без неё файл
-# остаётся в том же виде, в каком был всегда, и код это оговаривает вслух.
-# Поэтому её отсутствие - не ошибка сборки: headless-машины и контейнеры
-# существуют, и отказываться там работать было бы хуже.
-add_library(fear_secret_store INTERFACE)
-if(WIN32)
-    # DPAPI: CryptProtectData / CryptUnprotectData.
-    target_link_libraries(fear_secret_store INTERFACE crypt32)
-else()
-    find_package(PkgConfig QUIET)
-    if(PkgConfig_FOUND)
-        pkg_check_modules(LIBSECRET libsecret-1)
-    endif()
-    if(LIBSECRET_FOUND)
-        target_compile_definitions(fear_secret_store INTERFACE FEAR_HAVE_LIBSECRET)
-        target_include_directories(fear_secret_store INTERFACE ${LIBSECRET_INCLUDE_DIRS})
-        target_link_libraries(fear_secret_store INTERFACE ${LIBSECRET_LIBRARIES})
-        message(STATUS "libsecret found - the identity key is wrapped at rest")
-    else()
-        message(STATUS "libsecret not found - the identity key stays in the clear on disk")
-    endif()
-endif()
+include(${CMAKE_CURRENT_LIST_DIR}/cmake/FearSecretStore.cmake)
 
 add_subdirectory(client-console)
 if(NOT FEAR_GUI_ONLY)

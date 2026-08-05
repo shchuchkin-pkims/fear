@@ -239,10 +239,12 @@ void ChatWindow::updateOnlineStatus() {
                        || m_backend->currentRoom.startsWith("dm:");
     QString status;
     if (isPm) {
-        status = (total >= 2) ? tr("online") : tr("offline");
+        status = (total >= 2) ? tr("Online") : tr("Offline");
     } else {
-        status = (total <= 1) ? tr("just you online")
-                              : tr("%1 online").arg(total);
+        /* Число видно всегда, включая единицу: «Online 1» отвечает на вопрос
+         * «сколько нас», а «just you online» заставляет догадываться, что это
+         * то же самое. */
+        status = tr("Online %1").arg(total);
     }
     m_chatArea->setChat(m_backend->currentRoom,
                         prettyRoomTitle(m_backend->currentRoom), status);

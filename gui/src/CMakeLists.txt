@@ -146,7 +146,9 @@ add_executable(${PROJECT_NAME}
     ${SOURCES}
     ${RESOURCES_FILES}
 )
-# Хранилище секретов платформы для ключа личности (см. корневой CMakeLists).
+# Хранилище секретов платформы для ключа личности. GUI собирается и как
+# отдельный проект, поэтому цель определяется здесь же, если её ещё нет.
+include(${CMAKE_CURRENT_SOURCE_DIR}/../../cmake/FearSecretStore.cmake)
 target_link_libraries(${PROJECT_NAME} PRIVATE fear_secret_store)
 
 
