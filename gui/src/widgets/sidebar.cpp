@@ -1,4 +1,6 @@
 #include "sidebar.h"
+
+#include "icons.h"
 #include "../theme/theme.h"
 
 #include <QAction>
@@ -43,7 +45,9 @@ Sidebar::Sidebar(QWidget *parent) : QWidget(parent) {
     header->setFixedHeight(54);
 
     m_menuBtn = new QPushButton(header);
-    m_menuBtn->setText(QString::fromUtf8("☰"));
+    m_menuBtn->setIcon(fear::icon(fear::Glyph::Menu,
+                              Theme::instance().textSecondary(), 20));
+    m_menuBtn->setIconSize(QSize(20, 20));
     m_menuBtn->setFixedSize(36, 36);
     m_menuBtn->setCursor(Qt::PointingHandCursor);
     m_menuBtn->setToolTip(tr("Menu"));

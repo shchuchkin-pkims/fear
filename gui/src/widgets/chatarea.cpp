@@ -1,4 +1,6 @@
 #include "chatarea.h"
+
+#include "icons.h"
 #include "avatar.h"
 #include "../theme/theme.h"
 
@@ -256,17 +258,66 @@ private:
     QFrame *m_bubble = nullptr;
 };
 
-QPushButton *makeIconButton(const QString &glyph, const QString &tooltip,
+/**
+ * Дата над первым сообщением дня.
+ *
+ * Одного времени «14:03» мало: по нему не видно, сегодняшнее это сообщение
+ * или недельной давности, а открытая переписка спокойно переваливает за
+ * полночь. То же самое и теми же словами делает приложение на телефоне.
+ */
+class DaySeparator : public QWidget {
+public:
+    DaySeparator(const QDate &day, QWidget *parent = nullptr) : QWidget(parent) {
+        auto *lay = new QHBoxLayout(this);
+        lay->setContentsMargins(24, 6, 24, 6);
+        lay->addStretch(1);
+
+        auto *pill = new QLabel(label(day), this);
+        pill->setAlignment(Qt::AlignCenter);
+        const Theme &th = Theme::instance();
+        pill->setStyleSheet(QString(
+            "background: %1; color: %2; border-radius: 10px;"
+            " padding: 4px 12px; font-size: 12px; font-weight: 600;")
+            .arg(th.mode() == Theme::Light ? QStringLiteral("rgba(255,255,255,200)")
+                                           : QStringLiteral("rgba(58,61,66,220)"),
+                 th.textSecondary().name()));
+        lay->addWidget(pill);
+        lay->addStretch(1);
+    }
+
+    /**
+     * «Today», «Yesterday» или сама дата.
+     *
+     * Год пишется только когда он не нынешний - иначе он стоит в каждом
+     * разделителе и ни о чём не говорит. Считаем календарём, а не вычитанием
+     * суток: «вчера» в день перевода часов длится 23 часа или 25.
+     */
+    static QString label(const QDate &day) {
+        const QDate today = QDate::currentDate();
+        if (day == today) return tr("Today");
+        if (day == today.addDays(-1)) return tr("Yesterday");
+        const QString fmt = (day.year() == today.year())
+                                ? QStringLiteral("d MMMM")
+                                : QStringLiteral("d MMMM yyyy");
+        return QLocale().toString(day, fmt);
+    }
+
+private:
+    Q_DISABLE_COPY(DaySeparator)
+};
+
+QPushButton *makeIconButton(fear::Glyph glyph, const QString &tooltip,
                             QWidget *parent, int size = 36) {
-    auto *b = new QPushButton(glyph, parent);
+    auto *b = new QPushButton(parent);
     b->setProperty("flat", true);
     b->setFlat(true);
     b->setFixedSize(size, size);
     b->setCursor(Qt::PointingHandCursor);
     b->setToolTip(tooltip);
-    QFont f = b->font();
-    f.setPixelSize(16);
-    b->setFont(f);
+    /* Цвет берётся у темы в момент создания. Переключение темы пересоздаёт
+     * окно, так что перекрашивать значки на лету не нужно. */
+    b->setIcon(fear::icon(glyph, Theme::instance().textSecondary(), 20));
+    b->setIconSize(QSize(20, 20));
     return b;
 }
 
@@ -298,9 +349,9 @@ ChatArea::ChatArea(QWidget *parent) : QWidget(parent) {
     titleCol->addWidget(m_titleLbl);
     titleCol->addWidget(m_statusLbl);
 
-    m_audioCallBtn = makeIconButton(QString::fromUtf8("☎"), tr("Audio call"), m_header);
-    m_videoCallBtn = makeIconButton(QString::fromUtf8("▶"), tr("Video call"), m_header);
-    m_menuBtn      = makeIconButton(QString::fromUtf8("⋮"), tr("More"),       m_header);
+    m_audioCallBtn = makeIconButton(fear::Glyph::Phone, tr("Audio call"), m_header);
+    m_videoCallBtn = makeIconButton(fear::Glyph::Video, tr("Video call"), m_header);
+    m_menuBtn      = makeIconButton(fear::Glyph::More, tr("More"),       m_header);
 
     // Кликабельная зона: аватар + title — единый clickable контейнер.
     // Тап → headerClicked(), хост открывает профиль собеседника
@@ -400,9 +451,9 @@ ChatArea::ChatArea(QWidget *parent) : QWidget(parent) {
     connect(&Theme::instance(), &Theme::modeChanged, this,
             [applyPanelBg](Theme::Mode){ applyPanelBg(); });
 
-    m_attachBtn = makeIconButton(QString::fromUtf8("\U0001F4CE"), tr("Attach"), m_inputArea);
-    m_emojiBtn  = makeIconButton(QString::fromUtf8("\U0001F642"), tr("Emoji"),  m_inputArea);
-    m_sendBtn   = makeIconButton(QString::fromUtf8("➤"),    tr("Send"),   m_inputArea);
+    m_attachBtn = makeIconButton(fear::Glyph::Attach, tr("Attach"), m_inputArea);
+    m_emojiBtn  = makeIconButton(fear::Glyph::Smile, tr("Emoji"),  m_inputArea);
+    m_sendBtn   = makeIconButton(fear::Glyph::Send, tr("Send"),   m_inputArea);
     m_sendBtn->setObjectName("SendButton");
 
     // Rounded pill container — auto-grows in height with the input text up to
@@ -500,6 +551,8 @@ void ChatArea::setChat(const QString &id, const QString &title, const QString &s
 }
 
 void ChatArea::clearMessages() {
+    /* Лента пуста - значит следующее сообщение снова первое в своём дне. */
+    m_lastMessageDay = QDate();
     while (m_messagesLayout->count() > 1) {
         QLayoutItem *item = m_messagesLayout->takeAt(0);
         if (QWidget *w = item->widget()) w->deleteLater();
@@ -508,6 +561,17 @@ void ChatArea::clearMessages() {
 }
 
 void ChatArea::appendMessage(const Message &m) {
+    /* Разделитель ставится перед первым сообщением дня. Сравнивается
+     * календарный день, а не сама метка времени: час по обе стороны от
+     * полуночи - это два разных дня при разнице меньше суток. */
+    const QDate day = m.timestamp.isValid() ? m.timestamp.date()
+                                            : QDate::currentDate();
+    if (day != m_lastMessageDay) {
+        auto *sep = new DaySeparator(day, m_messagesContainer);
+        m_messagesLayout->insertWidget(m_messagesLayout->count() - 1, sep);
+        m_lastMessageDay = day;
+    }
+
     ChatArea *self = this;
     auto onSenderClick = [self](const QString &name) {
         self->emitSenderClicked(name);

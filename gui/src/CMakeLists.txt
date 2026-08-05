@@ -102,6 +102,7 @@ set(SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/../../identity/contacts_cipher.c
     theme/theme.cpp
     widgets/avatar.cpp
+    widgets/icons.cpp
     widgets/chatlistitem.cpp
     widgets/sidebar.cpp
     widgets/chatarea.cpp
@@ -137,6 +138,7 @@ set(HEADERS
     groupparticipantsdialog.h
     theme/theme.h
     widgets/avatar.h
+    widgets/icons.h
     widgets/chatlistitem.h
     widgets/sidebar.h
     widgets/chatarea.h

@@ -62,10 +62,13 @@ ChatWindow::ChatWindow(QWidget *parent) : QMainWindow(parent) {
         move(g.x() + (g.width() - 1200) / 2, g.y() + (g.height() - 780) / 2);
     }
 
-    // Restore last-used theme (default Dark on first launch).
+    // Restore last-used theme (default Light on first launch).
     {
         QSettings s("fear-messenger", "fear-gui");
-        const int saved = s.value("theme/mode", int(Theme::Dark)).toInt();
+        /* Светлая по умолчанию: ровно так выглядит приложение на телефоне,
+         * и человек, открывший оба, должен видеть одно и то же. Тёмная
+         * никуда не делась - переключатель в меню, выбор запоминается. */
+        const int saved = s.value("theme/mode", int(Theme::Light)).toInt();
         Theme::instance().setMode(Theme::Mode(saved == int(Theme::Light) ? Theme::Light : Theme::Dark));
     }
     if (auto *app = qobject_cast<QApplication*>(QApplication::instance())) {

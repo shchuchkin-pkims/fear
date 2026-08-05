@@ -3,6 +3,7 @@
 
 #include <QWidget>
 #include <QString>
+#include <QDate>
 #include <QDateTime>
 
 class QLabel;
@@ -63,6 +64,9 @@ protected:
     void paintEvent(QPaintEvent *event) override;
 
 private:
+    /* День последнего показанного сообщения: по нему решается, нужен
+     * ли новый разделитель с датой. QDate() значит «лента пуста». */
+    QDate m_lastMessageDay;
     void onSendClicked();
 
     QString      m_chatId;
