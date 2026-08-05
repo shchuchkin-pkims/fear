@@ -48,7 +48,7 @@ static void print_usage(const char *prog) {
         "  %s --version\n"
         "  %s genkey\n"
         "  %s gen-identity\n"
-        "  %s server [--port N]\n"
+        "  %s server [--port N] [--inbox off|30d|Nh]\n"
         "  %s client --host HOST --port N --room ROOM [--key-file FILE] [--name NAME]\n"
         "           [--identity-file FILE] [--no-sign] [--create] [--join] [--auto]\n"
 
@@ -206,11 +206,32 @@ int main(int argc, char **argv) {
         return 0;
     }
     if (strcmp(argv[1], "server") == 0) {
+        int64_t inbox_ttl = INBOX_TTL_DEFAULT;
         uint16_t port = DEFAULT_PORT;
         for (int i = 2; i < argc; i++) {
             if (strcmp(argv[i], "--port") == 0 && i + 1 < argc) { port = (uint16_t)atoi(argv[++i]); }
+            else if (strcmp(argv[i], "--inbox") == 0 && i + 1 < argc) {
+                /* off | Nh | Nd - «сколько держать недоставленное».
+                 * Выключатель здесь потому, что это решение оператора, а не
+                 * разработчика: чей сервер, того и политика хранения. */
+                const char *v = argv[++i];
+                if (strcmp(v, "off") == 0 || strcmp(v, "0") == 0) {
+                    inbox_ttl = 0;
+                } else {
+                    char *end = NULL;
+                    long n = strtol(v, &end, 10);
+                    if (n <= 0) {
+                        fprintf(stderr, "--inbox: expected off, Nh or Nd\n");
+                        return 1;
+                    }
+                    if (end && *end == 'h')      inbox_ttl = (int64_t)n * 3600;
+                    else if (end && *end == 'd') inbox_ttl = (int64_t)n * 86400;
+                    else if (end && *end == 0)   inbox_ttl = (int64_t)n * 86400;
+                    else { fprintf(stderr, "--inbox: expected off, Nh or Nd\n"); return 1; }
+                }
+            }
         }
-        run_server(port);
+        run_server_opts(port, inbox_ttl);
         return 0;
     }
     if (strcmp(argv[1], "client") == 0) {

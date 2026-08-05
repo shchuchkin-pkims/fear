@@ -57,6 +57,17 @@ static int ensure_schema(void) {
         "  connected_at INTEGER NOT NULL"
         ")") < 0) return -1;
 
+    /* Почта тому, кого нет в комнате. Адрес слепой - см. server_db.h. */
+    if (exec_or_log(
+        "CREATE TABLE IF NOT EXISTS inbox ("
+        "  id          INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "  addr        BLOB NOT NULL,"
+        "  ciphertext  BLOB NOT NULL,"
+        "  created_at  INTEGER NOT NULL"
+        ")") < 0) return -1;
+    if (exec_or_log(
+        "CREATE INDEX IF NOT EXISTS inbox_by_addr ON inbox(addr, id)") < 0) return -1;
+
     if (exec_or_log(
         "CREATE TABLE IF NOT EXISTS server_state ("
         "  key   TEXT PRIMARY KEY,"
@@ -413,4 +424,151 @@ void server_db_session_remove(int fd) {
     sqlite3_bind_int(st, 1, fd);
     sqlite3_step(st);
     sqlite3_finalize(st);
+}
+
+/* ------------------------------------------------------------------ *
+ * Offline inbox
+ * ------------------------------------------------------------------ */
+
+static int64_t g_inbox_ttl = 0;   /* 0 - хранение выключено */
+
+void server_db_inbox_set_ttl(int64_t ttl_seconds) {
+    g_inbox_ttl = ttl_seconds > 0 ? ttl_seconds : 0;
+    char buf[32];
+    snprintf(buf, sizeof buf, "%lld", (long long)g_inbox_ttl);
+    state_set("inbox_ttl", buf);
+}
+
+int64_t server_db_inbox_ttl(void) { return g_inbox_ttl; }
+
+inbox_put_result_t server_db_inbox_put(const uint8_t addr[INBOX_ADDR_BYTES],
+                                       const uint8_t *cipher, size_t len) {
+    if (!g_db || !addr || !cipher || len == 0) return INBOX_PUT_ERROR;
+    if (g_inbox_ttl <= 0) return INBOX_PUT_DISABLED;
+
+    /* Квота считается по адресу, а не по отправителю: отправителя мы не
+     * знаем и знать не хотим. Значит и залить чужой ящик может кто угодно,
+     * кому известен адрес - то есть собеседник. Ограничение здесь не от
+     * злоумышленника из интернета, а от того, чтобы забытый ящик не рос
+     * без предела. */
+    sqlite3_stmt *q = NULL;
+    if (sqlite3_prepare_v2(g_db,
+            "SELECT COUNT(*), COALESCE(SUM(LENGTH(ciphertext)), 0)"
+            "  FROM inbox WHERE addr = ?", -1, &q, NULL) != SQLITE_OK) {
+        return INBOX_PUT_ERROR;
+    }
+    sqlite3_bind_blob(q, 1, addr, INBOX_ADDR_BYTES, SQLITE_STATIC);
+    int64_t items = 0, bytes = 0;
+    if (sqlite3_step(q) == SQLITE_ROW) {
+        items = sqlite3_column_int64(q, 0);
+        bytes = sqlite3_column_int64(q, 1);
+    }
+    sqlite3_finalize(q);
+
+    if (items >= INBOX_MAX_ITEMS_PER_ADDR ||
+        bytes + (int64_t)len > INBOX_MAX_BYTES_PER_ADDR) {
+        return INBOX_PUT_FULL;
+    }
+
+    sqlite3_stmt *ins = NULL;
+    if (sqlite3_prepare_v2(g_db,
+            "INSERT INTO inbox(addr, ciphertext, created_at) VALUES (?, ?, ?)",
+            -1, &ins, NULL) != SQLITE_OK) {
+        return INBOX_PUT_ERROR;
+    }
+    sqlite3_bind_blob (ins, 1, addr, INBOX_ADDR_BYTES, SQLITE_STATIC);
+    sqlite3_bind_blob (ins, 2, cipher, (int)len, SQLITE_STATIC);
+    sqlite3_bind_int64(ins, 3, (sqlite3_int64)time(NULL));
+    int rc = sqlite3_step(ins);
+    sqlite3_finalize(ins);
+    return (rc == SQLITE_DONE) ? INBOX_PUT_OK : INBOX_PUT_ERROR;
+}
+
+size_t server_db_inbox_fetch(const uint8_t addr[INBOX_ADDR_BYTES],
+                             inbox_item_t *out, size_t cap) {
+    if (!g_db || !addr || !out || cap == 0) return 0;
+
+    sqlite3_stmt *q = NULL;
+    if (sqlite3_prepare_v2(g_db,
+            "SELECT id, ciphertext, created_at FROM inbox"
+            " WHERE addr = ? ORDER BY id LIMIT ?", -1, &q, NULL) != SQLITE_OK) {
+        return 0;
+    }
+    sqlite3_bind_blob(q, 1, addr, INBOX_ADDR_BYTES, SQLITE_STATIC);
+    sqlite3_bind_int (q, 2, (int)cap);
+
+    size_t n = 0;
+    while (n < cap && sqlite3_step(q) == SQLITE_ROW) {
+        const void *blob = sqlite3_column_blob(q, 1);
+        const int   blen = sqlite3_column_bytes(q, 1);
+        if (blen <= 0) continue;
+        uint8_t *copy = (uint8_t *)malloc((size_t)blen);
+        if (!copy) break;
+        memcpy(copy, blob, (size_t)blen);
+        out[n].id         = sqlite3_column_int64(q, 0);
+        out[n].ciphertext = copy;
+        out[n].len        = (size_t)blen;
+        out[n].created_at = sqlite3_column_int64(q, 2);
+        n++;
+    }
+    sqlite3_finalize(q);
+    return n;
+}
+
+void server_db_inbox_delete(const uint8_t addr[INBOX_ADDR_BYTES],
+                            const int64_t *ids, size_t n) {
+    if (!g_db || !addr || !ids || n == 0) return;
+
+    sqlite3_stmt *del = NULL;
+    /* Адрес в условии не для красоты: без него знание чужого номера записи
+     * позволяло бы стирать чужую почту. */
+    if (sqlite3_prepare_v2(g_db, "DELETE FROM inbox WHERE id = ? AND addr = ?",
+                           -1, &del, NULL) != SQLITE_OK) {
+        return;
+    }
+    for (size_t i = 0; i < n; i++) {
+        sqlite3_reset(del);
+        sqlite3_bind_int64(del, 1, (sqlite3_int64)ids[i]);
+        sqlite3_bind_blob (del, 2, addr, INBOX_ADDR_BYTES, SQLITE_STATIC);
+        sqlite3_step(del);
+    }
+    sqlite3_finalize(del);
+}
+
+void server_db_inbox_expire(void) {
+    if (!g_db) return;
+    if (g_inbox_ttl <= 0) {
+        /* Хранение выключили - выбрасываем и то, что накопилось раньше:
+         * оставить его значило бы, что выключатель ничего не выключает. */
+        exec_or_log("DELETE FROM inbox");
+        return;
+    }
+    sqlite3_stmt *q = NULL;
+    if (sqlite3_prepare_v2(g_db, "DELETE FROM inbox WHERE created_at < ?",
+                           -1, &q, NULL) != SQLITE_OK) {
+        return;
+    }
+    sqlite3_bind_int64(q, 1, (sqlite3_int64)(time(NULL) - g_inbox_ttl));
+    sqlite3_step(q);
+    sqlite3_finalize(q);
+}
+
+void server_db_inbox_stats(int64_t *items, int64_t *bytes, int64_t *addrs) {
+    if (items) *items = 0;
+    if (bytes) *bytes = 0;
+    if (addrs) *addrs = 0;
+    if (!g_db) return;
+
+    sqlite3_stmt *q = NULL;
+    if (sqlite3_prepare_v2(g_db,
+            "SELECT COUNT(*), COALESCE(SUM(LENGTH(ciphertext)), 0),"
+            "       COUNT(DISTINCT addr) FROM inbox", -1, &q, NULL) != SQLITE_OK) {
+        return;
+    }
+    if (sqlite3_step(q) == SQLITE_ROW) {
+        if (items) *items = sqlite3_column_int64(q, 0);
+        if (bytes) *bytes = sqlite3_column_int64(q, 1);
+        if (addrs) *addrs = sqlite3_column_int64(q, 2);
+    }
+    sqlite3_finalize(q);
 }

@@ -743,14 +743,150 @@ static int try_handle_command(client_t *cl, const uint8_t *frame, size_t flen) {
  * Returns 1 if the frame was handled (caller must skip broadcast/registration),
  *         0 otherwise.
  */
+/**
+ * Кадр от сервера с произвольной нагрузкой.
+ *
+ * send_result_frame умеет только «статус и причина»; ящику нужно отдать
+ * список писем, поэтому кадр собирается здесь - той же формы, что и все
+ * служебные: нулевой nonce и имя отправителя «server».
+ */
+static void send_payload_frame(sock_t fd, const char *room, uint16_t room_len,
+                               uint8_t msg_type,
+                               const uint8_t *payload, size_t payload_len) {
+    static const char *kSrvName = "server";
+    uint16_t name_len = (uint16_t)strlen(kSrvName);
+    uint8_t  nonce[CRYPTO_NPUBBYTES];
+    memset(nonce, 0, sizeof nonce);
+
+    size_t frame_len = 2 + room_len + 2 + name_len + 2
+                     + CRYPTO_NPUBBYTES + 1 + 4 + payload_len;
+    uint8_t *frame = (uint8_t *)malloc(frame_len);
+    if (!frame) return;
+
+    uint8_t *w = frame;
+    wr_u16(w, room_len);               w += 2;
+    memcpy(w, room, room_len);         w += room_len;
+    wr_u16(w, name_len);               w += 2;
+    memcpy(w, kSrvName, name_len);     w += name_len;
+    wr_u16(w, CRYPTO_NPUBBYTES);       w += 2;
+    memcpy(w, nonce, CRYPTO_NPUBBYTES); w += CRYPTO_NPUBBYTES;
+    *w++ = msg_type;
+    wr_u32(w, (uint32_t)payload_len);  w += 4;
+    if (payload_len) memcpy(w, payload, payload_len);
+
+    send_all(fd, frame, frame_len);
+    free(frame);
+}
+
+/** Наибольшее число адресов в одном запросе. */
+#define INBOX_FETCH_MAX_ADDRS 128
+
+/**
+ * Ответ на команду ящика.
+ *
+ * Срок хранения едет в каждом ответе: так клиент узнаёт политику сервера, не
+ * спрашивая отдельно, и может честно сказать «не доставлено», когда хранение
+ * выключено, вместо того чтобы делать вид, что письмо ушло.
+ */
+static void send_inbox_result(sock_t fd, const char *room, uint16_t room_len,
+                              uint8_t status,
+                              const inbox_item_t *items, size_t nitems) {
+    size_t payload_len = 1 + 4 + 2;
+    for (size_t i = 0; i < nitems; i++) payload_len += 8 + 4 + items[i].len;
+
+    uint8_t *payload = (uint8_t *)malloc(payload_len);
+    if (!payload) return;
+
+    uint8_t *w = payload;
+    *w++ = status;
+    wr_u32(w, (uint32_t)server_db_inbox_ttl()); w += 4;
+    wr_u16(w, (uint16_t)nitems); w += 2;
+    for (size_t i = 0; i < nitems; i++) {
+        for (int b = 0; b < 8; b++) *w++ = (uint8_t)((items[i].id >> (8 * b)) & 0xFF);
+        wr_u32(w, (uint32_t)items[i].len); w += 4;
+        memcpy(w, items[i].ciphertext, items[i].len);
+        w += items[i].len;
+    }
+
+    send_payload_frame(fd, room, room_len, (uint8_t)MSG_TYPE_INBOX_RESULT,
+                       payload, payload_len);
+    free(payload);
+}
+
 static int try_room_command(sock_t fd,
                             const uint8_t *frame, size_t flen,
                             const client_t *clients, int nclients) {
     fear_frame_t fv;
     if (fear_frame_parse(frame, flen, &fv) != 0) return 0;
-    uint16_t    room_len = fv.room_len;
-    uint8_t     type     = fv.type;
-    const char *room     = fv.room;
+    uint16_t       room_len = fv.room_len;
+    uint8_t        type     = fv.type;
+    const char    *room     = fv.room;
+    uint32_t       clen     = fv.payload_len;
+    const uint8_t *cipher   = fv.payload;
+
+    /* --- Офлайн-ящик ---------------------------------------------------
+     *
+     * Все три команды идут мимо комнаты: письмо кладут и забирают, не входя
+     * никуда. Поэтому они здесь, среди служебных, а не в ретрансляции.
+     */
+    if (type == MSG_TYPE_INBOX_PUT) {
+        if (clen < INBOX_ADDR_BYTES + 1) {
+            send_inbox_result(fd, room, room_len, 2, NULL, 0);
+            return 1;
+        }
+        const uint8_t *addr   = cipher;
+        const uint8_t *body   = cipher + INBOX_ADDR_BYTES;
+        const size_t   bodylen = clen - INBOX_ADDR_BYTES;
+
+        inbox_put_result_t r = server_db_inbox_put(addr, body, bodylen);
+        uint8_t status = (r == INBOX_PUT_OK)       ? 0
+                       : (r == INBOX_PUT_DISABLED) ? 1
+                       : (r == INBOX_PUT_FULL)     ? 3
+                                                   : 2;
+        send_inbox_result(fd, room, room_len, status, NULL, 0);
+        return 1;
+    }
+
+    if (type == MSG_TYPE_INBOX_FETCH) {
+        if (clen < 2) { send_inbox_result(fd, room, room_len, 2, NULL, 0); return 1; }
+        uint16_t naddr = rd_u16(cipher);
+        if (naddr == 0 || (size_t)clen < 2 + (size_t)naddr * INBOX_ADDR_BYTES) {
+            send_inbox_result(fd, room, room_len, 2, NULL, 0);
+            return 1;
+        }
+        /* Спрашивать можно пачкой: пятьдесят контактов - это пятьдесят
+         * адресов, и по одному запросу на каждый было бы полсотни обменов
+         * каждые двадцать секунд. */
+        if (naddr > INBOX_FETCH_MAX_ADDRS) naddr = INBOX_FETCH_MAX_ADDRS;
+
+        inbox_item_t items[INBOX_FETCH_LIMIT];
+        size_t got = 0;
+        for (uint16_t i = 0; i < naddr && got < INBOX_FETCH_LIMIT; i++) {
+            const uint8_t *addr = cipher + 2 + (size_t)i * INBOX_ADDR_BYTES;
+            got += server_db_inbox_fetch(addr, items + got, INBOX_FETCH_LIMIT - got);
+        }
+        send_inbox_result(fd, room, room_len, 0, items, got);
+        for (size_t i = 0; i < got; i++) free(items[i].ciphertext);
+        return 1;
+    }
+
+    if (type == MSG_TYPE_INBOX_DELETE) {
+        if (clen < INBOX_ADDR_BYTES + 2) return 1;
+        const uint8_t *addr = cipher;
+        uint16_t n = rd_u16(cipher + INBOX_ADDR_BYTES);
+        if ((size_t)clen < INBOX_ADDR_BYTES + 2 + (size_t)n * 8) return 1;
+
+        int64_t ids[INBOX_FETCH_LIMIT];
+        if (n > INBOX_FETCH_LIMIT) n = INBOX_FETCH_LIMIT;
+        for (uint16_t i = 0; i < n; i++) {
+            const uint8_t *p8 = cipher + INBOX_ADDR_BYTES + 2 + (size_t)i * 8;
+            int64_t v = 0;
+            for (int b = 0; b < 8; b++) v |= ((int64_t)p8[b]) << (8 * b);
+            ids[i] = v;
+        }
+        server_db_inbox_delete(addr, ids, n);
+        return 1;
+    }
 
     if (type == MSG_TYPE_PING) {
         /* No reply needed — caller already bumped last_seen on read_frame. */
@@ -860,7 +996,9 @@ static void send_error_and_close(sock_t fd, const char *room, uint16_t room_len,
  * @note Runs indefinitely until interrupted (Ctrl+C)
  * @note Maximum MAX_CLIENTS (100) simultaneous connections
  */
-void run_server(uint16_t port) {
+void run_server(uint16_t port) { run_server_opts(port, INBOX_TTL_DEFAULT); }
+
+void run_server_opts(uint16_t port, int64_t inbox_ttl) {
 #ifdef _WIN32
     WSADATA wsa;
     WSAStartup(MAKEWORD(2, 2), &wsa);
@@ -893,6 +1031,15 @@ void run_server(uint16_t port) {
 #else
     server_db_sessions_reset((long)getpid());
 #endif
+
+    server_db_inbox_set_ttl(inbox_ttl);
+    server_db_inbox_expire();
+    if (inbox_ttl > 0) {
+        printf("[server] offline inbox: keeping undelivered mail for %lld hours\n",
+               (long long)(inbox_ttl / 3600));
+    } else {
+        printf("[server] offline inbox: disabled - nothing is stored\n");
+    }
 
     /* Create UDP socket for relay, bound to same port */
     sock_t udp_sock = (sock_t)socket(AF_INET, SOCK_DGRAM, 0);
@@ -950,6 +1097,13 @@ void run_server(uint16_t port) {
         if (now - last_beat >= SERVER_HEARTBEAT_SEC) {
             last_beat = now;
             server_db_heartbeat();
+        }
+        /* Просроченную почту выбрасываем раз в минуту, а не при каждом
+         * пробуждении: запросов к базе и так хватает. */
+        static time_t last_sweep = 0;
+        if (now - last_sweep >= 60) {
+            last_sweep = now;
+            server_db_inbox_expire();
         }
         for (int i = 0; i < nclients; i++) {
             if (now - clients[i].last_seen <= IDLE_TIMEOUT_SEC) continue;

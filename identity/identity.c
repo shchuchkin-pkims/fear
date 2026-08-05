@@ -508,6 +508,15 @@ int identity_pm_room_key(const uint8_t my_sk[IDENTITY_SK_BYTES],
     return (rc == 0) ? 0 : -1;
 }
 
+int identity_inbox_addr(const uint8_t k_pm[32],
+                        uint8_t out[IDENTITY_INBOX_ADDR_BYTES]) {
+    if (!k_pm || !out) return -1;
+    static const char ctx[] = "fear.inbox.v1";
+    return crypto_generichash(out, IDENTITY_INBOX_ADDR_BYTES,
+                              (const uint8_t *)ctx, sizeof(ctx) - 1,
+                              k_pm, 32) == 0 ? 0 : -1;
+}
+
 char *identity_pk_fingerprint(const uint8_t pk[IDENTITY_PK_BYTES],
                               char out[IDENTITY_FINGERPRINT_LEN]) {
     /* BLAKE2b hash of public key, take first 8 bytes */

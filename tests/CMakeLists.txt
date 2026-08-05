@@ -76,6 +76,14 @@ set_tests_properties(fuzz_parsers PROPERTIES TIMEOUT 120)
 # доставка сообщений в обе стороны). Требует собранного таргета fear.
 # Чёрный список ключей и витрина живых сессий: то, чем управляет утилита
 # администрирования, и то, по чему сервер отказывает в обслуживании.
+# Офлайн-ящик: квоты, срок хранения и то, что удалить письмо можно только
+# зная его адрес.
+add_fear_test(test_inbox test_inbox.c
+              ${CMAKE_SOURCE_DIR}/client-console/src/server_db.c)
+target_include_directories(test_inbox PRIVATE
+                           ${CMAKE_SOURCE_DIR}/client-console/include)
+target_link_libraries(test_inbox PRIVATE ${SQLITE3_LIBRARIES} sqlite3)
+
 add_fear_test(test_server_admin test_server_admin.c
               ${CMAKE_SOURCE_DIR}/client-console/src/server_db.c)
 target_include_directories(test_server_admin PRIVATE

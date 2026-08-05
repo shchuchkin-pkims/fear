@@ -129,6 +129,16 @@ typedef enum {
                                           the client is otherwise silent so the server's idle
                                           scan doesn't kick the connection. */
     /* ===== Phase C: call signalling ===== */
+    /* Офлайн-ящик. Письмо адресовано не открытому ключу, а слепому адресу -
+     * хешу от общего секрета пары, так что ретранслятор видит непрозрачную
+     * метку и не знает, кто с кем переписывается. Знание адреса и есть право
+     * забрать: ключа пары у сервера нет, проверить подпись под ним он не
+     * может, а вычислить адрес умеют только двое. */
+    MSG_TYPE_INBOX_PUT        = 34, /**< [addr(32)][cipher] */
+    MSG_TYPE_INBOX_FETCH      = 35, /**< [count(2)][addr(32) x count] */
+    MSG_TYPE_INBOX_RESULT     = 36, /**< [status(1)][ttl(4)][count(2)][items] */
+    MSG_TYPE_INBOX_DELETE     = 37, /**< [addr(32)][count(2)][id(8) x count] */
+
     MSG_TYPE_ROTATION         = 33, /**< Room member -> room: K_room has a new
                                      *   generation. Payload is a rotation
                                      *   bundle (identity/rotation_bundle.h):
