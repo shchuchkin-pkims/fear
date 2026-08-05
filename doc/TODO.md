@@ -95,7 +95,7 @@
 
 ## In Progress
 
-- [ ] **Phase C - crypto evolution.** Landed: the key schedule, rotation
+- [x] **Phase C - crypto evolution.** Landed: the key schedule, rotation
       bundles, sender-rooted media keys, HELLO2 (now carrying a display name),
       the sender table with replay windows, call invites carrying the call_id,
       the switchover of the live media path on both platforms, group audio
@@ -138,8 +138,8 @@
       clients on one relay, two membership changes, one rotation each, and
       the member that joined last unable to read what came before it.
 
-      Remaining in Phase C: nothing on rotation. What is still open under
-      metadata privacy and the offline inbox is listed separately below.
+      Phase C is closed. Metadata privacy, the offline inbox and push are
+      phases of their own and are listed below.
 - [ ] Documentation updates and localization
 
 ## Planned

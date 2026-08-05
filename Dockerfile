@@ -39,6 +39,9 @@ RUN mkdir -p /out && gcc -O2 -Wall -Wextra -pthread \
         identity/media_keys.c \
         identity/key_schedule.c \
         identity/chat_frame.c \
+        identity/room_keys.c \
+        identity/rotation_bundle.c \
+        identity/rotation.c \
         -I client-console/include \
         -I identity \
         -lsodium -lsqlite3
