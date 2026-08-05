@@ -38,6 +38,15 @@ public:
     /** Newest `limit` messages for `roomId`, oldest-first for chronological UI. */
     QVector<Message> loadRecent(const QString &roomId, int limit = 500);
 
+    /**
+     * Перенести переписку из одной комнаты в другую.
+     *
+     * Нужно ровно однажды: при смене вывода идентификатора личной комнаты.
+     * Без переноса переписка осталась бы под прежним адресом и выглядела бы
+     * пропавшей.
+     */
+    bool renameRoom(const QString &fromRoomId, const QString &toRoomId);
+
     /** Drop all messages for `roomId`. */
     bool clearRoom(const QString &roomId);
 

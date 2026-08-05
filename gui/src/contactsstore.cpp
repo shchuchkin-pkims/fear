@@ -40,6 +40,7 @@ QVector<ContactsStore::Record> ContactsStore::reload() {
         r.server   = o.value("server").toString();
         r.pk       = o.value("pk").toString();
         r.verified = o.value("verified").toBool();
+        r.dmRoom   = o.value("dmRoom").toString();
         if (!r.pk.isEmpty()) m_cache.append(r);
     }
     return m_cache;
@@ -55,6 +56,7 @@ void ContactsStore::replaceAll(const QVector<Record> &records) {
         o["server"]   = r.server;
         o["pk"]       = r.pk;
         o["verified"] = r.verified;
+        o["dmRoom"]   = r.dmRoom;
         arr.append(o);
     }
     QJsonObject root;

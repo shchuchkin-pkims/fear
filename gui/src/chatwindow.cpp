@@ -217,6 +217,9 @@ void ChatWindow::requestConnect() {
 }
 
 void ChatWindow::handleConnected() {
+    /* Сначала перенос: ящики и чаты адресуются новым идентификатором, и
+     * заполнить его надо до того, как ими воспользуются. */
+    migrateDmRooms();
     /* Ящики контактов - сразу после подключения: письмо могло прийти,
      * пока нас не было, и ждать его до следующего изменения списка
      * контактов незачем. */
@@ -428,6 +431,22 @@ void ChatWindow::promptKeyChanged(const QString &peer, const QString &fp) {
                 tr("Could not update the trusted keys database."));
         }
     }
+}
+
+/**
+ * Идентификатор личной комнаты контакта.
+ *
+ * Сохранённый, если он есть, и старый - если контакт добавлен до перехода и
+ * заполнить поле ещё не успели. Возвращать старый в этом случае обязательно:
+ * иначе чат исчез бы из списка до первого подключения.
+ */
+static QString dmRoomFor(const ContactsStore::Record &c,
+                         const uint8_t my_pk[IDENTITY_PK_BYTES],
+                         const uint8_t their_pk[IDENTITY_PK_BYTES]) {
+    if (!c.dmRoom.isEmpty()) return c.dmRoom;
+    char buf[IDENTITY_PM_ROOM_ID_LEN];
+    if (identity_pm_room_id_v1(my_pk, their_pk, buf) != 0) return QString();
+    return QString::fromLatin1(buf);
 }
 
 void ChatWindow::appendParsedLine(const QString &line) {
@@ -680,9 +699,9 @@ QString ChatWindow::prettyRoomTitle(const QString &roomId) const {
             || pkLen != IDENTITY_PK_BYTES) {
             continue;
         }
-        char buf[IDENTITY_PM_ROOM_ID_LEN];
-        if (identity_pm_room_id(my_pk, their_pk, buf) != 0) continue;
-        if (QString::fromUtf8(buf) == roomId) {
+        const QString dm = dmRoomFor(c, my_pk, their_pk);
+        if (dm.isEmpty()) continue;
+        if (dm == roomId) {
             if (!c.name.isEmpty())   return c.name;
             if (!c.handle.isEmpty()) return c.handle;
             return roomId;
@@ -715,9 +734,9 @@ void ChatWindow::onChatHeaderClicked() {
             uint8_t my_pk[IDENTITY_PK_BYTES];
             if (identity_load_pk(m_backend->identityFilePath.toUtf8().constData(),
                                  my_pk) != 0) break;
-            char buf[IDENTITY_PM_ROOM_ID_LEN];
-            if (identity_pm_room_id(my_pk, their_pk, buf) != 0) continue;
-            if (QString::fromUtf8(buf) == room) {
+            const QString dm = dmRoomFor(c, my_pk, their_pk);
+            if (dm.isEmpty()) continue;
+            if (dm == room) {
                 /* Полный fingerprint = blake2b(pk, 32 байта)[0..32]
                  * в формате xx:xx:... */
                 QString fingerprint;
@@ -851,6 +870,66 @@ void ChatWindow::handleInboxMessage(const QString &roomId, const QString &sender
  * командой. Делается это при каждом подключении и при каждом изменении
  * списка контактов: пропустив контакт, мы просто не увидим его писем.
  */
+/**
+ * Заполнить у контактов идентификатор личной комнаты и перенести переписку.
+ *
+ * Старый идентификатор выводился из двух открытых ключей без секрета, и
+ * ретранслятор, знающий ключи всех, кто занял имя, мог перебрать пары и
+ * подписать каждую личную комнату именами обоих. Новый выводится под ключом
+ * пары, и посчитать его снаружи нельзя.
+ *
+ * Цена - смена адреса у существующих чатов, поэтому переписка переносится
+ * здесь же: без этого она осталась бы под прежним идентификатором и выглядела
+ * бы пропавшей. Делается однажды на контакт, при первой возможности, то есть
+ * когда секретный ключ уже загружен.
+ */
+void ChatWindow::migrateDmRooms() {
+    auto *store = ContactsStore::instance();
+    QVector<ContactsStore::Record> all = store->all();
+    if (all.isEmpty()) return;
+
+    bool needSave = false;
+    for (auto &c : all) {
+        if (!c.dmRoom.isEmpty() || c.pk.isEmpty()) continue;
+
+        uint8_t their_pk[IDENTITY_PK_BYTES];
+        size_t pkLen = 0;
+        const QByteArray pkUtf8 = c.pk.toUtf8();
+        if (sodium_base642bin(their_pk, IDENTITY_PK_BYTES,
+                              pkUtf8.constData(), pkUtf8.size(), nullptr,
+                              &pkLen, nullptr,
+                              sodium_base64_VARIANT_URLSAFE_NO_PADDING) != 0
+            || pkLen != IDENTITY_PK_BYTES) {
+            continue;
+        }
+
+        uint8_t my_pk[IDENTITY_PK_BYTES];
+        uint8_t my_sk[IDENTITY_SK_BYTES];
+        if (identity_load(m_backend->identityFilePath.toUtf8().constData(),
+                          my_pk, my_sk) != 0) {
+            return;                       /* без секрета переносить нечем */
+        }
+
+        uint8_t k_pm[32];
+        char oldId[IDENTITY_PM_ROOM_ID_LEN];
+        char newId[IDENTITY_PM_ROOM_ID_LEN];
+        const bool ok = identity_pm_room_key(my_sk, their_pk, k_pm) == 0
+                     && identity_pm_room_id_v1(my_pk, their_pk, oldId) == 0
+                     && identity_pm_room_id_v2(k_pm, newId) == 0;
+        sodium_memzero(my_sk, sizeof my_sk);
+        sodium_memzero(k_pm, sizeof k_pm);
+        if (!ok) continue;
+
+        c.dmRoom = QString::fromLatin1(newId);
+        needSave = true;
+        if (m_history) {
+            m_history->renameRoom(QString::fromLatin1(oldId), c.dmRoom);
+        }
+    }
+
+    if (needSave) store->replaceAll(all);
+}
+
 void ChatWindow::registerInboxWatches() {
     if (!m_backend || !m_backend->isConnected) return;
 
@@ -876,8 +955,11 @@ void ChatWindow::registerInboxWatches() {
 
         char roomBuf[IDENTITY_PM_ROOM_ID_LEN];
         uint8_t k_pm[32];
-        if (identity_pm_room_id(my_pk, their_pk, roomBuf) != 0) continue;
         if (identity_pm_room_key(my_sk, their_pk, k_pm) != 0) continue;
+        if (identity_pm_room_id_v2(k_pm, roomBuf) != 0) {
+            sodium_memzero(k_pm, sizeof k_pm);
+            continue;
+        }
 
         char keyB64[64];
         if (sodium_bin2base64(keyB64, sizeof keyB64, k_pm, sizeof k_pm,
@@ -991,10 +1073,10 @@ void ChatWindow::rebuildSidebarChats() {
                 || pkLen != IDENTITY_PK_BYTES) {
                 continue;
             }
-            char roomBuf[IDENTITY_PM_ROOM_ID_LEN];
-            if (identity_pm_room_id(my_pk, their_pk, roomBuf) != 0) continue;
+            const QString dm = dmRoomFor(c, my_pk, their_pk);
+            if (dm.isEmpty()) continue;
             ChatListEntry e;
-            e.id           = QString::fromUtf8(roomBuf);
+            e.id           = dm;
             e.title        = c.name.isEmpty() ? c.handle : c.name;
             e.preview      = (!c.handle.isEmpty() && !c.server.isEmpty())
                 ? QString("@%1@%2").arg(c.handle, c.server) : QString();
@@ -1059,9 +1141,8 @@ void ChatWindow::onSidebarChatSelected(const QString &id) {
             uint8_t my_pk[IDENTITY_PK_BYTES];
             if (identity_load_pk(m_backend->identityFilePath.toUtf8().constData(),
                                  my_pk) != 0) continue;
-            char roomBuf[IDENTITY_PM_ROOM_ID_LEN];
-            if (identity_pm_room_id(my_pk, their_pk, roomBuf) != 0) continue;
-            if (QString::fromUtf8(roomBuf) == id) { peerPkB64 = c.pk; break; }
+            const QString dm = dmRoomFor(c, my_pk, their_pk);
+            if (!dm.isEmpty() && dm == id) { peerPkB64 = c.pk; break; }
         }
         if (peerPkB64.isEmpty()) {
             QMessageBox::warning(this, tr("Open chat"),
@@ -1118,8 +1199,13 @@ void ChatWindow::switchToDmRoom(const QString &peerPkB64) {
         return;
     }
 
+    /* Здесь секретный ключ уже загружен, так что считаем сразу новый вывод -
+     * тот, который ретранслятор повторить не может. */
+    uint8_t k_pm_id[32];
     char roomBuf[IDENTITY_PM_ROOM_ID_LEN];
-    if (identity_pm_room_id(my_pk, their_pk, roomBuf) != 0) {
+    if (identity_pm_room_key(my_sk, their_pk, k_pm_id) != 0 ||
+        identity_pm_room_id_v2(k_pm_id, roomBuf) != 0) {
+        sodium_memzero(k_pm_id, sizeof k_pm_id);
         sodium_memzero(my_sk, sizeof(my_sk));
         QMessageBox::warning(this, tr("Open chat"),
             tr("Could not derive PM room id."));
@@ -1225,9 +1311,8 @@ void ChatWindow::onDeleteChatRequested(const QString &roomId) {
                                       nullptr, &pkLen, nullptr,
                                       sodium_base64_VARIANT_URLSAFE_NO_PADDING) == 0
                     && pkLen == IDENTITY_PK_BYTES) {
-                    char buf[IDENTITY_PM_ROOM_ID_LEN];
-                    if (identity_pm_room_id(my_pk, their_pk, buf) == 0
-                        && QString::fromUtf8(buf) == roomId) {
+                    const QString dm = dmRoomFor(c, my_pk, their_pk);
+                    if (!dm.isEmpty() && dm == roomId) {
                         drop = true;
                     }
                 }

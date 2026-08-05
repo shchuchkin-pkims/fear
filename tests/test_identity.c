@@ -75,16 +75,49 @@ int main(void) {
 
     /* --- deterministic PM room id --------------------------------------- */
     char id_ab[IDENTITY_PM_ROOM_ID_LEN], id_ba[IDENTITY_PM_ROOM_ID_LEN];
-    CHECK(identity_pm_room_id(pk, pk_b, id_ab) == 0);
-    CHECK(identity_pm_room_id(pk_b, pk, id_ba) == 0);
+    CHECK(identity_pm_room_id_v1(pk, pk_b, id_ab) == 0);
+    CHECK(identity_pm_room_id_v1(pk_b, pk, id_ba) == 0);
     CHECK(strcmp(id_ab, id_ba) == 0);
     CHECK(strncmp(id_ab, "pm:", 3) == 0);
 
     uint8_t pk_c[IDENTITY_PK_BYTES], sk_c[IDENTITY_SK_BYTES];
     CHECK(crypto_sign_keypair(pk_c, sk_c) == 0);
     char id_ac[IDENTITY_PM_ROOM_ID_LEN];
-    CHECK(identity_pm_room_id(pk, pk_c, id_ac) == 0);
+    CHECK(identity_pm_room_id_v1(pk, pk_c, id_ac) == 0);
     CHECK(strcmp(id_ab, id_ac) != 0);
+
+    /* --- идентификатор ЛС, выведенный под ключом пары ---------------------
+     *
+     * Старый вывод считался из двух открытых ключей и без секрета, поэтому
+     * ретранслятор, знающий ключи всех, кто занял имя, мог перебрать пары и
+     * подписать каждую личную комнату именами обоих собеседников. Новый
+     * считается под K_pm - снаружи его не повторить.
+     *
+     * Вектор закреплён, потому что то же самое вычисляет Android: разойдясь,
+     * две стороны оказались бы в разных комнатах и молча не видели друг
+     * друга.
+     */
+    {
+        uint8_t k_fixed[32];
+        for (int i = 0; i < 32; i++) k_fixed[i] = (uint8_t)i;
+        char id_v2[IDENTITY_PM_ROOM_ID_LEN];
+        CHECK(identity_pm_room_id_v2(k_fixed, id_v2) == 0);
+        CHECK(strcmp(id_v2, "pm:2cqzkCvp122e_u-J5N7BnQ") == 0);
+
+        /* Другой ключ пары - другая комната. */
+        uint8_t k_other[32];
+        memset(k_other, 0x5A, sizeof k_other);
+        char id_other[IDENTITY_PM_ROOM_ID_LEN];
+        CHECK(identity_pm_room_id_v2(k_other, id_other) == 0);
+        CHECK(strcmp(id_v2, id_other) != 0);
+
+        /* И он не совпадает со старым: иначе переносить было бы нечего. */
+        uint8_t k_ab_check[32];
+        CHECK(identity_pm_room_key(sk, pk_b, k_ab_check) == 0);
+        char id_new[IDENTITY_PM_ROOM_ID_LEN];
+        CHECK(identity_pm_room_id_v2(k_ab_check, id_new) == 0);
+        CHECK(strcmp(id_new, id_ab) != 0);
+    }
 
     /* --- deterministic PM room key --------------------------------------- */
     uint8_t k_ab[32], k_ba[32], k_ac[32];

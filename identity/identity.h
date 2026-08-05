@@ -148,27 +148,40 @@ char *identity_pk_fingerprint(const uint8_t pk[IDENTITY_PK_BYTES],
 #define IDENTITY_DM_ROOM_ID_LEN IDENTITY_PM_ROOM_ID_LEN
 
 /**
- * Деёрминированный room_id для личного 1-на-1 чата (Phase B-5+).
+ * Идентификатор личной комнаты - устаревший вывод, только для переноса.
  *
- *   room_id = "pm:" + base64url_no_pad(BLAKE2b(min(pk_a, pk_b) || max(pk_a, pk_b), 16))
- *
- * Обе стороны вычисляют одинаковое значение без координации. Префикс "pm:"
- * позволяет UI отличать ЛС от групповых комнат.
- *
- * @param my_pk     32-byte own public key
- * @param other_pk  32-byte peer public key
- * @param out       Буфер не менее IDENTITY_PM_ROOM_ID_LEN байт; NUL-terminated
- * @return 0 при успехе, -1 при ошибке
+ * Считается из двух открытых ключей и без секрета, а значит его может
+ * посчитать кто угодно, кому эти ключи известны. Ретранслятор знает
+ * открытые ключи всех, кто занял имя, поэтому мог перебрать пары и
+ * подписать каждую личную комнату именами обоих собеседников. Новый вывод -
+ * identity_pm_room_id_v2 - закрывает это; здесь остаётся только чтобы найти
+ * старую переписку и перенести её.
  */
-int identity_pm_room_id(const uint8_t my_pk[IDENTITY_PK_BYTES],
-                        const uint8_t other_pk[IDENTITY_PK_BYTES],
-                        char out[IDENTITY_PM_ROOM_ID_LEN]);
+int identity_pm_room_id_v1(const uint8_t my_pk[IDENTITY_PK_BYTES],
+                           const uint8_t other_pk[IDENTITY_PK_BYTES],
+                           char out[IDENTITY_PM_ROOM_ID_LEN]);
 
-/* Совместимость: вызов идёт в новый identity_pm_room_id. Удалим в Phase C. */
+/**
+ * Идентификатор личной комнаты из ключа пары.
+ *
+ * BLAKE2b под ключом K_pm - секретом, который выводят только двое. Для
+ * ретранслятора это непрозрачная метка: перебрать пары открытых ключей и
+ * узнать, кто с кем переписывается, больше нельзя.
+ *
+ * Ключ, а не открытые ключи, на входе намеренно: тогда видно, что для
+ * вычисления нужен секрет, и ни один вызывающий не сможет случайно
+ * посчитать его из общедоступного.
+ */
+int identity_pm_room_id_v2(const uint8_t k_pm[32],
+                           char out[IDENTITY_PM_ROOM_ID_LEN]);
+
+
+/* Совместимость со старым именем. Ведёт в устаревший вывод: новый требует
+ * ключ пары, которого у вызывающего этой обёртки нет. */
 static inline int identity_dm_room_id(const uint8_t my_pk[IDENTITY_PK_BYTES],
                                       const uint8_t other_pk[IDENTITY_PK_BYTES],
                                       char out[IDENTITY_DM_ROOM_ID_LEN]) {
-    return identity_pm_room_id(my_pk, other_pk, out);
+    return identity_pm_room_id_v1(my_pk, other_pk, out);
 }
 
 /**

@@ -302,7 +302,7 @@ void ContactsDialog::onContactActivated(QListWidgetItem *item) {
     }
 
     char dmId[IDENTITY_PM_ROOM_ID_LEN];
-    if (identity_pm_room_id(my_pk, their_pk, dmId) != 0) {
+    if (identity_pm_room_id_v1(my_pk, their_pk, dmId) != 0) {
         QMessageBox::warning(this, tr("Open chat"), tr("Could not derive DM room id."));
         return;
     }

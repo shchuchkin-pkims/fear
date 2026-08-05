@@ -96,6 +96,27 @@ static void identity_warn_plaintext_once(void) {
             "stored unencrypted (file mode 0600 only)\n");
 }
 
+int identity_pm_room_id_v2(const uint8_t k_pm[32],
+                           char out[IDENTITY_PM_ROOM_ID_LEN]) {
+    if (!k_pm || !out) return -1;
+
+    static const char ctx[] = "fear.pm.room.v2";
+    uint8_t digest[16];
+    if (crypto_generichash(digest, sizeof digest,
+                           (const uint8_t *)ctx, sizeof(ctx) - 1,
+                           k_pm, 32) != 0) {
+        return -1;
+    }
+
+    out[0] = 'p';
+    out[1] = 'm';
+    out[2] = ':';
+    return sodium_bin2base64(out + 3, IDENTITY_PM_ROOM_ID_LEN - 3,
+                             digest, sizeof digest,
+                             sodium_base64_VARIANT_URLSAFE_NO_PADDING)
+           ? 0 : -1;
+}
+
 /**
  * Write an identity file.
  *
@@ -435,7 +456,7 @@ int identity_default_known_keys_path(char *buf, size_t bufsize) {
     return 0;
 }
 
-int identity_pm_room_id(const uint8_t my_pk[IDENTITY_PK_BYTES],
+int identity_pm_room_id_v1(const uint8_t my_pk[IDENTITY_PK_BYTES],
                         const uint8_t other_pk[IDENTITY_PK_BYTES],
                         char out[IDENTITY_PM_ROOM_ID_LEN]) {
     if (!my_pk || !other_pk || !out) return -1;

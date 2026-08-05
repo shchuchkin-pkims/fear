@@ -109,6 +109,15 @@ QVector<Message> History::loadRecent(const QString &roomId, int limit) {
     return out;
 }
 
+bool History::renameRoom(const QString &fromRoomId, const QString &toRoomId) {
+    if (!m_open || fromRoomId.isEmpty() || toRoomId.isEmpty()) return false;
+    QSqlQuery q(m_db);
+    q.prepare(QStringLiteral("UPDATE messages SET roomId = ? WHERE roomId = ?"));
+    q.addBindValue(toRoomId);
+    q.addBindValue(fromRoomId);
+    return q.exec();
+}
+
 bool History::clearRoom(const QString &roomId) {
     if (!m_open) return false;
     QSqlQuery q(m_db);

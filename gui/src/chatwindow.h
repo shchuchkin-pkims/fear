@@ -58,6 +58,8 @@ private:
     /** Письмо из офлайн-ящика - в чат, которому оно адресовано. */
     void handleInboxMessage(const QString &roomId, const QString &sender,
                             const QString &text);
+    /** Заполнить новый идентификатор ЛС и перенести переписку. */
+    void migrateDmRooms();
     /** Сообщить клиенту ящики всех контактов. */
     void registerInboxWatches();
     /** Записать собеседника в контакты из его карточки. */
