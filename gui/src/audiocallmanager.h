@@ -123,6 +123,15 @@ public:
 
 signals:
     /**
+     * Процесс звонка узнал свой адрес снаружи.
+     *
+     * Приходит один раз, сразу после того как сокет для голоса занял порт:
+     * спрашивать надо именно с него, иначе NAT назовёт отображение, которого
+     * для голоса не существует.
+     */
+    void candidateDiscovered(const QString &host, quint16 port);
+
+    /**
      * @brief Emitted when a new key is generated
      * @param key The generated 64-character hex key
      */

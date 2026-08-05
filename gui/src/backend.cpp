@@ -505,15 +505,18 @@ bool Backend::hasIdentity() const {
     return identityAvailable;
 }
 
-bool Backend::sendCallInvite(const QString &host, quint16 port, bool video) {
+bool Backend::sendCallInvite(const QString &host, quint16 port, bool video,
+                             const QString &reuseCallId) {
     if (!clientProc || !isConnected) return false;
 
     /* Draw the id here rather than letting the CLI draw it and reading it
      * back: the call would otherwise start before the answer arrived. */
-    unsigned char raw[16];
-    randombytes_buf(raw, sizeof raw);
-    const QString callId =
-        QByteArray(reinterpret_cast<const char *>(raw), sizeof raw).toHex();
+    QString callId = reuseCallId;
+    if (callId.isEmpty()) {
+        unsigned char raw[16];
+        randombytes_buf(raw, sizeof raw);
+        callId = QByteArray(reinterpret_cast<const char *>(raw), sizeof raw).toHex();
+    }
 
     /* The media process must use exactly the id the room was told about. */
     if (video) {

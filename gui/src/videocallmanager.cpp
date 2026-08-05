@@ -97,6 +97,20 @@ QStringList VideoCallManager::buildArgs(const QString &quality, bool adaptive,
         args << QStringLiteral("--noise-suppress") << ns;
     }
 
+    /*
+     * Сервер, у которого спросить свой адрес снаружи.
+     *
+     * Пусто - не спрашивать. Так по умолчанию, и это осознанно: прямой
+     * звонок раскрывает ваш адрес собеседнику, чего ретранслятор не делает.
+     * Выигрыш - меньше задержка и оператор ретранслятора не видит потока;
+     * цена - собеседник видит, откуда вы. Решать это за человека нельзя.
+     */
+    {
+        QSettings st;
+        const QString stun = st.value(QStringLiteral("call/stunServer")).toString().trimmed();
+        if (!stun.isEmpty()) args << QStringLiteral("--stun") << stun;
+    }
+
     return args;
 }
 
@@ -311,9 +325,21 @@ QString VideoCallManager::getCurrentKey() const {
 }
 
 void VideoCallManager::onProcessOutput() {
-    if (callProcess) {
-        QString out = QString::fromUtf8(callProcess->readAllStandardOutput());
-        emit this->output(out);
+    if (!callProcess) return;
+    const QString out = QString::fromUtf8(callProcess->readAllStandardOutput());
+    emit this->output(out);
+
+    /* Свой адрес снаружи - см. AudioCallManager. */
+    for (const QString &line : out.split(QLatin1Char('
+'), Qt::SkipEmptyParts)) {
+        const QString t = line.trimmed();
+        if (!t.startsWith(QStringLiteral("[CANDIDATE] "))) continue;
+        const QStringList parts = t.mid(12).split(QLatin1Char(' '), Qt::SkipEmptyParts);
+        if (parts.size() != 2) continue;
+        bool ok = false;
+        const uint prt = parts[1].toUInt(&ok);
+        if (!ok || prt == 0 || prt > 65535) continue;
+        emit candidateDiscovered(parts[0], (quint16)prt);
     }
 }
 

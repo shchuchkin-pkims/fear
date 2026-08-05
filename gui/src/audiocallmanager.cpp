@@ -111,6 +111,20 @@ bool AudioCallManager::startCall(const QString &remoteIp, quint16 remotePort, co
         args << QStringLiteral("--noise-suppress") << ns;
     }
 
+    /*
+     * Сервер, у которого спросить свой адрес снаружи.
+     *
+     * Пусто - не спрашивать. Так по умолчанию, и это осознанно: прямой
+     * звонок раскрывает ваш адрес собеседнику, чего ретранслятор не делает.
+     * Выигрыш - меньше задержка и оператор ретранслятора не видит потока;
+     * цена - собеседник видит, откуда вы. Решать это за человека нельзя.
+     */
+    {
+        QSettings st;
+        const QString stun = st.value(QStringLiteral("call/stunServer")).toString().trimmed();
+        if (!stun.isEmpty()) args << QStringLiteral("--stun") << stun;
+    }
+
     if (localPort > 0) {
         args << QString::number(localPort);
     } else {
@@ -206,6 +220,20 @@ bool AudioCallManager::startListening(quint16 localPort, const QString &key,
         args << QStringLiteral("--noise-suppress") << ns;
     }
 
+    /*
+     * Сервер, у которого спросить свой адрес снаружи.
+     *
+     * Пусто - не спрашивать. Так по умолчанию, и это осознанно: прямой
+     * звонок раскрывает ваш адрес собеседнику, чего ретранслятор не делает.
+     * Выигрыш - меньше задержка и оператор ретранслятора не видит потока;
+     * цена - собеседник видит, откуда вы. Решать это за человека нельзя.
+     */
+    {
+        QSettings st;
+        const QString stun = st.value(QStringLiteral("call/stunServer")).toString().trimmed();
+        if (!stun.isEmpty()) args << QStringLiteral("--stun") << stun;
+    }
+
     // Add device parameters
     if (inputDevice >= 0) {
         args << QString::number(inputDevice);
@@ -293,6 +321,20 @@ bool AudioCallManager::startRelay(const QString &serverIp, quint16 serverPort,
         args << QStringLiteral("--noise-suppress") << ns;
     }
 
+    /*
+     * Сервер, у которого спросить свой адрес снаружи.
+     *
+     * Пусто - не спрашивать. Так по умолчанию, и это осознанно: прямой
+     * звонок раскрывает ваш адрес собеседнику, чего ретранслятор не делает.
+     * Выигрыш - меньше задержка и оператор ретранслятора не видит потока;
+     * цена - собеседник видит, откуда вы. Решать это за человека нельзя.
+     */
+    {
+        QSettings st;
+        const QString stun = st.value(QStringLiteral("call/stunServer")).toString().trimmed();
+        if (!stun.isEmpty()) args << QStringLiteral("--stun") << stun;
+    }
+
     if (inputDevice >= 0) {
         args << QString::number(inputDevice);
         if (outputDevice >= 0) {
@@ -350,9 +392,22 @@ QString AudioCallManager::getCurrentKey() const {
 }
 
 void AudioCallManager::onProcessOutput() {
-    if (callProcess) {
-        QString output = QString::fromUtf8(callProcess->readAllStandardOutput());
-        emit this->output(output);
+    if (!callProcess) return;
+    const QString output = QString::fromUtf8(callProcess->readAllStandardOutput());
+    emit this->output(output);
+
+    /* Свой адрес снаружи. Строку печатает процесс звонка: комнаты и
+     * её ключа он не знает и приглашение отправить не может, поэтому
+     * адрес доносим до комнаты мы. */
+    for (const QString &line : output.split(QLatin1Char('\n'), Qt::SkipEmptyParts)) {
+        const QString t = line.trimmed();
+        if (!t.startsWith(QStringLiteral("[CANDIDATE] "))) continue;
+        const QStringList parts = t.mid(12).split(QLatin1Char(' '), Qt::SkipEmptyParts);
+        if (parts.size() != 2) continue;
+        bool ok = false;
+        const uint prt = parts[1].toUInt(&ok);
+        if (!ok || prt == 0 || prt > 65535) continue;
+        emit candidateDiscovered(parts[0], (quint16)prt);
     }
 }
 

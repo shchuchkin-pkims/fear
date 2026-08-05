@@ -205,6 +205,36 @@ void SettingsDialog::setupAudioTab(QTabWidget *tabs) {
 
     form->addRow(micGroup);
 
+    QGroupBox *directGroup = new QGroupBox("Direct calls");
+    QFormLayout *directForm = new QFormLayout(directGroup);
+
+    stunServerEdit = new QLineEdit();
+    stunServerEdit->setPlaceholderText("empty - always use the relay");
+    directForm->addRow("STUN server:", stunServerEdit);
+
+    /* Здесь надо назвать цену, а не только выгоду. Прямой звонок короче по
+     * пути и не даёт оператору ретранслятора видеть поток - но открывает
+     * ваш адрес собеседнику, чего ретранслятор не делает. Решать это за
+     * человека нельзя, поэтому по умолчанию пусто. */
+    QLabel *directNote = new QLabel(
+        "With a STUN server (for example stun.l.google.com:19302) calls try to "
+        "go straight to the other person: shorter path, and the relay operator "
+        "sees no media.
+
+"
+        "The cost is real: a direct call shows your IP address to the person "
+        "you are calling, and the STUN server learns it too. Through the relay "
+        "neither of them does. Leave this empty if that matters more to you.
+
+"
+        "Behind a symmetric NAT the direct path will not open anyway and the "
+        "call falls back to the relay by itself.");
+    directNote->setWordWrap(true);
+    directNote->setStyleSheet("color: gray; font-size: 11px;");
+    directForm->addRow(directNote);
+
+    form->addRow(directGroup);
+
     QLabel *note = new QLabel("Device selection is applied when starting audio/video calls.");
     note->setWordWrap(true);
     note->setStyleSheet("color: gray; font-size: 11px;");
@@ -430,6 +460,7 @@ void SettingsDialog::loadSettings() {
     /* Audio */
     QString audioIn = settings->value("audio/inputDevice", "System default").toString();
     QString audioOut = settings->value("audio/outputDevice", "System default").toString();
+    stunServerEdit->setText(settings->value("call/stunServer", "").toString());
     micGainSlider->setValue(settings->value("audio/micGainDb", 0).toInt());
     micGainValue->setText(QString("%1%2 dB")
         .arg(micGainSlider->value() > 0 ? "+" : "").arg(micGainSlider->value()));
@@ -494,6 +525,7 @@ void SettingsDialog::saveSettings() {
     emit chatFontChanged(newFont);
 
     /* Audio */
+    settings->setValue("call/stunServer", stunServerEdit->text().trimmed());
     settings->setValue("audio/micGainDb", micGainSlider->value());
     settings->setValue("audio/noiseSuppress", noiseSuppressCombo->currentData().toString());
     settings->setValue("video/width", videoWidthSpin->value());

@@ -96,6 +96,7 @@ static int g_have_call_id = 0;
 /* Identity */
 #include "identity.h"
 #include "mic_dsp.h"
+#include "stun.h"
 
 /* ===== Configuration ===== */
 
@@ -466,6 +467,11 @@ static int tcp_relay_connect(VideoCall *vc, const char *ip, uint16_t port) {
 }
 
 /* См. audio_call: настройка запуска, а не отдельного звонка. */
+/* Сервер, у которого спрашивают свой внешний адрес. Пусто - не спрашивать:
+ * лишний вопрос третьей стороне это лишний рассказ о себе. */
+static char g_stun_host[128] = "";
+static uint16_t g_stun_port = 3478;
+
 static float          g_mic_gain_db = 0.0f;
 static mic_ns_level_t g_mic_ns      = MIC_NS_MEDIUM;
 
@@ -2425,6 +2431,21 @@ static int start_video_call(const char *remote_ip, uint16_t remote_port,
         CLOSESOCK(vc->sock); free(vc); SDL_Quit(); return -1;
     }
 
+    /* Свой адрес снаружи - с того самого сокета, что понесёт видео.
+     * Подробности и почему именно с него - см. audio_call. */
+    if (g_stun_host[0]) {
+        char pub[STUN_MAX_ADDR];
+        uint16_t pub_port = 0;
+        stun_status_t st = stun_query_on_socket((int)vc->sock, g_stun_host,
+                                                g_stun_port, pub, &pub_port);
+        if (st == STUN_OK) {
+            printf("[CANDIDATE] %s %u\n", pub, (unsigned)pub_port);
+            fflush(stdout);
+        } else {
+            fprintf(stderr, "[stun] no public address: %s\n", stun_strerror(st));
+        }
+    }
+
     vc->peer_set = 0;
     vc->relay_mode = 0;
     if (remote_ip && remote_port != 0) {
@@ -2674,6 +2695,20 @@ int main(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--mic-gain") == 0 && i + 1 < argc) {
             g_mic_gain_db = (float)atof(argv[i + 1]);
+        } else if (strcmp(argv[i], "--stun") == 0 && i + 1 < argc) {
+            const char *v = argv[i + 1];
+            const char *colon = strrchr(v, ':');
+            if (colon && colon != v) {
+                size_t hl = (size_t)(colon - v);
+                if (hl >= sizeof g_stun_host) hl = sizeof g_stun_host - 1;
+                memcpy(g_stun_host, v, hl);
+                g_stun_host[hl] = 0;
+                g_stun_port = (uint16_t)atoi(colon + 1);
+                if (g_stun_port == 0) g_stun_port = 3478;
+            } else {
+                snprintf(g_stun_host, sizeof g_stun_host, "%s", v);
+                g_stun_port = 3478;
+            }
         } else if (strcmp(argv[i], "--noise-suppress") == 0 && i + 1 < argc) {
             if (mic_ns_from_string(argv[i + 1], &g_mic_ns) != 0) {
                 fprintf(stderr, "unknown noise suppression level: %s "

@@ -262,6 +262,14 @@ void AudioCallDialog::setupConnections() {
     connect(audioManager, &AudioCallManager::listeningStarted, this, &AudioCallDialog::onCallStarted);
     connect(audioManager, &AudioCallManager::callStopped, this, &AudioCallDialog::onCallStopped);
     connect(audioManager, &AudioCallManager::error, this, &AudioCallDialog::onError);
+    /* Адрес, который процесс звонка узнал у сервера STUN, надо донести до
+     * комнаты вторым приглашением: первое объявило звонок, но адреса тогда
+     * ещё не существовало - сокет для голоса не занял порт. Идентификатор
+     * тот же, иначе собеседник счёл бы это отдельным звонком. */
+    connect(audioManager, &AudioCallManager::candidateDiscovered, this,
+            [this](const QString &h, quint16 p) {
+        if (backend) backend->sendCallInvite(h, p, /*video=*/false, audioManager->callId);
+    });
     connect(audioManager, &AudioCallManager::output, this, &AudioCallDialog::onOutput);
 
     // Connect UI buttons

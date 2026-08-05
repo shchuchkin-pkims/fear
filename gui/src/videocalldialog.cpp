@@ -369,6 +369,14 @@ void VideoCallDialog::setupConnections() {
     connect(videoManager, &VideoCallManager::listeningStarted, this, &VideoCallDialog::onCallStarted);
     connect(videoManager, &VideoCallManager::callStopped, this, &VideoCallDialog::onCallStopped);
     connect(videoManager, &VideoCallManager::error, this, &VideoCallDialog::onError);
+    /* Адрес, который процесс звонка узнал у сервера STUN, надо донести до
+     * комнаты вторым приглашением: первое объявило звонок, но адреса тогда
+     * ещё не существовало - сокет для голоса не занял порт. Идентификатор
+     * тот же, иначе собеседник счёл бы это отдельным звонком. */
+    connect(videoManager, &VideoCallManager::candidateDiscovered, this,
+            [this](const QString &h, quint16 p) {
+        if (backend) backend->sendCallInvite(h, p, /*video=*/true, videoManager->callId);
+    });
     connect(videoManager, &VideoCallManager::output, this, &VideoCallDialog::onOutput);
 
     connect(genKeyButton, &QPushButton::clicked, this, &VideoCallDialog::onGenerateKey);

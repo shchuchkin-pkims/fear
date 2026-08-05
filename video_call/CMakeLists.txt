@@ -29,6 +29,8 @@ set(SOURCES
     ${CMAKE_SOURCE_DIR}/identity/media_senders.c
     ${CMAKE_SOURCE_DIR}/identity/media_packet.c
     ${CMAKE_SOURCE_DIR}/identity/mic_dsp.c
+    ${CMAKE_SOURCE_DIR}/identity/stun.c
+    ${CMAKE_SOURCE_DIR}/identity/stun_net.c
 )
 
 add_executable(video_call ${SOURCES})

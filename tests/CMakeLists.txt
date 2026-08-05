@@ -44,6 +44,7 @@ add_fear_test(test_media_senders test_media_senders.c ${IDENTITY_DIR}/media_send
 add_fear_test(test_call_invite  test_call_invite.c  ${IDENTITY_DIR}/call_invite.c ${IDENTITY_DIR}/media_keys.c)
 add_fear_test(test_media_packet test_media_packet.c ${IDENTITY_DIR}/media_packet.c ${IDENTITY_DIR}/media_keys.c)
 add_fear_test(test_mic_dsp test_mic_dsp.c ${IDENTITY_DIR}/mic_dsp.c)
+add_fear_test(test_stun test_stun.c ${IDENTITY_DIR}/stun.c)
 # Обработка микрофона считает в плавающей точке - нужна libm там, где она
 # не входит в libc.
 if(NOT WIN32)

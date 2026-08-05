@@ -72,6 +72,7 @@ typedef int socket_t;
 #include "media_packet.h"
 #include "identity.h"
 #include "mic_dsp.h"
+#include "stun.h"
 
 /* -------------------------- Конфигурация --------------------------------- */
 
@@ -1454,6 +1455,16 @@ static void ac_free_wiped(AudioCall *c) {
  * двумя лишними параметрами через всю цепочку вызовов, каждый из которых
  * пришлось бы править в четырёх местах.
  */
+/*
+ * Сервер, у которого спрашивают свой внешний адрес.
+ *
+ * Пусто - не спрашивать вовсе. Так и надо тем, кто звонит внутри одной
+ * сети или наружу вообще не ходит: лишний вопрос третьей стороне - лишний
+ * рассказ о себе, пусть и состоящий из одного адреса.
+ */
+static char g_stun_host[128] = "";
+static uint16_t g_stun_port = 3478;
+
 static float          g_mic_gain_db = 0.0f;
 static mic_ns_level_t g_mic_ns      = MIC_NS_MEDIUM;
 
@@ -1610,6 +1621,31 @@ int audio_call_start(AudioCall **out_call,
         mix_teardown(c);
         ac_free_wiped(c);
         return -1;
+    }
+
+    /*
+     * Свой адрес снаружи - сразу после bind и с этого самого сокета.
+     *
+     * NAT выдаёт отображение не машине, а паре «внутренний адрес и порт»:
+     * спроси мы с другого сокета, собеседник получил бы адрес, которого для
+     * голоса не существует. Печатаем строкой, чтобы тот, кто нас запустил,
+     * положил её в приглашение - сам звонок про комнату и её ключ ничего не
+     * знает и отправить приглашение не может.
+     *
+     * Неудача здесь не беда: остаётся ретранслятор, который и так работает.
+     * Он же и есть наш TURN.
+     */
+    if (g_stun_host[0]) {
+        char pub[STUN_MAX_ADDR];
+        uint16_t pub_port = 0;
+        stun_status_t st = stun_query_on_socket((int)c->sock, g_stun_host,
+                                                g_stun_port, pub, &pub_port);
+        if (st == STUN_OK) {
+            printf("[CANDIDATE] %s %u\n", pub, (unsigned)pub_port);
+            fflush(stdout);
+        } else {
+            fprintf(stderr, "[stun] no public address: %s\n", stun_strerror(st));
+        }
     }
 
     c->peer_set = 0;
@@ -1846,6 +1882,21 @@ int main(int argc, char **argv) {
         for (int i = 1; i < argc; i++) {
             if (strcmp(argv[i], "--mic-gain") == 0 && i + 1 < argc) {
                 mic_gain_db = (float)atof(argv[i + 1]);
+            } else if (strcmp(argv[i], "--stun") == 0 && i + 1 < argc) {
+                /* «host» или «host:port». Порт по умолчанию 3478. */
+                const char *v = argv[i + 1];
+                const char *colon = strrchr(v, ':');
+                if (colon && colon != v) {
+                    size_t hl = (size_t)(colon - v);
+                    if (hl >= sizeof g_stun_host) hl = sizeof g_stun_host - 1;
+                    memcpy(g_stun_host, v, hl);
+                    g_stun_host[hl] = '\0';
+                    g_stun_port = (uint16_t)atoi(colon + 1);
+                    if (g_stun_port == 0) g_stun_port = 3478;
+                } else {
+                    snprintf(g_stun_host, sizeof g_stun_host, "%s", v);
+                    g_stun_port = 3478;
+                }
             } else if (strcmp(argv[i], "--noise-suppress") == 0 && i + 1 < argc) {
                 if (mic_ns_from_string(argv[i + 1], &mic_ns) != 0) {
                     fprintf(stderr, "unknown noise suppression level: %s "
@@ -2097,7 +2148,7 @@ int main(int argc, char **argv) {
 
     if (strcmp(argv[1], "listen") == 0) {
         if (argc < 3) {
-            fprintf(stderr, "Usage: %s listen <local_bind_port> --call-id HEX [--key-file FILE] [--identity-file FILE] [--no-sign] [--mic-gain dB] [--noise-suppress off|low|medium|high] [input_dev] [output_dev]\n", argv[0]);
+            fprintf(stderr, "Usage: %s listen <local_bind_port> --call-id HEX [--key-file FILE] [--identity-file FILE] [--no-sign] [--mic-gain dB] [--noise-suppress off|low|medium|high] [--stun HOST[:PORT]] [input_dev] [output_dev]\n", argv[0]);
             return 1;
         }
         uint16_t lport = (uint16_t)atoi(argv[2]);
@@ -2241,7 +2292,7 @@ int main(int argc, char **argv) {
 
     if (strcmp(argv[1], "relay") == 0) {
         if (argc < 4) {
-            fprintf(stderr, "Usage: %s relay <server_ip> <server_port> --room ROOM --name NAME --call-id HEX [--key-file FILE] [--identity-file FILE] [--no-sign] [--mic-gain dB] [--noise-suppress off|low|medium|high] [input_dev] [output_dev]\n", argv[0]);
+            fprintf(stderr, "Usage: %s relay <server_ip> <server_port> --room ROOM --name NAME --call-id HEX [--key-file FILE] [--identity-file FILE] [--no-sign] [--mic-gain dB] [--noise-suppress off|low|medium|high] [--stun HOST[:PORT]] [input_dev] [output_dev]\n", argv[0]);
             return 1;
         }
         const char *ip = argv[2];

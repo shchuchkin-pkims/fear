@@ -162,7 +162,17 @@ public:
      * callInviteSent(). Host and port are an optional hint for a direct
      * connection; leave them empty for a relayed or group call.
      */
-    bool sendCallInvite(const QString &host, quint16 port, bool video);
+    /**
+     * Позвать комнату в звонок.
+     *
+     * @param reuseCallId непусто - взять этот идентификатор вместо нового.
+     *        Нужно для второго приглашения: первое объявляет звонок, а адрес
+     *        становится известен позже, когда процесс звонка спросит его у
+     *        сервера STUN. Нарисуй мы там новый идентификатор - собеседник
+     *        счёл бы это вторым, отдельным звонком.
+     */
+    bool sendCallInvite(const QString &host, quint16 port, bool video,
+                        const QString &reuseCallId = QString());
 
     bool generateIdentity(bool copyToClipboard = true);
 

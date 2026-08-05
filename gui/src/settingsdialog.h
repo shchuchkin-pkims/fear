@@ -71,6 +71,9 @@ private:
     QComboBox *audioOutputCombo;
 
     /* Video tab */
+    /* Сервер STUN: пусто - звонки идут через ретранслятор. */
+    QLineEdit *stunServerEdit = nullptr;
+
     QComboBox *videoQualityCombo;
     /* Ручное качество: готовые наборы покрывают обычные случаи, но не все.
      * Узкий канал, слабая камера или, наоборот, гигабитная сеть - там нужны
