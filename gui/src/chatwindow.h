@@ -55,6 +55,11 @@ private:
      *  server endpoint or falls back to the saved profile defaults. */
     void promptAndConnectRoom(Backend::ConnectMode mode);
     void openPeerProfile(const QString &senderName);
+    /** Письмо из офлайн-ящика - в чат, которому оно адресовано. */
+    void handleInboxMessage(const QString &roomId, const QString &sender,
+                            const QString &text);
+    /** Сообщить клиенту ящики всех контактов. */
+    void registerInboxWatches();
     /** Записать собеседника в контакты из его карточки. */
     void addPeerToContacts(const QString &pkB64, const QString &displayName);
     /** «Delete chat» from sidebar context menu. Wipes local history for

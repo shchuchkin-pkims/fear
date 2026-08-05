@@ -1510,7 +1510,10 @@ static void handle_inbox_add(const char *arg) {
     if (!arg) return;
     char room[MAX_ROOM];
     char keyb64[128];
-    if (sscanf(arg, "%127s %127s", room, keyb64) != 2) {
+    /* Ширина полей написана числом, а буферы под неё проверены здесь же:
+     * иначе изменение MAX_ROOM однажды сделало бы запись мимо буфера. */
+    _Static_assert(MAX_ROOM > 200, "room buffer smaller than the scan width");
+    if (sscanf(arg, "%200s %127s", room, keyb64) != 2) {
         printf("[inbox] usage: /inbox-add <room> <key-base64url>\n");
         fflush(stdout);
         return;
@@ -1526,6 +1529,8 @@ static void handle_inbox_add(const char *arg) {
     }
     if (inbox_watch(room, key) != 0) {
         printf("[inbox] cannot watch more mailboxes\n");
+    } else {
+        printf("[inbox] watching %s\n", room);
     }
     sodium_memzero(key, sizeof key);
     fflush(stdout);

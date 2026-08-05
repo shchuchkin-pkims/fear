@@ -151,6 +151,9 @@ ChatWindow::ChatWindow(QWidget *parent) : QMainWindow(parent) {
             this, &ChatWindow::onDeleteChatRequested);
     connect(ContactsStore::instance(), &ContactsStore::contactsChanged,
             this, &ChatWindow::rebuildSidebarChats);
+    /* Новый контакт - новый ящик, за которым надо следить. */
+    connect(ContactsStore::instance(), &ContactsStore::contactsChanged,
+            this, &ChatWindow::registerInboxWatches);
 
     // Initial empty state
     m_chatArea->showEmptyState(tr("Click ☰ to connect to a room."));
@@ -214,6 +217,10 @@ void ChatWindow::requestConnect() {
 }
 
 void ChatWindow::handleConnected() {
+    /* Ящики контактов - сразу после подключения: письмо могло прийти,
+     * пока нас не было, и ждать его до следующего изменения списка
+     * контактов незачем. */
+    registerInboxWatches();
     // Mirror of Android ProfileStore.markRegistered: first successful connect
     // to a host = this user has effectively claimed @displayName@host on it.
     // Phase B-2 will replace this with the server's REGISTER_HANDLE confirmation.
@@ -424,6 +431,32 @@ void ChatWindow::promptKeyChanged(const QString &peer, const QString &fp) {
 }
 
 void ChatWindow::appendParsedLine(const QString &line) {
+    /* Письмо из ящика: «[INBOX] pm:… отправитель: текст».
+     *
+     * Оно пришло не в ту комнату, в которой мы сидим, поэтому кладём его в
+     * историю нужного чата и подсвечиваем чат в списке, а на экран выводим
+     * только если этот чат сейчас открыт. Иначе сообщение из личной
+     * переписки появилось бы посреди общей комнаты. */
+    static const QRegularExpression inboxRe(
+        R"(^\s*\[INBOX\]\s+(\S+)\s+(.+?):\s(.*)$)");
+    if (auto im = inboxRe.match(line); im.hasMatch()) {
+        handleInboxMessage(im.captured(1), im.captured(2), im.captured(3));
+        return;
+    }
+
+    /* Сервер не хранит недоставленное - об этом нужно сказать вслух, а не
+     * рисовать вторую галочку. */
+    if (line.contains(QLatin1String("[inbox] this relay stores nothing"))) {
+        Message m;
+        m.text = tr("Not delivered: the recipient is offline and this relay "
+                    "keeps nothing. Ask them to come online, or use a relay "
+                    "with an inbox.");
+        m.timestamp = QDateTime::currentDateTime();
+        m.isSystem = true;
+        m_chatArea->appendMessage(m);
+        return;
+    }
+
     // File-transfer progress from the CLI ("Progress: 123/4567 bytes (2.7%)").
     // Shown transiently in the status bar: as chat messages it would flood
     // the view, and dropping it entirely made transfers look hung (audit UX).
@@ -779,6 +812,86 @@ void ChatWindow::addPeerToContacts(const QString &pkB64, const QString &displayN
     QMessageBox::information(this, tr("Contacts"),
         tr("%1 added. Their private chat is now in the list on the left.")
             .arg(who));
+}
+
+/**
+ * Положить письмо из ящика в его чат.
+ *
+ * История хранится по идентификатору комнаты, так что письмо ложится туда же,
+ * куда легло бы, приди оно живьём. Разница только в том, что мы в этой
+ * комнате не находимся - значит на экран его выводим лишь когда открыт
+ * именно этот чат.
+ */
+void ChatWindow::handleInboxMessage(const QString &roomId, const QString &sender,
+                                    const QString &text) {
+    const qint64 now = QDateTime::currentMSecsSinceEpoch();
+    if (m_history) {
+        m_history->insert(roomId, sender, text, now, /*fromSelf=*/false,
+                          /*isSystem=*/false);
+    }
+
+    if (roomId == m_backend->currentRoom) {
+        Message m;
+        m.sender    = sender;
+        m.text      = text;
+        m.timestamp = QDateTime::fromMSecsSinceEpoch(now);
+        m_chatArea->appendMessage(m);
+    } else {
+        /* Чат не открыт - пусть его строка в списке скажет, что там новое. */
+        rebuildSidebarChats();
+        statusBar()->showMessage(tr("New message from %1").arg(sender), 5000);
+    }
+}
+
+/**
+ * Сказать консольному клиенту, за какими ящиками следить.
+ *
+ * Список контактов ведёт интерфейс, ключ пары он умеет выводить, а сам
+ * клиент про контакты ничего не знает - поэтому ящики передаются ему
+ * командой. Делается это при каждом подключении и при каждом изменении
+ * списка контактов: пропустив контакт, мы просто не увидим его писем.
+ */
+void ChatWindow::registerInboxWatches() {
+    if (!m_backend || !m_backend->isConnected) return;
+
+    uint8_t my_pk[IDENTITY_PK_BYTES];
+    uint8_t my_sk[IDENTITY_SK_BYTES];
+    if (identity_load(m_backend->identityFilePath.toUtf8().constData(),
+                      my_pk, my_sk) != 0) {
+        return;
+    }
+
+    for (const auto &c : ContactsStore::instance()->all()) {
+        if (c.pk.isEmpty()) continue;
+        uint8_t their_pk[IDENTITY_PK_BYTES];
+        size_t pkLen = 0;
+        const QByteArray pkUtf8 = c.pk.toUtf8();
+        if (sodium_base642bin(their_pk, IDENTITY_PK_BYTES,
+                              pkUtf8.constData(), pkUtf8.size(), nullptr,
+                              &pkLen, nullptr,
+                              sodium_base64_VARIANT_URLSAFE_NO_PADDING) != 0
+            || pkLen != IDENTITY_PK_BYTES) {
+            continue;
+        }
+
+        char roomBuf[IDENTITY_PM_ROOM_ID_LEN];
+        uint8_t k_pm[32];
+        if (identity_pm_room_id(my_pk, their_pk, roomBuf) != 0) continue;
+        if (identity_pm_room_key(my_sk, their_pk, k_pm) != 0) continue;
+
+        char keyB64[64];
+        if (sodium_bin2base64(keyB64, sizeof keyB64, k_pm, sizeof k_pm,
+                              sodium_base64_VARIANT_URLSAFE_NO_PADDING) == nullptr) {
+            sodium_memzero(k_pm, sizeof k_pm);
+            continue;
+        }
+        m_backend->sendMessage(QString(),
+            QStringLiteral("/inbox-add %1 %2")
+                .arg(QString::fromLatin1(roomBuf), QString::fromLatin1(keyB64)));
+        sodium_memzero(k_pm, sizeof k_pm);
+        sodium_memzero(keyB64, sizeof keyB64);
+    }
+    sodium_memzero(my_sk, sizeof my_sk);
 }
 
 void ChatWindow::openPeerProfile(const QString &senderName) {
