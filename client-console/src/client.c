@@ -27,6 +27,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 #include <time.h>
 #include <locale.h>
 #include <sodium.h>
@@ -1618,6 +1619,21 @@ static int send_signed_file_message(sock_t s, const char *room, const char *name
     return rc;
 }
 
+/**
+ * Пустое ли сообщение.
+ *
+ * Сборки постарше регистрировались на сервере кадром с одним пробелом, а не
+ * нулевой длины, поэтому проверки на длину не хватало: в чате от них
+ * оставалась пустая строка. Намеренно пустых сообщений никто не пишет -
+ * поле ввода их не отправляет.
+ */
+static int message_is_blank(const uint8_t *p, size_t len) {
+    for (size_t i = 0; i < len; i++) {
+        if (!isspace((unsigned char)p[i])) return 0;
+    }
+    return 1;
+}
+
 int recv_and_decrypt(sock_t s, const char *room, const uint8_t *key, const char *myname) {
     uint8_t hdr2[2];
     if (recv_all(s, hdr2, 2) < 0) return -1;
@@ -1763,7 +1779,7 @@ int recv_and_decrypt(sock_t s, const char *room, const uint8_t *key, const char 
 
     if (msg_type == MSG_TYPE_TEXT) {
         // Пропускаем пустые сообщения (регистрационные)
-        if (plen > 0) {
+        if (!message_is_blank(plain, (size_t)plen)) {
             time_t now = time(NULL);
             struct tm *tm = localtime(&now);
             char tbuf[32];
@@ -1790,6 +1806,11 @@ int recv_and_decrypt(sock_t s, const char *room, const uint8_t *key, const char 
                 } else if (tofu != TOFU_KEY_CONFLICT) {
                     prefix = "[T]";  /* TOFU trusted (not manually verified) */
                 }
+            }
+
+            if (message_is_blank(actual_msg, actual_len)) {
+                free(room_in); free(name); free(cipher); free(plain);
+                return 1;
             }
 
             if (tofu == TOFU_NEW_KEY && sig_ok == 0) {
@@ -1957,6 +1978,7 @@ int recv_and_decrypt(sock_t s, const char *room, const uint8_t *key, const char 
     free(plain);
     return 1;
 }
+
 
 
 void print_local_message(const char *name, const char *msg) {
@@ -2198,22 +2220,34 @@ void run_client(const char *host, uint16_t port, const char *room, const char *n
     g_room = room;
     g_name = name;
 
-    // Отправляем пустое сообщение для регистрации на сервере
-    const char *join_msg = "";
-    if (send_ciphertext(s, room, name, active_key, (uint8_t*)join_msg, strlen(join_msg)) < 0) {
-        fprintf(stderr, "[client] failed to register with server\n");
-        close_socket(s);
-        return;
-    }
-
-    // Send identity announcement if we have an identity
     /* Generation zero: what the room key exchange produced. Everything after
      * it arrives in a rotation bundle. */
     rk_init(&g_rk, 0, active_key);
     g_rk_ready = 1;
+
+    /* Регистрирует нас на сервере первый же отправленный кадр: имя и комнату
+     * он берёт из его заголовка. Годится любой кадр, который сервер
+     * ретранслирует, и анонс личности как раз такой - отдельное пустое
+     * сообщение для этого не нужно. А видно его было всем: сервер раздавал
+     * его в комнату, и у собеседников оставался пустой пузырь. */
     if (g_has_identity) {
         roster_note_identity(name, g_identity_pk);
-        send_identity_announce(s, room, name, active_key, g_identity_sk, g_identity_pk);
+        if (send_identity_announce(s, room, name, active_key,
+                                   g_identity_sk, g_identity_pk) < 0) {
+            fprintf(stderr, "[client] failed to register with server\n");
+            close_socket(s);
+            return;
+        }
+    } else {
+        /* Без личности анонса нет, а зарегистрироваться надо: иначе нас не
+         * будет в списке участников, пока мы не заговорим. */
+        const char *join_msg = "";
+        if (send_ciphertext(s, room, name, active_key,
+                            (const uint8_t*)join_msg, strlen(join_msg)) < 0) {
+            fprintf(stderr, "[client] failed to register with server\n");
+            close_socket(s);
+            return;
+        }
     }
 
     /* Phase B-8: start the heartbeat thread now that g_sock/g_room/g_name
