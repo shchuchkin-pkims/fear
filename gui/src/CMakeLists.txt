@@ -107,6 +107,7 @@ set(SOURCES
     widgets/chatarea.cpp
     # Phase A: identity backup (encrypted .fbk + QR blob)
     ${CMAKE_CURRENT_SOURCE_DIR}/../../identity/identity.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../identity/identity_at_rest.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../identity/identity_backup.c
 )
 
@@ -145,6 +146,9 @@ add_executable(${PROJECT_NAME}
     ${SOURCES}
     ${RESOURCES_FILES}
 )
+# Хранилище секретов платформы для ключа личности (см. корневой CMakeLists).
+target_link_libraries(${PROJECT_NAME} PRIVATE fear_secret_store)
+
 
 if(WIN32)
     set_target_properties(${PROJECT_NAME} PROPERTIES WIN32_EXECUTABLE TRUE)

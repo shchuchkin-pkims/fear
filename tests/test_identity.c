@@ -3,9 +3,11 @@
  * deterministic PM room id / room key.
  */
 #include "identity.h"
+#include "identity_at_rest.h"
 #include "test_util.h"
 
 #include <sodium.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -92,6 +94,78 @@ int main(void) {
 
     CHECK(identity_pm_room_key(sk, pk_c, k_ac) == 0);
     CHECK(memcmp(k_ab, k_ac, 32) != 0);
+
+    /* --- the secret key at rest ------------------------------------------
+     *
+     * The public key stays in the clear - identity_load_pk is called on paths
+     * that only want a fingerprint and have no business unlocking a keyring.
+     * The secret key is wrapped when there is somewhere to keep the wrapping
+     * key, and written the old way when there is not. Both have to load, and
+     * a file written before any of this existed still has to load, or an
+     * upgrade would look exactly like a lost identity.
+     */
+    {
+        char path[512];
+        snprintf(path, sizeof path, "%s/at_rest_identity", dir);
+
+        CHECK(identity_generate(path) == 0);
+
+        uint8_t gpk[IDENTITY_PK_BYTES], gsk[IDENTITY_SK_BYTES];
+        CHECK(identity_load(path, gpk, gsk) == 0);
+
+        uint8_t only_pk[IDENTITY_PK_BYTES];
+        CHECK(identity_load_pk(path, only_pk) == 0);
+        CHECK(memcmp(only_pk, gpk, IDENTITY_PK_BYTES) == 0);
+
+        /* Whatever the store situation, the file says which one it is, and
+         * the secret key is only in the clear when it says so. */
+        FILE *f = fopen(path, "r");
+        CHECK(f != NULL);
+        char buf[4096];
+        size_t n = fread(buf, 1, sizeof buf - 1, f);
+        buf[n] = '\0';
+        fclose(f);
+
+        if (iar_available() != IAR_NONE) {
+            CHECK(strstr(buf, "\nSKENC:") != NULL);
+            CHECK(strstr(buf, "\nSK:") == NULL);
+        } else {
+            CHECK(strstr(buf, "\nSK:") != NULL);
+        }
+
+        /* A file from before any of this: two lines, secret key in base64. */
+        char legacy[512];
+        snprintf(legacy, sizeof legacy, "%s/legacy_identity", dir);
+        char pk_b64[128], sk_b64[256];
+        CHECK(sodium_bin2base64(pk_b64, sizeof pk_b64, gpk, IDENTITY_PK_BYTES,
+                                sodium_base64_VARIANT_URLSAFE_NO_PADDING) != NULL);
+        CHECK(sodium_bin2base64(sk_b64, sizeof sk_b64, gsk, IDENTITY_SK_BYTES,
+                                sodium_base64_VARIANT_URLSAFE_NO_PADDING) != NULL);
+        FILE *lf = fopen(legacy, "w");
+        CHECK(lf != NULL);
+        fprintf(lf, "PK:%s\nSK:%s\n", pk_b64, sk_b64);
+        fclose(lf);
+
+        uint8_t lpk[IDENTITY_PK_BYTES], lsk[IDENTITY_SK_BYTES];
+        CHECK(identity_load(legacy, lpk, lsk) == 0);
+        CHECK(memcmp(lpk, gpk, IDENTITY_PK_BYTES) == 0);
+        CHECK(memcmp(lsk, gsk, IDENTITY_SK_BYTES) == 0);
+
+        /* And on a machine that has a store now, it has been rewritten under
+         * it - reading an old file is what triggers the move. */
+        if (iar_available() != IAR_NONE) {
+            FILE *lf2 = fopen(legacy, "r");
+            CHECK(lf2 != NULL);
+            n = fread(buf, 1, sizeof buf - 1, lf2);
+            buf[n] = '\0';
+            fclose(lf2);
+            CHECK(strstr(buf, "\nSKENC:") != NULL);
+
+            uint8_t rpk[IDENTITY_PK_BYTES], rsk[IDENTITY_SK_BYTES];
+            CHECK(identity_load(legacy, rpk, rsk) == 0);
+            CHECK(memcmp(rsk, gsk, IDENTITY_SK_BYTES) == 0);
+        }
+    }
 
     return t_report("test_identity");
 }

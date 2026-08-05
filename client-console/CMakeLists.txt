@@ -29,6 +29,7 @@ set(SOURCES
     ${SRC_DIR}/server.c
     ${SRC_DIR}/server_db.c
     ${CMAKE_SOURCE_DIR}/identity/identity.c
+    ${CMAKE_SOURCE_DIR}/identity/identity_at_rest.c
     ${CMAKE_SOURCE_DIR}/identity/call_invite.c
     ${CMAKE_SOURCE_DIR}/identity/media_keys.c
     ${CMAKE_SOURCE_DIR}/identity/key_schedule.c
@@ -40,6 +41,9 @@ set(SOURCES
 
 # Создание исполняемого файла
 add_executable(${TARGET_NAME} ${SOURCES})
+
+# Хранилище секретов платформы для ключа личности (см. корневой CMakeLists).
+target_link_libraries(${TARGET_NAME} fear_secret_store)
 
 # Включение директорий
 target_include_directories(${TARGET_NAME} PRIVATE ${INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/identity)

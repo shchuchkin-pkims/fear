@@ -35,6 +35,7 @@ RUN mkdir -p /out && gcc -O2 -Wall -Wextra -pthread \
         client-console/src/server.c \
         client-console/src/server_db.c \
         identity/identity.c \
+        identity/identity_at_rest.c \
         identity/call_invite.c \
         identity/media_keys.c \
         identity/key_schedule.c \

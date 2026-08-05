@@ -6,6 +6,7 @@
  */
 
 #include "identity.h"
+#include "identity_at_rest.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -77,60 +78,91 @@ static int get_fear_dir(char *buf, size_t bufsize) {
 
 /* ===== Public API ===== */
 
-int identity_generate(const char *path) {
-    if (sodium_init() < 0) return -1;
+/**
+ * Say once that the key is on disk in the clear.
+ *
+ * Once, because this is a hardening step and not a new requirement: headless
+ * machines and containers have no keyring, and refusing to run there would
+ * be worse than the plaintext file we have had all along. Saying nothing
+ * would be worse still - the difference matters to whoever is backing that
+ * directory up.
+ */
+static void identity_warn_plaintext_once(void) {
+    static int said = 0;
+    if (said) return;
+    said = 1;
+    fprintf(stderr,
+            "[identity] no secret store available - the identity key is "
+            "stored unencrypted (file mode 0600 only)\n");
+}
 
-    uint8_t pk[IDENTITY_PK_BYTES];
-    uint8_t sk[IDENTITY_SK_BYTES];
-    crypto_sign_keypair(pk, sk);
+/**
+ * Write an identity file.
+ *
+ * The public key is in the clear. It is public, and several call sites read
+ * it with identity_load_pk only to show a fingerprint - which has no
+ * business unlocking a keyring. The secret key goes through the platform
+ * store when there is one, and is written the way it always was when there
+ * is not.
+ */
+static int identity_write_file(const char *path, const uint8_t *pk,
+                               const uint8_t *sk) {
+    if (ensure_parent_dir(path) != 0) return -1;
 
-    if (ensure_parent_dir(path) != 0) {
-        sodium_memzero(sk, sizeof(sk));
-        return -1;
-    }
-
-    /* Encode to base64url no-padding */
     char pk_b64[128], sk_b64[256];
     if (sodium_bin2base64(pk_b64, sizeof(pk_b64), pk, IDENTITY_PK_BYTES,
                           sodium_base64_VARIANT_URLSAFE_NO_PADDING) == NULL) {
-        sodium_memzero(sk, sizeof(sk));
         return -1;
     }
-    if (sodium_bin2base64(sk_b64, sizeof(sk_b64), sk, IDENTITY_SK_BYTES,
-                          sodium_base64_VARIANT_URLSAFE_NO_PADDING) == NULL) {
-        sodium_memzero(sk, sizeof(sk));
-        sodium_memzero(sk_b64, sizeof(sk_b64));
-        return -1;
+
+    uint8_t *blob = NULL;
+    size_t blob_len = 0;
+    iar_mode_t mode = iar_protect(sk, IDENTITY_SK_BYTES, &blob, &blob_len);
+
+    char *enc = NULL;
+    if (mode != IAR_NONE && blob) {
+        size_t cap = blob_len * 4 / 3 + 8;
+        enc = (char *)malloc(cap);
+        if (!enc || sodium_bin2base64(enc, cap, blob, blob_len,
+                                      sodium_base64_VARIANT_URLSAFE_NO_PADDING) == NULL) {
+            free(enc);
+            enc = NULL;
+            mode = IAR_NONE;
+        }
+    }
+    if (blob) {
+        sodium_memzero(blob, blob_len);
+        free(blob);
+    }
+
+    if (mode == IAR_NONE) {
+        identity_warn_plaintext_once();
+        if (sodium_bin2base64(sk_b64, sizeof(sk_b64), sk, IDENTITY_SK_BYTES,
+                              sodium_base64_VARIANT_URLSAFE_NO_PADDING) == NULL) {
+            return -1;
+        }
     }
 
 #ifndef _WIN32
     /* Create the file with 0600 from the outset. fopen(path, "w") would create
      * it with 0666 & ~umask - typically 0644 - leaving the Ed25519 secret key
-     * world-readable during the window between creation and the chmod below. */
+     * world-readable during the window between creation and the chmod below.
+     * Still true of the wrapped form: the wrapping is not an excuse to widen
+     * the permissions. */
     int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
-    if (fd < 0) {
-        sodium_memzero(sk, sizeof(sk));
-        sodium_memzero(sk_b64, sizeof(sk_b64));
-        return -1;
-    }
+    if (fd < 0) goto fail;
     FILE *f = fdopen(fd, "w");
-    if (!f) {
-        close(fd);
-        sodium_memzero(sk, sizeof(sk));
-        sodium_memzero(sk_b64, sizeof(sk_b64));
-        return -1;
-    }
+    if (!f) { close(fd); goto fail; }
 #else
-    /* Windows: no POSIX modes here. DPAPI / ACLs are the proper fix (M2). */
     FILE *f = fopen(path, "w");
-    if (!f) {
-        sodium_memzero(sk, sizeof(sk));
-        sodium_memzero(sk_b64, sizeof(sk_b64));
-        return -1;
-    }
+    if (!f) goto fail;
 #endif
 
-    fprintf(f, "PK:%s\nSK:%s\n", pk_b64, sk_b64);
+    if (mode == IAR_NONE) {
+        fprintf(f, "PK:%s\nSK:%s\n", pk_b64, sk_b64);
+    } else {
+        fprintf(f, "PK:%s\nSKENC:%s:%s\n", pk_b64, iar_mode_name(mode), enc);
+    }
     fclose(f);
 
     /* The mode above only applies when the file is created, so still tighten
@@ -139,9 +171,26 @@ int identity_generate(const char *path) {
     chmod(path, 0600);
 #endif
 
-    sodium_memzero(sk, sizeof(sk));
     sodium_memzero(sk_b64, sizeof(sk_b64));
+    if (enc) { sodium_memzero(enc, strlen(enc)); free(enc); }
     return 0;
+
+fail:
+    sodium_memzero(sk_b64, sizeof(sk_b64));
+    if (enc) { sodium_memzero(enc, strlen(enc)); free(enc); }
+    return -1;
+}
+
+int identity_generate(const char *path) {
+    if (sodium_init() < 0) return -1;
+
+    uint8_t pk[IDENTITY_PK_BYTES];
+    uint8_t sk[IDENTITY_SK_BYTES];
+    crypto_sign_keypair(pk, sk);
+
+    int rc = identity_write_file(path, pk, sk);
+    sodium_memzero(sk, sizeof(sk));
+    return rc;
 }
 
 int identity_load(const char *path, uint8_t *pk, uint8_t *sk) {
@@ -149,7 +198,7 @@ int identity_load(const char *path, uint8_t *pk, uint8_t *sk) {
     if (!f) return -1;
 
     char line[512];
-    int got_pk = 0, got_sk = 0;
+    int got_pk = 0, got_sk = 0, was_plaintext = 0;
 
     while (fgets(line, sizeof(line), f)) {
         /* Remove trailing whitespace */
@@ -170,6 +219,44 @@ int identity_load(const char *path, uint8_t *pk, uint8_t *sk) {
                 return -1;
             }
             got_pk = 1;
+        } else if (strncmp(line, "SKENC:", 6) == 0) {
+            /* SKENC:<mode>:<base64 blob> */
+            char *rest = line + 6;
+            char *colon = strchr(rest, ':');
+            if (!colon) { fclose(f); return -1; }
+            *colon = '\0';
+            iar_mode_t mode = iar_mode_from_name(rest);
+            const char *b64 = colon + 1;
+
+            size_t blob_cap = strlen(b64);
+            uint8_t *blob = (uint8_t *)malloc(blob_cap ? blob_cap : 1);
+            size_t blob_len = 0;
+            if (!blob ||
+                sodium_base642bin(blob, blob_cap, b64, strlen(b64), NULL,
+                                  &blob_len, NULL,
+                                  sodium_base64_VARIANT_URLSAFE_NO_PADDING) != 0) {
+                free(blob);
+                fclose(f);
+                return -1;
+            }
+
+            size_t got = 0;
+            int rc = iar_unprotect(mode, blob, blob_len, sk,
+                                   IDENTITY_SK_BYTES, &got);
+            sodium_memzero(blob, blob_len);
+            free(blob);
+            if (rc != 0 || got != IDENTITY_SK_BYTES) {
+                /* What is missing is the store, not the file. Saying which is
+                 * the difference between "unlock your keyring" and "your
+                 * identity is gone". */
+                fprintf(stderr,
+                        "[identity] the identity key is held by the %s store, "
+                        "which did not open it\n", iar_mode_name(mode));
+                sodium_memzero(sk, IDENTITY_SK_BYTES);
+                fclose(f);
+                return -1;
+            }
+            got_sk = 1;
         } else if (strncmp(line, "SK:", 3) == 0) {
             const char *b64 = line + 3;
             size_t bin_len = 0;
@@ -182,6 +269,7 @@ int identity_load(const char *path, uint8_t *pk, uint8_t *sk) {
                 return -1;
             }
             got_sk = 1;
+            was_plaintext = 1;
         }
     }
 
@@ -190,6 +278,14 @@ int identity_load(const char *path, uint8_t *pk, uint8_t *sk) {
     if (!got_pk || !got_sk) {
         sodium_memzero(sk, IDENTITY_SK_BYTES);
         return -1;
+    }
+
+    /* An identity written before there was a store, on a machine that has one
+     * now, gets rewritten under it. A failure here is not worth stopping for:
+     * the key we just read is good, and the file is no worse than it was a
+     * moment ago. */
+    if (was_plaintext && iar_available() != IAR_NONE) {
+        (void)identity_write_file(path, pk, sk);
     }
 
     return 0;

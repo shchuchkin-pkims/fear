@@ -145,8 +145,27 @@
 ## Planned
 
 ### Security
-- [ ] Desktop identity key encrypted at rest (libsecret / DPAPI) - Android already
-      uses a Keystore-backed EncryptedFile; the desktop file is 0600 but plaintext
+- [x] Desktop identity key encrypted at rest (libsecret / DPAPI). The public
+      key stays in the clear - identity_load_pk is called on half a dozen GUI
+      paths that only want a fingerprint and have no business unlocking a
+      keyring - and the secret key is wrapped by a key the platform store
+      holds. The keyring holds the wrapping key rather than the identity
+      itself, so the identity is still a file the user can copy, back up or
+      move; that file is simply useless on its own now.
+
+      What this closes is the file leaving the machine: a backup, a copied
+      home directory, a disk out of a laptop. It does not stop a process
+      running as this user while the session is unlocked - the keyring is
+      unlocked too and will hand the key over. That is the same bargain
+      Android'''s Keystore-backed EncryptedFile makes.
+
+      A build without libsecret, or a machine with no keyring running, keeps
+      the old plaintext form and says so once on stderr. Refusing to start
+      would be worse: headless and container use is real, and this is a
+      hardening step rather than a new requirement. Linux CI installs
+      libsecret so the wrapped path is compiled; the unit-test job does not,
+      so the fallback is compiled too, and test_identity asserts whichever
+      invariant matches the environment it finds.
 - [ ] Post-compromise security (Signal-style ratchet) - deliberately out of scope
       for v0.6.0, recorded so the gap is not mistaken for an oversight
 

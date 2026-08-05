@@ -29,11 +29,12 @@ function(add_fear_test name)
         ${IDENTITY_DIR}
         ${TEST_SODIUM_INCLUDE})
     target_link_libraries(${name} PRIVATE ${TEST_SODIUM_LIBS})
+    target_link_libraries(${name} PRIVATE fear_secret_store)
     add_test(NAME ${name} COMMAND ${name})
 endfunction()
 
-add_fear_test(test_identity test_identity.c ${IDENTITY_DIR}/identity.c)
-add_fear_test(test_backup   test_backup.c   ${IDENTITY_DIR}/identity_backup.c ${IDENTITY_DIR}/identity.c)
+add_fear_test(test_identity test_identity.c ${IDENTITY_DIR}/identity.c ${IDENTITY_DIR}/identity_at_rest.c)
+add_fear_test(test_backup   test_backup.c   ${IDENTITY_DIR}/identity_backup.c ${IDENTITY_DIR}/identity.c ${IDENTITY_DIR}/identity_at_rest.c)
 add_fear_test(test_contacts test_contacts.c ${IDENTITY_DIR}/contacts_cipher.c)
 add_fear_test(test_key_schedule test_key_schedule.c ${IDENTITY_DIR}/key_schedule.c)
 add_fear_test(test_rotation     test_rotation.c     ${IDENTITY_DIR}/rotation.c)
@@ -43,7 +44,7 @@ add_fear_test(test_media_senders test_media_senders.c ${IDENTITY_DIR}/media_send
 add_fear_test(test_call_invite  test_call_invite.c  ${IDENTITY_DIR}/call_invite.c ${IDENTITY_DIR}/media_keys.c)
 add_fear_test(test_media_packet test_media_packet.c ${IDENTITY_DIR}/media_packet.c ${IDENTITY_DIR}/media_keys.c)
 add_fear_test(test_chat_frame   test_chat_frame.c   ${IDENTITY_DIR}/chat_frame.c ${IDENTITY_DIR}/key_schedule.c)
-add_fear_test(test_room_keys    test_room_keys.c    ${IDENTITY_DIR}/room_keys.c ${IDENTITY_DIR}/chat_frame.c ${IDENTITY_DIR}/key_schedule.c ${IDENTITY_DIR}/identity.c)
+add_fear_test(test_room_keys    test_room_keys.c    ${IDENTITY_DIR}/room_keys.c ${IDENTITY_DIR}/chat_frame.c ${IDENTITY_DIR}/key_schedule.c ${IDENTITY_DIR}/identity.c ${IDENTITY_DIR}/identity_at_rest.c)
 add_fear_test(test_rotation_bundle test_rotation_bundle.c ${IDENTITY_DIR}/rotation_bundle.c ${IDENTITY_DIR}/rotation.c)
 
 # Разборщики, которые видят сеть до всякой аутентификации. Санитайзеры
@@ -125,7 +126,7 @@ endif()
 # challenge). Бинарь ходит на живой сервер через реальные sp_*-функции;
 # сервер поднимает обёртка blob_auth.sh.
 add_executable(test_blob_auth test_blob_auth.c
-    ${IDENTITY_DIR}/identity.c
+    ${IDENTITY_DIR}/identity.c ${IDENTITY_DIR}/identity_at_rest.c
     ${IDENTITY_DIR}/server_proto.c)
 target_include_directories(test_blob_auth PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}

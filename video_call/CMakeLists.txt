@@ -23,6 +23,7 @@ set(SOURCES
     ${CMAKE_SOURCE_DIR}/audio_call/src/audio_hub.c
     # Identity module
     ${CMAKE_SOURCE_DIR}/identity/identity.c
+    ${CMAKE_SOURCE_DIR}/identity/identity_at_rest.c
     ${CMAKE_SOURCE_DIR}/identity/media_keys.c
     ${CMAKE_SOURCE_DIR}/identity/media_hello.c
     ${CMAKE_SOURCE_DIR}/identity/media_senders.c
@@ -30,6 +31,9 @@ set(SOURCES
 )
 
 add_executable(video_call ${SOURCES})
+
+# Хранилище секретов платформы для ключа личности (см. корневой CMakeLists).
+target_link_libraries(video_call PRIVATE fear_secret_store)
 
 # Include directories
 target_include_directories(video_call PRIVATE

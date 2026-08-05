@@ -41,6 +41,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             build-essential cmake ninja-build pkg-config \
             libsodium-dev libsqlite3-dev libqrencode-dev libzbar-dev \
+            libsecret-1-dev \
             qt6-base-dev qt6-base-dev-tools \
             libgl1-mesa-dev libxkbcommon-dev
 
