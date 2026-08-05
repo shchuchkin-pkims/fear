@@ -42,7 +42,7 @@ bool ServerDb::open(const QString &path, QString *error) {
 
     if (!q.exec(QStringLiteral("SELECT 1 FROM handles LIMIT 1"))) {
         if (error) {
-            *error = QObject::tr("это не похоже на базу ретранслятора: %1")
+            *error = QObject::tr("this does not look like a relay database: %1")
                          .arg(q.lastError().text());
         }
         close();
@@ -64,7 +64,7 @@ void ServerDb::close() {
 }
 
 QString ServerDb::fingerprint(const QByteArray &pk) {
-    if (pk.size() != IDENTITY_PK_BYTES) return QStringLiteral("(ключ не 32 байта)");
+    if (pk.size() != IDENTITY_PK_BYTES) return QStringLiteral("(key is not 32 bytes)");
     char buf[IDENTITY_FINGERPRINT_LEN];
     identity_pk_fingerprint(reinterpret_cast<const uint8_t *>(pk.constData()), buf);
     return QString::fromLatin1(buf);
@@ -219,7 +219,7 @@ bool ServerDb::deleteBlob(const QByteArray &pk, const QString &type, QString *er
 
 bool ServerDb::blockKey(const QByteArray &pk, const QString &reason, QString *error) {
     if (pk.size() != IDENTITY_PK_BYTES) {
-        if (error) *error = QObject::tr("ключ должен быть длиной 32 байта");
+        if (error) *error = QObject::tr("the key must be 32 bytes long");
         return false;
     }
     QSqlQuery q(m_db);

@@ -27,9 +27,9 @@
 namespace {
 
 QString humanBytes(qint64 n) {
-    if (n < 1024) return QObject::tr("%1 Б").arg(n);
-    if (n < 1024 * 1024) return QObject::tr("%1 КБ").arg(n / 1024.0, 0, 'f', 1);
-    return QObject::tr("%1 МБ").arg(n / (1024.0 * 1024.0), 0, 'f', 1);
+    if (n < 1024) return QObject::tr("%1 B").arg(n);
+    if (n < 1024 * 1024) return QObject::tr("%1 KB").arg(n / 1024.0, 0, 'f', 1);
+    return QObject::tr("%1 MB").arg(n / (1024.0 * 1024.0), 0, 'f', 1);
 }
 
 QString whenText(const QDateTime &t) {
@@ -67,15 +67,15 @@ AdminWindow::AdminWindow(QWidget *parent) : QMainWindow(parent) {
 }
 
 void AdminWindow::buildUi() {
-    setWindowTitle(tr("F.E.A.R. - администрирование ретранслятора"));
+    setWindowTitle(tr("F.E.A.R. - relay administration"));
     resize(1000, 640);
 
-    auto *fileMenu = menuBar()->addMenu(tr("&База"));
-    fileMenu->addAction(tr("&Открыть..."), this, &AdminWindow::chooseDatabase);
-    fileMenu->addAction(tr("О&бновить"), this, &AdminWindow::refreshAll,
+    auto *fileMenu = menuBar()->addMenu(tr("&Database"));
+    fileMenu->addAction(tr("&Open..."), this, &AdminWindow::chooseDatabase);
+    fileMenu->addAction(tr("&Refresh"), this, &AdminWindow::refreshAll,
                         QKeySequence(QKeySequence::Refresh));
     fileMenu->addSeparator();
-    fileMenu->addAction(tr("&Выход"), qApp, &QApplication::quit);
+    fileMenu->addAction(tr("&Quit"), qApp, &QApplication::quit);
 
     auto *tabs = new QTabWidget;
     setCentralWidget(tabs);
@@ -87,20 +87,20 @@ void AdminWindow::buildUi() {
 
         auto *top = new QHBoxLayout;
         m_filter = new QLineEdit;
-        m_filter->setPlaceholderText(tr("поиск по имени или отпечатку"));
+        m_filter->setPlaceholderText(tr("search by handle or fingerprint"));
         connect(m_filter, &QLineEdit::textChanged, this, [this] { fillHandles(); });
-        top->addWidget(new QLabel(tr("Найти:")));
+        top->addWidget(new QLabel(tr("Find:")));
         top->addWidget(m_filter, 1);
         v->addLayout(top);
 
-        m_handles = makeTable({ tr("Имя"), tr("Отпечаток ключа"), tr("Зарегистрировано"),
-                                tr("Блобов"), tr("Блокировка") });
+        m_handles = makeTable({ tr("Handle"), tr("Key fingerprint"), tr("Claimed"),
+                                tr("Blobs"), tr("Blocked") });
         v->addWidget(m_handles, 1);
 
         auto *row = new QHBoxLayout;
-        auto *del = new QPushButton(tr("Удалить имя"));
-        auto *blk = new QPushButton(tr("Заблокировать ключ"));
-        auto *exp = new QPushButton(tr("Экспорт..."));
+        auto *del = new QPushButton(tr("Release handle"));
+        auto *blk = new QPushButton(tr("Block key"));
+        auto *exp = new QPushButton(tr("Export..."));
         connect(del, &QPushButton::clicked, this, &AdminWindow::deleteSelectedHandles);
         connect(blk, &QPushButton::clicked, this, &AdminWindow::blockSelectedHandles);
         connect(exp, &QPushButton::clicked, this, &AdminWindow::exportHandles);
@@ -110,7 +110,7 @@ void AdminWindow::buildUi() {
         row->addWidget(exp);
         v->addLayout(row);
 
-        tabs->addTab(page, tr("Пользователи"));
+        tabs->addTab(page, tr("Users"));
     }
 
     /* --- Блобы ----------------------------------------------------------- */
@@ -118,20 +118,20 @@ void AdminWindow::buildUi() {
         auto *page = new QWidget;
         auto *v = new QVBoxLayout(page);
         v->addWidget(new QLabel(tr(
-            "Содержимое зашифровано клиентом - ни сервер, ни эта утилита его "
-            "прочитать не могут. Видны только метаданные.")));
-        m_blobs = makeTable({ tr("Отпечаток ключа"), tr("Имя"), tr("Тип"),
-                              tr("Размер"), tr("Обновлён") });
+            "The contents are encrypted by the client - neither the server nor "
+            "this utility can read them. Only metadata is shown.")));
+        m_blobs = makeTable({ tr("Key fingerprint"), tr("Handle"), tr("Type"),
+                              tr("Size"), tr("Updated") });
         v->addWidget(m_blobs, 1);
 
         auto *row = new QHBoxLayout;
-        auto *del = new QPushButton(tr("Удалить блоб"));
+        auto *del = new QPushButton(tr("Delete blob"));
         connect(del, &QPushButton::clicked, this, &AdminWindow::deleteSelectedBlobs);
         row->addWidget(del);
         row->addStretch(1);
         v->addLayout(row);
 
-        tabs->addTab(page, tr("Блобы"));
+        tabs->addTab(page, tr("Blobs"));
     }
 
     /* --- Блокировки ------------------------------------------------------ */
@@ -139,20 +139,21 @@ void AdminWindow::buildUi() {
         auto *page = new QWidget;
         auto *v = new QVBoxLayout(page);
         auto *note = new QLabel(tr(
-            "Блокировка действует там, где сервер вообще видит ключ: имя "
-            "нельзя занять, найти по ключу и хранить блобы. Войти в комнату "
-            "она не мешает - при обычном подключении сервер личного ключа не "
-            "видит, и это свойство самой схемы, а не недоделка."));
+            "A block bites where the relay actually sees a key: the key cannot "
+            "claim a handle, be found by one, or keep anything in the blob "
+            "store. It does not stop whoever holds it from joining a room - on "
+            "an ordinary connection the relay never sees an identity key, and "
+            "that is a property of the design rather than something missing."));
         note->setWordWrap(true);
         v->addWidget(note);
 
-        m_blocks = makeTable({ tr("Отпечаток ключа"), tr("Имя"), tr("Причина"),
-                               tr("Когда") });
+        m_blocks = makeTable({ tr("Key fingerprint"), tr("Handle"), tr("Reason"),
+                               tr("Blocked at") });
         v->addWidget(m_blocks, 1);
 
         auto *row = new QHBoxLayout;
-        auto *add = new QPushButton(tr("Заблокировать по ключу..."));
-        auto *rm  = new QPushButton(tr("Снять блокировку"));
+        auto *add = new QPushButton(tr("Block by key..."));
+        auto *rm  = new QPushButton(tr("Unblock"));
         connect(add, &QPushButton::clicked, this, &AdminWindow::blockByFingerprint);
         connect(rm,  &QPushButton::clicked, this, &AdminWindow::unblockSelected);
         row->addWidget(add);
@@ -160,7 +161,7 @@ void AdminWindow::buildUi() {
         row->addStretch(1);
         v->addLayout(row);
 
-        tabs->addTab(page, tr("Блокировки"));
+        tabs->addTab(page, tr("Blocked keys"));
     }
 
     /* --- Сейчас в сети ---------------------------------------------------- */
@@ -171,10 +172,10 @@ void AdminWindow::buildUi() {
         m_serverState->setWordWrap(true);
         v->addWidget(m_serverState);
 
-        m_sessions = makeTable({ tr("Имя"), tr("Комната"), tr("Адрес"),
-                                 tr("С"), tr("Медиа") });
+        m_sessions = makeTable({ tr("Name"), tr("Room"), tr("Address"),
+                                 tr("Since"), tr("Media") });
         v->addWidget(m_sessions, 1);
-        tabs->addTab(page, tr("Сейчас в сети"));
+        tabs->addTab(page, tr("Connected now"));
     }
 
     /* --- Сводка ----------------------------------------------------------- */
@@ -188,22 +189,22 @@ void AdminWindow::buildUi() {
         v->addStretch(1);
 
         auto *row = new QHBoxLayout;
-        auto *vac = new QPushButton(tr("Сжать базу (VACUUM)"));
+        auto *vac = new QPushButton(tr("Compact database (VACUUM)"));
         connect(vac, &QPushButton::clicked, this, &AdminWindow::compactDatabase);
         row->addWidget(vac);
         row->addStretch(1);
         v->addLayout(row);
 
-        tabs->addTab(page, tr("Сводка"));
+        tabs->addTab(page, tr("Overview"));
     }
 
-    statusBar()->showMessage(tr("база не открыта"));
+    statusBar()->showMessage(tr("no database open"));
 }
 
 bool AdminWindow::openDatabase(const QString &path) {
     QString err;
     if (!m_db.open(path, &err)) {
-        showError(tr("Не удалось открыть базу"), err);
+        showError(tr("Could not open the database"), err);
         return false;
     }
     statusBar()->showMessage(path);
@@ -213,8 +214,8 @@ bool AdminWindow::openDatabase(const QString &path) {
 
 void AdminWindow::chooseDatabase() {
     const QString path = QFileDialog::getOpenFileName(
-        this, tr("База ретранслятора"), QString(),
-        tr("SQLite (*.sqlite *.db);;Все файлы (*)"));
+        this, tr("Relay database"), QString(),
+        tr("SQLite (*.sqlite *.db);;All files (*)"));
     if (!path.isEmpty()) openDatabase(path);
 }
 
@@ -230,7 +231,7 @@ void AdminWindow::refreshAll() {
 void AdminWindow::fillHandles() {
     QString err;
     const auto rows = m_db.handles(&err);
-    if (!err.isEmpty()) { showError(tr("Не удалось прочитать имена"), err); return; }
+    if (!err.isEmpty()) { showError(tr("Could not read the handles"), err); return; }
 
     const QString needle = m_filter ? m_filter->text().trimmed() : QString();
 
@@ -250,7 +251,7 @@ void AdminWindow::fillHandles() {
         m_handles->setItem(row, 2, new QTableWidgetItem(whenText(r.claimedAt)));
         m_handles->setItem(row, 3, new QTableWidgetItem(QString::number(r.blobCount)));
         m_handles->setItem(row, 4, new QTableWidgetItem(
-            r.blocked ? tr("заблокирован") : QString()));
+            r.blocked ? tr("blocked") : QString()));
     }
     m_handles->setSortingEnabled(true);
     m_handles->resizeColumnsToContents();
@@ -259,7 +260,7 @@ void AdminWindow::fillHandles() {
 void AdminWindow::fillBlobs() {
     QString err;
     const auto rows = m_db.blobs(&err);
-    if (!err.isEmpty()) { showError(tr("Не удалось прочитать блобы"), err); return; }
+    if (!err.isEmpty()) { showError(tr("Could not read the blobs"), err); return; }
 
     m_blobs->setSortingEnabled(false);
     m_blobs->setRowCount(0);
@@ -282,7 +283,7 @@ void AdminWindow::fillBlobs() {
 void AdminWindow::fillBlocked() {
     QString err;
     const auto rows = m_db.blocked(&err);
-    if (!err.isEmpty()) { showError(tr("Не удалось прочитать блокировки"), err); return; }
+    if (!err.isEmpty()) { showError(tr("Could not read the blocked keys"), err); return; }
 
     m_blocks->setSortingEnabled(false);
     m_blocks->setRowCount(0);
@@ -304,16 +305,16 @@ void AdminWindow::refreshSessions() {
     const ServerState st = m_db.state();
     if (!st.known) {
         m_serverState->setText(tr(
-            "Сервер ни разу не запускался с этой базой, либо запускался "
-            "сборкой, которая ещё не умеет вести список подключений."));
+            "The relay has never run against this database, or it ran a build "
+            "that does not yet keep a list of connections."));
     } else if (st.alive()) {
-        m_serverState->setText(tr("Сервер работает (pid %1), запущен %2.")
+        m_serverState->setText(tr("The relay is running (pid %1), started %2.")
                                    .arg(st.pid)
                                    .arg(whenText(st.startedAt)));
     } else {
         m_serverState->setText(tr(
-            "Сервер не отвечает: последнее биение %1. Строки ниже остались от "
-            "прошлого запуска и никого не описывают.")
+            "The relay is not answering: last heartbeat %1. The rows below are "
+            "left over from an earlier run and describe nobody.")
                                    .arg(whenText(st.heartbeatAt)));
     }
 
@@ -327,7 +328,7 @@ void AdminWindow::refreshSessions() {
         m_sessions->setItem(row, 1, new QTableWidgetItem(r.room));
         m_sessions->setItem(row, 2, new QTableWidgetItem(r.addr));
         m_sessions->setItem(row, 3, new QTableWidgetItem(whenText(r.connectedAt)));
-        m_sessions->setItem(row, 4, new QTableWidgetItem(r.isMedia ? tr("да") : QString()));
+        m_sessions->setItem(row, 4, new QTableWidgetItem(r.isMedia ? tr("yes") : QString()));
     }
     m_sessions->setSortingEnabled(true);
     m_sessions->resizeColumnsToContents();
@@ -349,17 +350,17 @@ void AdminWindow::fillOverview() {
     }
 
     m_overview->setText(tr(
-        "<b>Файл:</b> %1<br>"
-        "<b>Занимает:</b> %2 (вместе с журналом WAL)<br><br>"
-        "<b>Занятых имён:</b> %3<br>"
-        "<b>Самое старое:</b> %4<br>"
-        "<b>Самое новое:</b> %5<br><br>"
-        "<b>Блобов:</b> %6, суммарно %7<br>"
-        "<b>Заблокированных ключей:</b> %8<br><br>"
-        "Переписки в базе нет и не появится: ретранслятор пересылает "
-        "сообщения на лету и не хранит ни тел, ни того, кто кому писал. "
-        "Здесь только занятые имена с открытыми ключами и зашифрованные "
-        "клиентом блобы.")
+        "<b>File:</b> %1<br>"
+        "<b>On disk:</b> %2 (including the WAL journal)<br><br>"
+        "<b>Handles claimed:</b> %3<br>"
+        "<b>Oldest:</b> %4<br>"
+        "<b>Newest:</b> %5<br><br>"
+        "<b>Blobs:</b> %6, %7 in total<br>"
+        "<b>Blocked keys:</b> %8<br><br>"
+        "There is no correspondence in this database and there will not be: "
+        "the relay forwards messages live and keeps neither bodies nor who "
+        "wrote to whom. What is here is claimed handles with their public "
+        "keys, and blobs the client encrypted itself.")
         .arg(m_db.path())
         .arg(humanBytes(m_db.fileBytes()))
         .arg(handles.size())
@@ -396,19 +397,19 @@ void AdminWindow::deleteSelectedHandles() {
      * тут же может занять кто угодно другой, и собеседники увидят прежний
      * @ник за новым ключом. Сказать об этом до, а не после. */
     const auto answer = QMessageBox::warning(
-        this, tr("Освободить имена"),
-        tr("Будут освобождены имена: %1.\n\n"
-           "Имя сразу сможет занять другой ключ, и собеседники увидят "
-           "привычный @ник за чужим ключом. Ключ владельца при этом не "
-           "трогается - он продолжит работать без имени.\n\n"
-           "Продолжить?").arg(names.join(QStringLiteral(", "))),
+        this, tr("Release handles"),
+        tr("These handles will be released: %1.\n\n"
+           "A handle can be claimed by another key straight away, and contacts "
+           "will see the familiar @handle behind a different key. The owner's "
+           "key is not touched - it keeps working, just without a handle.\n\n"
+           "Go ahead?").arg(names.join(QStringLiteral(", "))),
         QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
     if (answer != QMessageBox::Yes) return;
 
     for (const QString &name : names) {
         QString err;
         if (!m_db.deleteHandle(name, &err)) {
-            showError(tr("Не удалось освободить имя %1").arg(name), err);
+            showError(tr("Could not release the handle %1").arg(name), err);
             break;
         }
     }
@@ -421,15 +422,15 @@ void AdminWindow::blockSelectedHandles() {
 
     bool ok = false;
     const QString reason = QInputDialog::getText(
-        this, tr("Заблокировать ключ"),
-        tr("Причина (попадёт только в эту базу):"), QLineEdit::Normal,
+        this, tr("Block key"),
+        tr("Reason (stays in this database only):"), QLineEdit::Normal,
         QString(), &ok);
     if (!ok) return;
 
     for (const QByteArray &pk : keys) {
         QString err;
         if (!m_db.blockKey(pk, reason, &err)) {
-            showError(tr("Не удалось заблокировать ключ"), err);
+            showError(tr("Could not block the key"), err);
             break;
         }
     }
@@ -450,19 +451,19 @@ void AdminWindow::deleteSelectedBlobs() {
     if (targets.isEmpty()) return;
 
     const auto answer = QMessageBox::warning(
-        this, tr("Удалить блобы"),
-        tr("Будет удалено записей: %1.\n\n"
-           "Это данные пользователя, а не сервера: список контактов, который "
-           "клиент хранит здесь зашифрованным. Восстановить его сервер не "
-           "сможет - только сам клиент, если у него есть локальная копия.\n\n"
-           "Продолжить?").arg(targets.size()),
+        this, tr("Delete blobs"),
+        tr("%1 record(s) will be deleted.\n\n"
+           "This is the user's data, not the server's: the contact list the "
+           "client keeps here encrypted. The server cannot restore it - only "
+           "the client can, and only from a local copy.\n\n"
+           "Go ahead?").arg(targets.size()),
         QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
     if (answer != QMessageBox::Yes) return;
 
     for (const auto &t : targets) {
         QString err;
         if (!m_db.deleteBlob(t.first, t.second, &err)) {
-            showError(tr("Не удалось удалить блоб"), err);
+            showError(tr("Could not delete the blob"), err);
             break;
         }
     }
@@ -474,7 +475,7 @@ void AdminWindow::unblockSelected() {
     for (const QByteArray &pk : keys) {
         QString err;
         if (!m_db.unblockKey(pk, &err)) {
-            showError(tr("Не удалось снять блокировку"), err);
+            showError(tr("Could not unblock the key"), err);
             break;
         }
     }
@@ -484,8 +485,8 @@ void AdminWindow::unblockSelected() {
 void AdminWindow::blockByFingerprint() {
     bool ok = false;
     const QString b64 = QInputDialog::getText(
-        this, tr("Заблокировать ключ"),
-        tr("Открытый ключ в base64url (без выравнивания), 32 байта:"),
+        this, tr("Block key"),
+        tr("Public key in base64url (no padding), 32 bytes:"),
         QLineEdit::Normal, QString(), &ok);
     if (!ok || b64.trimmed().isEmpty()) return;
 
@@ -493,21 +494,21 @@ void AdminWindow::blockByFingerprint() {
         b64.trimmed().toLatin1(),
         QByteArray::Base64UrlEncoding | QByteArray::OmitTrailingEquals);
     if (pk.size() != 32) {
-        showError(tr("Не похоже на ключ"),
-                  tr("Получилось %1 байт вместо 32. Ключ ожидается в том же "
-                     "виде, в каком его показывает клиент - base64url без "
-                     "выравнивания.").arg(pk.size()));
+        showError(tr("That does not look like a key"),
+                  tr("Got %1 bytes instead of 32. The key is expected in the "
+                     "form the client shows it - base64url without "
+                     "padding.").arg(pk.size()));
         return;
     }
 
     const QString reason = QInputDialog::getText(
-        this, tr("Заблокировать ключ"), tr("Причина:"), QLineEdit::Normal,
+        this, tr("Block key"), tr("Reason:"), QLineEdit::Normal,
         QString(), &ok);
     if (!ok) return;
 
     QString err;
     if (!m_db.blockKey(pk, reason, &err)) {
-        showError(tr("Не удалось заблокировать ключ"), err);
+        showError(tr("Could not block the key"), err);
         return;
     }
     refreshAll();
@@ -515,14 +516,14 @@ void AdminWindow::blockByFingerprint() {
 
 void AdminWindow::exportHandles() {
     const QString path = QFileDialog::getSaveFileName(
-        this, tr("Выгрузить список"), QStringLiteral("handles.csv"),
+        this, tr("Export the list"), QStringLiteral("handles.csv"),
         tr("CSV (*.csv);;JSON (*.json)"));
     if (path.isEmpty()) return;
 
     const auto rows = m_db.handles();
     QFile f(path);
     if (!f.open(QIODevice::WriteOnly | QIODevice::Text)) {
-        showError(tr("Не удалось записать файл"), f.errorString());
+        showError(tr("Could not write the file"), f.errorString());
         return;
     }
 
@@ -556,27 +557,28 @@ void AdminWindow::exportHandles() {
         }
     }
     f.close();
-    statusBar()->showMessage(tr("выгружено записей: %1").arg(rows.size()), 5000);
+    statusBar()->showMessage(tr("%1 record(s) exported").arg(rows.size()), 5000);
 }
 
 void AdminWindow::compactDatabase() {
     const auto answer = QMessageBox::question(
-        this, tr("Сжать базу"),
-        tr("VACUUM переписывает файл целиком. На работающем сервере это "
-           "безопасно, но пока идёт запись, обращения к базе будут ждать.\n\n"
-           "Продолжить?"),
+        this, tr("Compact the database"),
+        tr("VACUUM rewrites the whole file. That is safe against a running "
+           "relay, but while it writes, everything else waits on the "
+           "database.\n\n"
+           "Go ahead?"),
         QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
     if (answer != QMessageBox::Yes) return;
 
     const qint64 before = m_db.fileBytes();
     QString err;
     if (!m_db.vacuum(&err)) {
-        showError(tr("Не удалось сжать базу"), err);
+        showError(tr("Could not compact the database"), err);
         return;
     }
     fillOverview();
     statusBar()->showMessage(
-        tr("было %1, стало %2").arg(humanBytes(before), humanBytes(m_db.fileBytes())), 8000);
+        tr("was %1, now %2").arg(humanBytes(before), humanBytes(m_db.fileBytes())), 8000);
 }
 
 void AdminWindow::showError(const QString &what, const QString &detail) {
