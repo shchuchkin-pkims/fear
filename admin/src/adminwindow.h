@@ -52,6 +52,8 @@ private:
     void fillBlobs();
     void fillBlocked();
     void fillOverview();
+    /** Счётчики и политика офлайн-ящика одной строкой. */
+    QString inboxLine() const;
 
     ServerDb m_db;
 

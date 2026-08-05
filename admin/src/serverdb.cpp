@@ -193,6 +193,27 @@ ServerState ServerDb::state() const {
     return s;
 }
 
+InboxStats ServerDb::inbox() const {
+    InboxStats st;
+    if (!isOpen()) return st;
+
+    QSqlQuery q(m_db);
+    /* Таблицы может не быть: сервер старой сборки про ящик не знает, и это
+     * не ошибка - просто нечего показывать. */
+    if (q.exec(QStringLiteral(
+            "SELECT COUNT(*), COALESCE(SUM(LENGTH(ciphertext)), 0),"
+            "       COUNT(DISTINCT addr) FROM inbox")) && q.next()) {
+        st.items     = q.value(0).toLongLong();
+        st.bytes     = q.value(1).toLongLong();
+        st.addresses = q.value(2).toLongLong();
+    }
+    QSqlQuery p(m_db);
+    p.prepare(QStringLiteral("SELECT value FROM server_state WHERE key = ?"));
+    p.addBindValue(QStringLiteral("inbox_ttl"));
+    if (p.exec() && p.next()) st.ttlSeconds = p.value(0).toLongLong();
+    return st;
+}
+
 bool ServerDb::deleteHandle(const QString &handle, QString *error) {
     QSqlQuery q(m_db);
     q.prepare(QStringLiteral("DELETE FROM handles WHERE handle = ?"));

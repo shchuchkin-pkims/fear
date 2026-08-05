@@ -334,6 +334,31 @@ void AdminWindow::refreshSessions() {
     m_sessions->resizeColumnsToContents();
 }
 
+/**
+ * Строка про ящик для сводки.
+ *
+ * Показываем счётчики и действующую политику - её сервер записывает в базу
+ * сам, так что администратор видит, что на самом деле настроено, а не то,
+ * что он помнит про строку запуска.
+ */
+QString AdminWindow::inboxLine() const {
+    const InboxStats st = m_db.inbox();
+    if (st.ttlSeconds < 0) {
+        return tr("this relay does not report an inbox (older build)");
+    }
+    if (st.ttlSeconds == 0) {
+        return st.items > 0
+            ? tr("storage is off, %1 leftover item(s) still to be swept")
+                  .arg(st.items)
+            : tr("storage is off - nothing is kept");
+    }
+    return tr("%1 item(s), %2, for %3 mailbox(es); kept up to %4 days")
+        .arg(st.items)
+        .arg(humanBytes(st.bytes))
+        .arg(st.addresses)
+        .arg(st.ttlSeconds / 86400.0, 0, 'g', 3);
+}
+
 void AdminWindow::fillOverview() {
     const auto handles = m_db.handles();
     const auto blobs   = m_db.blobs();
@@ -357,10 +382,13 @@ void AdminWindow::fillOverview() {
         "<b>Newest:</b> %5<br><br>"
         "<b>Blobs:</b> %6, %7 in total<br>"
         "<b>Blocked keys:</b> %8<br><br>"
-        "There is no correspondence in this database and there will not be: "
-        "the relay forwards messages live and keeps neither bodies nor who "
-        "wrote to whom. What is here is claimed handles with their public "
-        "keys, and blobs the client encrypted itself.")
+        "<b>Offline inbox:</b> %9<br><br>"
+        "Delivered messages are not here: the relay forwards them live and "
+        "keeps neither bodies nor who wrote to whom. What it may hold is "
+        "undelivered mail - sealed by the sender, addressed to a blind label "
+        "rather than to anyone's key, deleted the moment it is collected, and "
+        "only when the operator enabled it. Beyond that: claimed handles with "
+        "their public keys, and blobs the client encrypted itself.")
         .arg(m_db.path())
         .arg(humanBytes(m_db.fileBytes()))
         .arg(handles.size())
@@ -368,7 +396,8 @@ void AdminWindow::fillOverview() {
         .arg(whenText(newest))
         .arg(blobs.size())
         .arg(humanBytes(blobBytes))
-        .arg(blocks.size()));
+        .arg(blocks.size())
+        .arg(inboxLine()));
 }
 
 QList<QByteArray> AdminWindow::selectedKeys(QTableWidget *table) const {

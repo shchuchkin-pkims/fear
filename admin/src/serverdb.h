@@ -58,6 +58,16 @@ struct SessionRow {
     QDateTime connectedAt;
 };
 
+/** Сводка по офлайн-ящику. Содержимое писем недоступно - только счётчики. */
+struct InboxStats {
+    qint64 items = 0;
+    qint64 bytes = 0;
+    qint64 addresses = 0;
+    /** Срок хранения в секундах; 0 - оператор выключил хранение, -1 - сервер
+     *  старой сборки и о ящике ничего не сообщает. */
+    qint64 ttlSeconds = -1;
+};
+
 /** Что сервер сообщает о себе. */
 struct ServerState {
     bool      known = false;   ///< есть ли вообще запись
@@ -83,6 +93,7 @@ public:
     QList<BlockRow>   blocked(QString *error = nullptr) const;
     QList<SessionRow> sessions(QString *error = nullptr) const;
     ServerState       state() const;
+    InboxStats        inbox() const;
 
     bool deleteHandle(const QString &handle, QString *error);
     bool deleteBlob(const QByteArray &pk, const QString &type, QString *error);
