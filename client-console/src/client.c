@@ -2628,8 +2628,19 @@ DWORD WINAPI input_thread(LPVOID param) {
  */
 int probe_room_info(const char *host, uint16_t port, const char *room,
                     int timeout_ms) {
-    sock_t s = dial_tcp(host, port);
+    /*
+     * Спрашивать надо той же меткой, под которой мы потом зарегистрируемся.
+     *
+     * Сервер знает комнату только по метке - названия он не видит. Спроси
+     * проба про «general», он честно ответит «пусто», потому что под таким
+     * именем действительно никого нет: все сидят под хешем. Дальше режим
+     * AUTO решает «комната пуста - создаём» и рисует собственный ключ, а
+     * клиент оказывается в комнате один, рядом с людьми, которых не видит.
+     */
+    char wire[IDENTITY_WIRE_ROOM_LEN];
+    if (identity_wire_room(room, wire) == 0) room = wire;
 
+    sock_t s = dial_tcp(host, port);
 
     if (s < 0) return -1;
 
