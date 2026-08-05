@@ -506,6 +506,7 @@ size_t server_db_inbox_fetch(const uint8_t addr[INBOX_ADDR_BYTES],
         if (!copy) break;
         memcpy(copy, blob, (size_t)blen);
         out[n].id         = sqlite3_column_int64(q, 0);
+        memcpy(out[n].addr, addr, INBOX_ADDR_BYTES);
         out[n].ciphertext = copy;
         out[n].len        = (size_t)blen;
         out[n].created_at = sqlite3_column_int64(q, 2);

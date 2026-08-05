@@ -140,6 +140,37 @@ static const uint8_t *g_room_key = NULL;
  * against the TOFU store as they arrived and then forgotten. The store is on
  * disk and keyed by name; what rotation needs is who is here *now*.
  */
+/*
+ * Почтовые ящики, за которыми следим.
+ *
+ * Личная переписка - это комната, чей идентификатор и ключ выводятся из двух
+ * личных ключей. Пока обе стороны в этой комнате, всё идёт как обычно. Если
+ * собеседника там нет, письмо ложится в ящик по слепому адресу, а он забирает
+ * его, когда придёт.
+ *
+ * Беда в том, что «придёт» - это не только «откроет этот чат»: человек может
+ * сидеть в общей комнате и не знать, что ему написали. Поэтому клиент следит
+ * сразу за всеми ящиками, о которых ему сказали, - по одному на контакт, - и
+ * спрашивает их пачкой. Ключ пары приходит снаружи: консольный клиент не
+ * ведёт список контактов, его ведёт интерфейс.
+ */
+#define INBOX_MAX_WATCH 128
+#define INBOX_POLL_MS   20000
+
+typedef struct {
+    char    room[MAX_ROOM];                  /**< pm:… - куда класть сообщения */
+    uint8_t k_pm[KS_KEY_BYTES];              /**< он же ключ комнаты */
+    uint8_t addr[IDENTITY_INBOX_ADDR_BYTES]; /**< слепой адрес */
+} inbox_watch_t;
+
+static inbox_watch_t g_inbox[INBOX_MAX_WATCH];
+static int g_inbox_count = 0;
+static uint64_t g_inbox_next_poll = 0;
+
+/** Срок хранения, о котором сказал сервер: 0 - не хранит ничего. */
+static uint32_t g_inbox_ttl = 0;
+static int g_inbox_ttl_known = 0;
+
 static room_keys_t g_rk;
 static int g_rk_ready = 0;
 
@@ -1267,6 +1298,266 @@ static void rotation_tick(sock_t s, const char *room, const char *myname,
     }
 }
 
+/** Ящик, за которым следим, по его комнате. NULL если такого нет. */
+static inbox_watch_t *inbox_find_room(const char *room) {
+    for (int i = 0; i < g_inbox_count; i++) {
+        if (strcmp(g_inbox[i].room, room) == 0) return &g_inbox[i];
+    }
+    return NULL;
+}
+
+/** …и по адресу, чтобы понять, каким ключом открывать пришедшее письмо. */
+static inbox_watch_t *inbox_find_addr(const uint8_t *addr) {
+    for (int i = 0; i < g_inbox_count; i++) {
+        if (memcmp(g_inbox[i].addr, addr, IDENTITY_INBOX_ADDR_BYTES) == 0) {
+            return &g_inbox[i];
+        }
+    }
+    return NULL;
+}
+
+/** Взять ящик под наблюдение. Повторный вызов обновляет ключ. */
+static int inbox_watch(const char *room, const uint8_t k_pm[KS_KEY_BYTES]) {
+    inbox_watch_t *w = inbox_find_room(room);
+    if (!w) {
+        if (g_inbox_count >= INBOX_MAX_WATCH) return -1;
+        w = &g_inbox[g_inbox_count++];
+        snprintf(w->room, sizeof w->room, "%s", room);
+    }
+    memcpy(w->k_pm, k_pm, KS_KEY_BYTES);
+    if (identity_inbox_addr(k_pm, w->addr) != 0) return -1;
+    /* Спросить сразу, а не через двадцать секунд: человек только что открыл
+     * приложение и ждёт свою почту, а не отсчёта таймера. */
+    g_inbox_next_poll = 0;
+    return 0;
+}
+
+/**
+ * Положить сообщение в ящик собеседника.
+ *
+ * Печатью занимается тот же cf_seal, что и для обычных сообщений, но имя
+ * отправителя в связанных данных фиксировано, а настоящее едет внутри: иначе
+ * получателю пришлось бы знать имя заранее, чтобы открыть письмо, а серверу
+ * это имя пришлось бы показать.
+ */
+static int inbox_send(sock_t s, const inbox_watch_t *w, const char *myname,
+                      const uint8_t *text, size_t tlen) {
+    const size_t namelen = strlen(myname);
+    if (namelen > 255) return -1;
+
+    size_t plen = 1 + namelen + tlen;
+    uint8_t *plain = (uint8_t *)malloc(plen);
+    if (!plain) return -1;
+    plain[0] = (uint8_t)namelen;
+    memcpy(plain + 1, myname, namelen);
+    memcpy(plain + 1 + namelen, text, tlen);
+
+    uint8_t nonce[CRYPTO_NPUBBYTES];
+    randombytes_buf(nonce, sizeof nonce);
+
+    cf_key_t ck;
+    ck.version = 0;
+    memcpy(ck.key, w->k_pm, KS_KEY_BYTES);
+
+    size_t cmax = plen + CF_OVERHEAD_BYTES;
+    uint8_t *cipher = (uint8_t *)malloc(cmax);
+    if (!cipher) { free(plain); return -1; }
+
+    size_t clen = 0;
+    cf_status_t st = cf_seal(&ck, w->room, "inbox", plain, plen, nonce,
+                             cipher, cmax, &clen);
+    sodium_memzero(plain, plen);
+    free(plain);
+    if (st != CF_OK) { free(cipher); return -1; }
+
+    /* [addr(32)][nonce(12)][sealed] - nonce едет с письмом, потому что
+     * открывать его будут не сейчас и не на этом соединении. */
+    size_t blen = IDENTITY_INBOX_ADDR_BYTES + CRYPTO_NPUBBYTES + clen;
+    uint8_t *body = (uint8_t *)malloc(blen);
+    if (!body) { free(cipher); return -1; }
+    memcpy(body, w->addr, IDENTITY_INBOX_ADDR_BYTES);
+    memcpy(body + IDENTITY_INBOX_ADDR_BYTES, nonce, CRYPTO_NPUBBYTES);
+    memcpy(body + IDENTITY_INBOX_ADDR_BYTES + CRYPTO_NPUBBYTES, cipher, clen);
+    free(cipher);
+
+    int rc = send_service_frame(s, w->room, myname,
+                                (uint8_t)MSG_TYPE_INBOX_PUT, body, blen);
+    free(body);
+    return rc;
+}
+
+/** Спросить все ящики разом. */
+static void inbox_poll(sock_t s, const char *room, const char *myname) {
+    if (g_inbox_count == 0) return;
+
+    size_t blen = 2 + (size_t)g_inbox_count * IDENTITY_INBOX_ADDR_BYTES;
+    uint8_t *body = (uint8_t *)malloc(blen);
+    if (!body) return;
+    wr_u16(body, (uint16_t)g_inbox_count);
+    for (int i = 0; i < g_inbox_count; i++) {
+        memcpy(body + 2 + (size_t)i * IDENTITY_INBOX_ADDR_BYTES,
+               g_inbox[i].addr, IDENTITY_INBOX_ADDR_BYTES);
+    }
+    send_service_frame(s, room, myname, (uint8_t)MSG_TYPE_INBOX_FETCH, body, blen);
+    free(body);
+}
+
+/** Подтвердить, что письма получены, - только после того, как они показаны. */
+static void inbox_ack(sock_t s, const char *myname, const inbox_watch_t *w,
+                      const int64_t *ids, size_t n) {
+    if (n == 0) return;
+    size_t blen = IDENTITY_INBOX_ADDR_BYTES + 2 + n * 8;
+    uint8_t *body = (uint8_t *)malloc(blen);
+    if (!body) return;
+    memcpy(body, w->addr, IDENTITY_INBOX_ADDR_BYTES);
+    wr_u16(body + IDENTITY_INBOX_ADDR_BYTES, (uint16_t)n);
+    uint8_t *p = body + IDENTITY_INBOX_ADDR_BYTES + 2;
+    for (size_t i = 0; i < n; i++) {
+        for (int b = 0; b < 8; b++) *p++ = (uint8_t)((ids[i] >> (8 * b)) & 0xFF);
+    }
+    send_service_frame(s, w->room, myname, (uint8_t)MSG_TYPE_INBOX_DELETE,
+                       body, blen);
+    free(body);
+}
+
+/** Разобрать ответ сервера: письма и объявленный срок хранения. */
+static void inbox_handle_result(sock_t s, const char *myname,
+                                const uint8_t *p, size_t len) {
+    if (len < 1 + 4 + 2) return;
+    const uint8_t status = p[0];
+    g_inbox_ttl = rd_u32(p + 1);
+    g_inbox_ttl_known = 1;
+
+    if (status != 0) {
+        /* Единственный статус, о котором стоит сказать вслух: сервер не
+         * хранит ничего, и сообщение никуда не легло. Молчать тут нельзя -
+         * отправитель будет думать, что доставил. */
+        if (status == 1) {
+            printf("[inbox] this relay stores nothing - the message was not "
+                   "delivered because the recipient is offline\n");
+        } else if (status == 3) {
+            printf("[inbox] the recipient's mailbox is full\n");
+        }
+        fflush(stdout);
+        return;
+    }
+
+    uint16_t count = rd_u16(p + 5);
+    const uint8_t *q = p + 7;
+    const uint8_t *end = p + len;
+
+    for (uint16_t i = 0; i < count; i++) {
+        if ((size_t)(end - q) < 8 + IDENTITY_INBOX_ADDR_BYTES + 4) return;
+        int64_t id = 0;
+        for (int b = 0; b < 8; b++) id |= ((int64_t)q[b]) << (8 * b);
+        q += 8;
+        const uint8_t *addr = q; q += IDENTITY_INBOX_ADDR_BYTES;
+        uint32_t clen = rd_u32(q); q += 4;
+        if ((size_t)(end - q) < clen) return;
+        const uint8_t *cipher = q; q += clen;
+
+        inbox_watch_t *w = inbox_find_addr(addr);
+        if (!w) continue;                       /* не наш ящик */
+        if (clen < CRYPTO_NPUBBYTES) continue;
+
+        const uint8_t *nonce = cipher;
+        const uint8_t *sealed = cipher + CRYPTO_NPUBBYTES;
+        const size_t   slen = clen - CRYPTO_NPUBBYTES;
+
+        uint8_t *plain = (uint8_t *)malloc(slen);
+        if (!plain) continue;
+
+        cf_key_t ck;
+        ck.version = 0;
+        memcpy(ck.key, w->k_pm, KS_KEY_BYTES);
+        unsigned long long plen = 0;
+        cf_status_t st = cf_open(&ck, 1, w->room, "inbox", sealed, slen, nonce,
+                                 plain, slen, &plen);
+        if (st != CF_OK || plen < 1) { free(plain); continue; }
+
+        const size_t namelen = plain[0];
+        if (namelen + 1 > plen) { free(plain); continue; }
+        char sender[MAX_NAME];
+        size_t n = namelen < sizeof sender - 1 ? namelen : sizeof sender - 1;
+        memcpy(sender, plain + 1, n);
+        sender[n] = '\0';
+        sanitize_display_inplace(sender, n);
+
+        const uint8_t *text = plain + 1 + namelen;
+        const size_t tlen = plen - 1 - namelen;
+
+        /* Комната печатается вместе с сообщением: письмо пришло не в ту
+         * комнату, в которой мы сидим, и интерфейсу нужно знать, куда его
+         * положить. */
+        printf("[INBOX] %s %s: %.*s\n", w->room, sender, (int)tlen, (const char *)text);
+        fflush(stdout);
+
+        sodium_memzero(plain, slen);
+        free(plain);
+
+        inbox_ack(s, myname, w, &id, 1);
+    }
+}
+
+/**
+ * /inbox-add <комната> <ключ-пары-base64url>
+ *
+ * Список контактов ведёт интерфейс, а не консольный клиент, поэтому ключи
+ * приходят снаружи. Ключ пары - он же ключ личной комнаты, так что
+ * интерфейс уже умеет его выводить.
+ */
+static void handle_inbox_add(const char *arg) {
+    if (!arg) return;
+    char room[MAX_ROOM];
+    char keyb64[128];
+    if (sscanf(arg, "%127s %127s", room, keyb64) != 2) {
+        printf("[inbox] usage: /inbox-add <room> <key-base64url>\n");
+        fflush(stdout);
+        return;
+    }
+    uint8_t key[KS_KEY_BYTES];
+    size_t klen = 0;
+    if (sodium_base642bin(key, sizeof key, keyb64, strlen(keyb64), NULL, &klen,
+                          NULL, sodium_base64_VARIANT_URLSAFE_NO_PADDING) != 0 ||
+        klen != KS_KEY_BYTES) {
+        printf("[inbox] bad key\n");
+        fflush(stdout);
+        return;
+    }
+    if (inbox_watch(room, key) != 0) {
+        printf("[inbox] cannot watch more mailboxes\n");
+    }
+    sodium_memzero(key, sizeof key);
+    fflush(stdout);
+}
+
+/** Пора ли снова спросить почту. */
+static void inbox_tick(sock_t s, const char *room, const char *myname) {
+    if (g_inbox_count == 0) return;
+    const uint64_t now = rot_now_ms();
+    if (now < g_inbox_next_poll) return;
+    g_inbox_next_poll = now + INBOX_POLL_MS;
+    inbox_poll(s, room, myname);
+}
+
+/**
+ * Некому доставить прямо сейчас?
+ *
+ * Это личная комната, и собеседника в ней нет. Тогда сообщение идёт в его
+ * ящик, а не в пустоту: сервер рассылает только тем, кто в комнате, и не
+ * хранит ничего сам.
+ */
+static int inbox_should_use(const char *room) {
+    if (strncmp(room, "pm:", 3) != 0) return 0;
+    if (!inbox_find_room(room)) return 0;
+    for (int i = 0; i < g_roster_count; i++) {
+        if (g_roster[i].present && strcmp(g_roster[i].name, g_name ? g_name : "") != 0) {
+            return 0;                    /* кто-то тут есть - доставим живьём */
+        }
+    }
+    return 1;
+}
+
 /** Take in a rotation somebody else sent. */
 static void rotation_handle_bundle(const char *room, const char *sender,
                                    const uint8_t *payload, size_t plen) {
@@ -1691,6 +1982,14 @@ int recv_and_decrypt(sock_t s, const char *room, const uint8_t *key, const char 
     unsigned long long plen = 0;
     int ok = -1;
 
+    if (is_service_message && msg_type == MSG_TYPE_INBOX_RESULT) {
+        /* Не проверяем комнату: ответ приходит на то соединение, которое
+         * спрашивало, а письма в нём - для других комнат, в этом весь смысл. */
+        inbox_handle_result(s, myname, cipher, clen);
+        free(room_in); free(name); free(cipher); free(plain);
+        return 0;
+    }
+
     if (is_service_message && same_room && msg_type == MSG_TYPE_ROTATION) {
         rotation_handle_bundle(room_in, name, cipher, clen);
         free(room_in); free(name); free(cipher); free(plain);
@@ -2016,6 +2315,10 @@ DWORD WINAPI input_thread(LPVOID param) {
         if (len == 0) continue;
 
         // File transfer commands
+        if (strncmp(line, "/inbox-add ", 11) == 0) {
+            handle_inbox_add(line + 11);
+            continue;
+        }
         if (strncmp(line, "/sendfile ", 10) == 0) {
             handle_file_transfer(line + 10, ctx->key, ctx->room, ctx->name, ctx->s);
             continue;
@@ -2294,6 +2597,7 @@ void run_client(const char *host, uint16_t port, const char *room, const char *n
             }
         }
         rotation_tick(ctx.s, ctx.room, ctx.name, ctx.key);
+        inbox_tick(ctx.s, ctx.room, ctx.name);
     }
     WaitForSingleObject(hThread, INFINITE);
     CloseHandle(hThread);
@@ -2308,6 +2612,7 @@ void run_client(const char *host, uint16_t port, const char *room, const char *n
         int r = select(maxfd, &rfds, NULL, NULL, &tv);
         if (r < 0) { if (errno == EINTR) continue; break; }
         rotation_tick(s, room, name, active_key);
+        inbox_tick(s, room, name);
         if (FD_ISSET(s, &rfds)) {
             int rc = recv_and_decrypt(s, room, active_key, name);
             if (rc < 0) { printf("[client] disconnected\n"); break; }
@@ -2322,6 +2627,11 @@ void run_client(const char *host, uint16_t port, const char *room, const char *n
             if (len == 0) { free(line); continue; }
 
             // File transfer commands
+            if (strncmp(line, "/inbox-add ", 11) == 0) {
+                handle_inbox_add(line + 11);
+                free(line);
+                continue;
+            }
             if (strncmp(line, "/sendfile ", 10) == 0) {
                 handle_file_transfer(line + 10, active_key, room, name, s);
                 free(line);
@@ -2362,7 +2672,13 @@ void run_client(const char *host, uint16_t port, const char *room, const char *n
             }
 
             int rc;
-            if (g_has_identity) {
+            if (inbox_should_use(room)) {
+                /* Ответ сервера скажет, легло ли письмо: он же сообщит, что
+                 * хранение выключено, и тогда пользователь узнает правду, а
+                 * не увидит две галочки. */
+                rc = inbox_send(s, inbox_find_room(room), name,
+                                (const uint8_t *)line, len);
+            } else if (g_has_identity) {
                 rc = send_signed_ciphertext(s, room, name, active_key,
                                             (uint8_t*)line, len,
                                             g_identity_sk, g_identity_pk);

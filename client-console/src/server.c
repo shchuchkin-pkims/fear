@@ -792,7 +792,11 @@ static void send_inbox_result(sock_t fd, const char *room, uint16_t room_len,
                               uint8_t status,
                               const inbox_item_t *items, size_t nitems) {
     size_t payload_len = 1 + 4 + 2;
-    for (size_t i = 0; i < nitems; i++) payload_len += 8 + 4 + items[i].len;
+    /* Адрес едет с каждым письмом: запрос идёт пачкой по всем контактам, и
+     * без адреса получатель не поймёт, из какого ящика письмо, каким ключом
+     * его открывать и что потом удалять. */
+    for (size_t i = 0; i < nitems; i++)
+        payload_len += 8 + INBOX_ADDR_BYTES + 4 + items[i].len;
 
     uint8_t *payload = (uint8_t *)malloc(payload_len);
     if (!payload) return;
@@ -803,6 +807,7 @@ static void send_inbox_result(sock_t fd, const char *room, uint16_t room_len,
     wr_u16(w, (uint16_t)nitems); w += 2;
     for (size_t i = 0; i < nitems; i++) {
         for (int b = 0; b < 8; b++) *w++ = (uint8_t)((items[i].id >> (8 * b)) & 0xFF);
+        memcpy(w, items[i].addr, INBOX_ADDR_BYTES); w += INBOX_ADDR_BYTES;
         wr_u32(w, (uint32_t)items[i].len); w += 4;
         memcpy(w, items[i].ciphertext, items[i].len);
         w += items[i].len;

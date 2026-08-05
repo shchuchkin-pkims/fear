@@ -190,6 +190,7 @@ typedef enum {
 /** Одна запись, как её отдаёт server_db_inbox_fetch. */
 typedef struct {
     int64_t  id;
+    uint8_t  addr[INBOX_ADDR_BYTES];
     uint8_t *ciphertext;   /**< malloc'нуто, освобождает вызывающий */
     size_t   len;
     int64_t  created_at;
