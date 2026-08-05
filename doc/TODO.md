@@ -13,7 +13,7 @@
 | **v0.4.3** | RTT latency measurement, video call latency fixes | Done |
 | **v0.5.0** | Phase A/B: identity handles, encrypted backup (file + QR), local history, server SQLite, contacts blob, DM | Done |
 | **v0.5.1** | Audit remediation (5 Critical), signed releases, hardened relay | Done |
-| **v0.6.0** | Phase C-F: key rotation, metadata privacy, offline inbox, push | In progress |
+| **v0.6.0** | Phase C-F: ротация ключа, приватность метаданных (комната и имя), офлайн-ящик, уведомления без Google, миграции базы вместо стирания, один интерфейс, шумоподавление, STUN, TLS | Dev |
 
 ---
 

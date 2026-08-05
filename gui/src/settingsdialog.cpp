@@ -256,14 +256,10 @@ void SettingsDialog::setupAudioTab(QTabWidget *tabs) {
     QLabel *directNote = new QLabel(
         "With a STUN server (for example stun.l.google.com:19302) calls try to "
         "go straight to the other person: shorter path, and the relay operator "
-        "sees no media.
-
-"
+        "sees no media.\n\n"
         "The cost is real: a direct call shows your IP address to the person "
         "you are calling, and the STUN server learns it too. Through the relay "
-        "neither of them does. Leave this empty if that matters more to you.
-
-"
+        "neither of them does. Leave this empty if that matters more to you.\n\n"
         "Behind a symmetric NAT the direct path will not open anyway and the "
         "call falls back to the relay by itself.");
     directNote->setWordWrap(true);

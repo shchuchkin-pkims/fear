@@ -132,11 +132,13 @@ ConnectionDialog::ConnectionDialog(ProfileSettings *profile,
     m_host = new QComboBox(this);
     m_host->setEditable(true);
     m_host->setInsertPolicy(QComboBox::NoInsert);
-    m_host->addItem(tr("fear-project.ru — Russia (Moscow)"),     QStringLiteral("fear-project.ru"));
+    /* Меппел первым: это сервер по умолчанию. Первый пункт списка - и есть
+     * то, что увидит человек, никогда не открывавший этот список. */
     m_host->addItem(tr("77.221.145.132 — Netherlands (Meppel)"), QStringLiteral("77.221.145.132"));
+    m_host->addItem(tr("fear-project.ru — Russia (Moscow)"),     QStringLiteral("fear-project.ru"));
     m_host->insertSeparator(m_host->count());
     m_host->addItem(tr("Custom server… (type below)"),            QStringLiteral(""));
-    m_host->lineEdit()->setPlaceholderText(tr("e.g. fear-project.ru or 192.168.1.1"));
+    m_host->lineEdit()->setPlaceholderText(tr("or type your own: host name or address"));
     connect(m_host, QOverload<int>::of(&QComboBox::activated), this, [this](int idx) {
         const QString preset = m_host->itemData(idx).toString();
         if (!preset.isEmpty()) m_host->setEditText(preset);
@@ -241,7 +243,9 @@ void ConnectionDialog::updateModeUi() {
 void ConnectionDialog::loadFromSettings() {
     QSettings s("fear-messenger", "fear-gui");
     s.beginGroup("connect");
-    m_host->setCurrentText(s.value("host", "fear-project.ru").toString());
+    /* Запомненный адрес важнее умолчания: человек, выбравший себе сервер,
+     * не должен возвращаться к чужому после каждого запуска. */
+    m_host->setCurrentText(s.value("host", "77.221.145.132").toString());
     m_port->setText(s.value("port", 8888).toString());
     m_room->setText(s.value("room", "general").toString());
     m_name->setText(s.value("name").toString());

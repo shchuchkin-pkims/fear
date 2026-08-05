@@ -330,8 +330,7 @@ void VideoCallManager::onProcessOutput() {
     emit this->output(out);
 
     /* Свой адрес снаружи - см. AudioCallManager. */
-    for (const QString &line : out.split(QLatin1Char('
-'), Qt::SkipEmptyParts)) {
+    for (const QString &line : out.split(QLatin1Char('\n'), Qt::SkipEmptyParts)) {
         const QString t = line.trimmed();
         if (!t.startsWith(QStringLiteral("[CANDIDATE] "))) continue;
         const QStringList parts = t.mid(12).split(QLatin1Char(' '), Qt::SkipEmptyParts);

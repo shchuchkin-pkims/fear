@@ -23,7 +23,7 @@ find_package(Qt6 REQUIRED COMPONENTS Widgets Network Sql Concurrent)
 
 # Bake version into GUI for the auto-update check (must match PROGRAM_VERSION in
 # client-console/src/main.c).
-add_compile_definitions(FEAR_VERSION="0.5.0")
+add_compile_definitions(FEAR_VERSION="0.6.0")
 
 # Получаем путь к windeployqt (только для Windows)
 if(WIN32)
