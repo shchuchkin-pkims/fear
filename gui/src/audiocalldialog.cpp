@@ -101,7 +101,12 @@ void AudioCallDialog::onStartCall() {
     /* Announce the call to the room first: the invite carries the call_id
      * every media key is bound to, and the far side cannot derive a
      * matching key without it. */
-    if (backend) backend->sendCallInvite(remoteIp, remotePort, /*video=*/false);
+    /* Только когда звоним сами. Отвечая на приглашение, мы уже держим его
+     * идентификатор - нарисовав новый, разошлись бы в ключах и не услышали
+     * бы друг друга. */
+    if (backend && audioManager && audioManager->callId.isEmpty()) {
+        backend->sendCallInvite(remoteIp, remotePort, /*video=*/false);
+    }
 
     if (relayCheck->isChecked() && backend) {
         // Relay mode: route through server

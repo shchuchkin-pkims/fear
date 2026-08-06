@@ -598,7 +598,16 @@ void Backend::parseClientOutput(const QString &s) {
         // at the parse, so what reaches here is safe to act on.
         {
             static const QRegularExpression inviteRe(
-                QStringLiteral("^\\[CALL_INVITE\\] (\\S+) ([0-9a-f]{32}) (\\S+) (\\d+) (audio|video)$"));
+                /* Имя, а не метка: с тех пор как клиент разворачивает метку
+                 * сессии в отображаемое имя, здесь бывают пробелы - «Татьяна
+                 * Щучкина». Прежний \\S+ такую строку не разбирал вовсе, и
+                 * приглашение молча пропадало: на телефоне звонок идёт, на
+                 * ПК не происходит ничего.
+                 *
+                 * Жадный (.+) безопасен: всё, что за именем, имеет строгую
+                 * форму - 32 шестнадцатеричных знака, хост, порт, вид
+                 * звонка, - и конец строки закреплён. */
+                QStringLiteral("^\\[CALL_INVITE\\] (.+) ([0-9a-f]{32}) (\\S+) (\\d+) (audio|video)$"));
             if (auto m = inviteRe.match(t); m.hasMatch()) {
                 const QString hostHint = (m.captured(3) == QStringLiteral("-"))
                                              ? QString() : m.captured(3);

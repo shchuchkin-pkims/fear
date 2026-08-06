@@ -134,6 +134,22 @@ void VideoCallDialog::onStartCall() {
     int audioInput = inputDeviceCombo->currentData().toInt();
     int audioOutput = outputDeviceCombo->currentData().toInt();
 
+    /*
+     * Объявить звонок комнате - и только если мы его начинаем.
+     *
+     * Идентификатор звонка связывает все ключи мультимедиа, и без него
+     * процесс звонка отказывается стартовать: «--call-id is required».
+     * Здесь этого вызова не было вовсе, и видеозвонок с ПК не начинался
+     * никогда - хотя тот же код у голосового звонка был на месте.
+     *
+     * Условие важно: когда мы отвечаем на чужое приглашение,
+     * идентификатор уже проставлен из него, и рисовать новый нельзя -
+     * ключи разойдутся, и собеседник не услышит ничего.
+     */
+    if (backend && videoManager && videoManager->callId.isEmpty()) {
+        backend->sendCallInvite(remoteIp, remotePort, /*video=*/true);
+    }
+
     if (relayCheck->isChecked() && backend) {
         // Relay mode: route through server
         if (videoManager->startRelay(remoteIp, remotePort,

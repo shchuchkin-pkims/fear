@@ -1708,6 +1708,9 @@ void ChatWindow::onVideoCallRequested() {
             tr("Connect to a room first."));
         return;
     }
+    /* То же, что и у голосового: своя кнопка - свой идентификатор. */
+    if (m_backend->videoManager) m_backend->videoManager->callId.clear();
+
     VideoCallDialog dlg(m_backend->videoManager, m_backend, this, m_backend->roomKeyHex);
     dlg.exec();
 }
