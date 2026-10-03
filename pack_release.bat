@@ -52,6 +52,11 @@ REM Copy all files from build directory
 echo   * Copying all files from build directory...
 xcopy /E /I /Q "build\*" "%TEMP_DIR%\" >nul 2>&1
 
+REM GPL requires shipping the license text with the program
+copy "LICENSE" "%TEMP_DIR%\" >nul 2>&1
+copy "LICENSE.GPL-3.0" "%TEMP_DIR%\" >nul 2>&1
+copy "LICENSING.md" "%TEMP_DIR%\" >nul 2>&1
+
 REM Copy only manual.pdf from documentation
 if exist "doc\manual.pdf" (
     mkdir "%TEMP_DIR%\doc"

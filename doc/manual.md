@@ -11,7 +11,7 @@
 
 <div align="center">
 
-![F.E.A.R. Project](./images/logo.png)
+![F.E.A.R. Project](./images/banner_small.png)
 </div>
 
 ## Table of Contents

@@ -56,6 +56,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && useradd --system --no-create-home --shell /usr/sbin/nologin fear
 
 COPY --from=build /out/fear /usr/local/bin/fear
+# Текст лицензии едет вместе с программой: так требует GPL, а AGPL - ещё и
+# ссылки на исходники для тех, кто пользуется сервером по сети.
+COPY LICENSE LICENSE.GPL-3.0 LICENSING.md /usr/share/doc/fear/
+LABEL org.opencontainers.image.title="F.E.A.R. relay" \
+      org.opencontainers.image.licenses="AGPL-3.0-or-later" \
+      org.opencontainers.image.source="https://github.com/shchuchkin-pkims/fear"
 
 USER fear
 WORKDIR /home/fear

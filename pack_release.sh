@@ -57,6 +57,9 @@ if [ -f "build/fear_gui" ]; then
     echo "  ✓ GUI included"
 fi
 
+# GPL требует отдавать текст лицензии вместе с программой.
+cp LICENSE LICENSE.GPL-3.0 LICENSING.md "$TEMP_DIR/" 2>/dev/null || true
+
 # Copy only manual.pdf from documentation
 if [ -f "doc/manual.pdf" ]; then
     mkdir -p "$TEMP_DIR/doc"
