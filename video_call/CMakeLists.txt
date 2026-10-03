@@ -154,9 +154,10 @@ if(WIN32)
         endif()
 
         # Windows system libraries required by static FFmpeg (dshow, mf, tls, etc.)
+        # psapi: FFmpeg names it among the dshow input's extralibs.
         list(APPEND FFMPEG_LIBS
             bcrypt secur32 ncrypt crypt32 strmiids mfplat mfuuid oleaut32 shlwapi
-            user32 gdi32 advapi32 shell32
+            user32 gdi32 advapi32 shell32 psapi
         )
     else()
         message(STATUS "FFmpeg: using shared libraries (DLLs required at runtime)")
@@ -214,18 +215,37 @@ else()
         ${LIBSWSCALE_INCLUDE_DIRS}
         ${LIBAVUTIL_INCLUDE_DIRS}
     )
-    target_link_libraries(video_call PRIVATE
-        ${LIBAVDEVICE_LIBRARIES}
-        ${LIBAVFORMAT_LIBRARIES}
-        ${LIBAVCODEC_LIBRARIES}
-        ${LIBSWSCALE_LIBRARIES}
-        ${LIBAVUTIL_LIBRARIES}
-    )
 
     # SDL3
     pkg_check_modules(SDL3 REQUIRED sdl3)
     target_include_directories(video_call PRIVATE ${SDL3_INCLUDE_DIRS})
-    target_link_libraries(video_call PRIVATE ${SDL3_LIBRARIES})
+
+    # Релизная сборка (CI) берёт FFmpeg и SDL3 статическими: SDL3 в Ubuntu
+    # 22.04 нет вовсе, а системный FFmpeg привязал бы программу к сонейму
+    # одной версии дистрибутива. Статической библиотеке нужны и её
+    # собственные зависимости - их называет pkg-config --static, вместе с
+    # путями (*_STATIC_LDFLAGS). См. .github/scripts/linux-media-deps.sh.
+    option(FEAR_STATIC_MEDIA "Link FFmpeg and SDL3 statically (pkg-config --static)" OFF)
+    if(FEAR_STATIC_MEDIA)
+        target_link_libraries(video_call PRIVATE
+            ${LIBAVDEVICE_STATIC_LDFLAGS}
+            ${LIBAVFORMAT_STATIC_LDFLAGS}
+            ${LIBAVCODEC_STATIC_LDFLAGS}
+            ${LIBSWSCALE_STATIC_LDFLAGS}
+            ${LIBAVUTIL_STATIC_LDFLAGS}
+            ${SDL3_STATIC_LDFLAGS}
+        )
+        message(STATUS "video_call: static FFmpeg and SDL3")
+    else()
+        target_link_libraries(video_call PRIVATE
+            ${LIBAVDEVICE_LIBRARIES}
+            ${LIBAVFORMAT_LIBRARIES}
+            ${LIBAVCODEC_LIBRARIES}
+            ${LIBSWSCALE_LIBRARIES}
+            ${LIBAVUTIL_LIBRARIES}
+            ${SDL3_LIBRARIES}
+        )
+    endif()
 
     # Additional Linux libraries
     target_link_libraries(video_call PRIVATE pthread m)

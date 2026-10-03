@@ -1,15 +1,25 @@
 name: Build Windows release
 
-# Сборка ПК-клиента под Windows. Без подписи кода (sertificat не куплен,
-# Windows SmartScreen покажет «Неизвестный издатель»; обходной путь
-# описан в Wiki → Installation-Desktop). Артефакт — zip с fear_gui.exe,
-# fear.exe, развёрнутыми Qt-DLL и системными зависимостями MSYS2/MinGW.
+# Сборка ПК-клиента под Windows: GUI, консольный клиент и всё, что GUI
+# запускает, - программы звонков, обновления, обмена ключами. Раскладка
+# архива та, которую ждёт программа обновления: fear_gui.exe в корне,
+# программы в bin/, рядом с каждой - её DLL.
+#
+# До 0.6.0 здесь собирались только fear.exe и fear_gui.exe, да ещё не там,
+# где GUI их искал: архив со страницы релизов не мог даже переписываться, а
+# звонков в нём не было вовсе. Зависимости звонков разработчик держит в
+# lib/, которой нет в git; здесь те же библиотеки берутся из MSYS2
+# (.github/scripts/windows-stage-deps.sh), а FFmpeg собирается минимальным и
+# статическим тем же скриптом, что у разработчика (lib/build-ffmpeg-static.sh).
+#
+# Без подписи кода (сертификат не куплен, Windows SmartScreen покажет
+# «Неизвестный издатель»; обходной путь описан в Wiki → Installation-Desktop).
 #
 # Триггеры:
-#   - push в main или dev — собирает и кладёт zip как build artifact
+#   - push в main или dev - собирает и кладёт zip как build artifact
 #     (хранится 90 дней, ссылка в логе run-а);
-#   - тег v* — дополнительно прикладывает zip к GitHub Release;
-#   - workflow_dispatch — кнопка «Run workflow» в Actions.
+#   - тег v* - дополнительно прикладывает zip к GitHub Release;
+#   - workflow_dispatch - кнопка «Run workflow» в Actions.
 
 on:
   push:
@@ -17,14 +27,25 @@ on:
     tags: ['v*']
     paths:
       - 'CMakeLists.txt'
+      - 'cmake/**'
       - 'client-console/**'
       - 'gui/**'
       - 'identity/**'
+      - 'audio_call/**'
+      - 'video_call/**'
+      - 'updater/**'
+      - 'key-exchange/**'
+      - 'doc/manual.pdf'
+      - 'lib/build-ffmpeg-static.sh'
+      - '.github/scripts/windows-stage-deps.sh'
       - '.github/workflows/windows.yml'
   workflow_dispatch:
 
 permissions:
   contents: write
+
+env:
+  FFMPEG_TAG: n8.0.3
 
 jobs:
   build:
@@ -51,30 +72,63 @@ jobs:
             mingw-w64-x86_64-cmake
             mingw-w64-x86_64-ninja
             mingw-w64-x86_64-pkgconf
+            mingw-w64-x86_64-nasm
+            mingw-w64-x86_64-yasm
             mingw-w64-x86_64-libsodium
             mingw-w64-x86_64-sqlite3
+            mingw-w64-x86_64-openssl
             mingw-w64-x86_64-qrencode
             mingw-w64-x86_64-zbar
             mingw-w64-x86_64-qt6-base
             mingw-w64-x86_64-qt6-tools
+            mingw-w64-x86_64-opus
+            mingw-w64-x86_64-portaudio
+            mingw-w64-x86_64-sdl3
+            mingw-w64-x86_64-curl
+            mingw-w64-x86_64-libvpx
+            mingw-w64-x86_64-zlib
+            mingw-w64-x86_64-libiconv
 
       - name: Show toolchain versions
         run: |
           gcc --version | head -n1
           cmake --version | head -n1
           ninja --version
-          pkg-config --modversion libsodium libqrencode zbar sqlite3 || true
+          pkg-config --modversion libsodium libqrencode zbar sqlite3 opus portaudio-2.0 sdl3 libcurl vpx || true
           ls -1 /mingw64/bin/windeployqt*.exe 2>/dev/null || echo "windeployqt not found in /mingw64/bin"
 
-      - name: Configure root project (console client + server)
+      # The FFmpeg build takes several minutes; its result only changes with
+      # the version or the script.
+      - name: Restore minimal static FFmpeg
+        id: ffmpeg-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            lib/ffmpeg-win64/lib
+            lib/ffmpeg-win64/include
+            lib/libvpx
+          key: windows-ffmpeg-${{ env.FFMPEG_TAG }}-${{ hashFiles('lib/build-ffmpeg-static.sh') }}
+
+      - name: Build minimal static FFmpeg
+        if: steps.ffmpeg-cache.outputs.cache-hit != 'true'
+        run: |
+          set -e
+          git clone --quiet --depth 1 --branch "$FFMPEG_TAG" \
+            https://github.com/FFmpeg/FFmpeg.git lib/ffmpeg-win64
+          FEAR_NO_PACMAN=1 bash lib/build-ffmpeg-static.sh
+
+      - name: Stage MSYS2 libraries into lib/
+        run: bash .github/scripts/windows-stage-deps.sh
+
+      - name: Configure root project
         run: |
           cmake -S . -B build \
             -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
-            -DFEAR_GUI_ONLY=ON
+            -DFEAR_BUILD_TESTS=OFF
 
-      - name: Build console client (fear.exe)
-        run: cmake --build build --target fear -j
+      - name: Build console client, calls, updater, key-exchange
+        run: cmake --build build --target fear audio_call video_call updater key-exchange -j
 
       # gui/src/ — отдельный CMake-проект (не add_subdirectory из корневого).
       # Конфигурируем его второй раз. LIBSODIUM_PATH не указывает на
@@ -92,9 +146,16 @@ jobs:
       - name: Stage release directory
         run: |
           set -e
-          mkdir -p release/fear
-          cp build/bin/fear.exe       release/fear/fear.exe
-          cp build/fear_gui.exe       release/fear/fear_gui.exe
+          R=release/fear
+          mkdir -p "$R/bin" "$R/doc"
+          cp build/fear_gui.exe "$R/"
+          for p in fear audio_call video_call updater key-exchange; do
+            cp "build/bin/$p.exe" "$R/bin/"
+          done
+          cp updater/updater.conf updater/cacert.pem "$R/bin/"
+          cp doc/manual.pdf "$R/doc/"
+          # GPL требует отдавать текст лицензии вместе с программой.
+          cp LICENSE LICENSE.GPL-3.0 LICENSING.md "$R/"
 
           # Run windeployqt to bundle Qt DLLs and plugins next to the exe.
           # Pick whichever name MSYS2 ships under: windeployqt6.exe in newer
@@ -116,52 +177,92 @@ jobs:
             --no-system-d3d-compiler \
             --no-opengl-sw \
             --compiler-runtime \
-            "release/fear/fear_gui.exe"
+            "$R/fear_gui.exe"
 
-          # Copy MinGW + system DLLs that windeployqt does not pick up.
-          # We ldd-walk both binaries and pick anything from /mingw64/bin.
-          missing_dlls() {
-            local exe="$1"
-            ldd "$exe" 2>/dev/null \
-              | awk '$3 ~ "/mingw64/bin/" {print $3}' \
-              | sort -u
-          }
-          for exe in release/fear/fear.exe release/fear/fear_gui.exe; do
-            for dll in $(missing_dlls "$exe"); do
-              dst="release/fear/$(basename "$dll")"
-              if [ ! -f "$dst" ]; then
-                cp -v "$dll" "$dst"
-              fi
+          # DLLs from MSYS2 go next to whatever loads them: Windows looks for
+          # a DLL in the directory of the program first, and fear_gui.exe and
+          # the programs in bin/ are in different directories. ldd lists the
+          # whole chain, so one pass per file is enough. Qt plugins load
+          # their DLLs from the directory of fear_gui.exe.
+          copy_deps() {
+            local dir="$1"; shift
+            for f in "$@"; do
+              for dll in $(ldd "$f" 2>/dev/null | awk '$3 ~ "^/mingw64/bin/" {print $3}' | sort -u); do
+                [ -f "$dir/$(basename "$dll")" ] || cp -v "$dll" "$dir/"
+              done
             done
-          done
+          }
+          copy_deps "$R" "$R/fear_gui.exe" $(find "$R" -name '*.dll' -not -path "$R/bin/*")
+          copy_deps "$R/bin" "$R"/bin/*.exe
 
-          # Extra runtime files used by fear_gui.exe at runtime
-          # (resources are baked into qrc, but a README is useful).
           {
-            printf '%s\n' "F.E.A.R. Messenger — Windows portable build"
+            printf '%s\n' "F.E.A.R. Messenger - Windows build"
             printf '\n'
-            printf '%s\n' "Run fear_gui.exe to start the graphical client."
-            printf '%s\n' "The console client (fear.exe) is included for advanced use."
+            printf '%s\n' "Run fear_gui.exe to start the graphical client. The programs it starts"
+            printf '%s\n' "are in bin\\: fear.exe (console client and relay), audio_call.exe,"
+            printf '%s\n' "video_call.exe, updater.exe, key-exchange.exe. The manual is doc\\manual.pdf."
+            printf '\n'
+            printf '%s\n' "Keep the layout as it is: the GUI looks for its programs in bin\\,"
+            printf '%s\n' "and the updater unpacks a new release over this folder."
             printf '\n'
             printf '%s\n' "This build is unsigned. Windows SmartScreen will warn the first time"
             printf '%s\n' "you run it: click 'More info' -> 'Run anyway'."
             printf '\n'
             printf '%s\n' "See https://fear-project.ru and the project Wiki for documentation."
-          } > release/fear/README.txt
+            printf '\n'
+            printf '%s\n' "F.E.A.R. is free software: the clients are GPL-3.0-or-later (LICENSE.GPL-3.0),"
+            printf '%s\n' "the console client and server AGPL-3.0-or-later (LICENSE). See LICENSING.md."
+          } > "$R/README.txt"
 
-          ls -la release/fear/
+          find "$R" -maxdepth 2 -type f | sort
+
+      # What a person downloading the archive would hit first: a DLL that is
+      # not there. Every DLL any program or plugin imports has to sit next
+      # to the program that loads it or be part of Windows - checked from the
+      # import tables, without relying on what happens to be on PATH here.
+      # Then the programs are run with PATH cut down to Windows itself.
+      - name: Check the staged programs
+        run: |
+          set -e
+          R=release/fear
+          bad=0
+          check_imports() {
+            local dir="$1"; shift
+            for f in "$@"; do
+              for dll in $(objdump -p "$f" | awk '/DLL Name:/ {print $3}'); do
+                case "${dll,,}" in api-ms-win-*|ext-ms-*) continue ;; esac
+                [ -f "$dir/$dll" ] && continue
+                [ -f "/c/Windows/System32/$dll" ] && continue
+                echo "::error::$f imports $dll, which is neither in $dir nor in Windows"
+                bad=1
+              done
+            done
+          }
+          check_imports "$R" "$R/fear_gui.exe" $(find "$R" -name '*.dll' -not -path "$R/bin/*")
+          check_imports "$R/bin" "$R"/bin/*.exe $(find "$R/bin" -name '*.dll')
+          [ "$bad" -eq 0 ]
+
+          WINPATH=/c/Windows/System32:/c/Windows:/c/Windows/System32/Wbem
+          PATH="$WINPATH" "$R/bin/fear.exe" --version
+          PATH="$WINPATH" "$R/bin/video_call.exe" listdevices
+          PATH="$WINPATH" "$R/bin/audio_call.exe" listdevices
 
       - name: Make zip
         shell: pwsh
         run: |
           $tag = "${{ github.ref_name }}"
           $sha = "${{ github.sha }}".Substring(0, 7)
+          # Имя обязано начинаться с «fear-windows-x86_64»: так его ищет
+          # программа обновления (asset_prefix + платформа). С «x64» она не
+          # находила ни одного релиза - обновление на Windows не работало.
           if ("${{ github.ref }}" -like "refs/tags/v*") {
-            $name = "fear-windows-x64-$tag.zip"
+            $name = "fear-windows-x86_64-$tag.zip"
           } else {
             # Sanitise: branch names like "dev"/"main" become part of filename
-            $name = ("fear-windows-x64-$tag-$sha.zip") -replace '/', '_'
+            $name = ("fear-windows-x86_64-$tag-$sha.zip") -replace '/', '_'
           }
+          # Содержимое - в корне архива: программа обновления распаковывает
+          # его поверх каталога установки как есть.
           Compress-Archive -Path "release/fear/*" -DestinationPath "release/$name"
           echo "ZIP_NAME=$name" >> $env:GITHUB_ENV
 
