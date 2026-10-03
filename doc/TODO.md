@@ -20,7 +20,7 @@
 ## Completed
 
 ### v0.6.0 - Phases C-F, complete release archives
-Released notes: [release-notes/v0.6.0.md](release-notes/v0.6.0.md). The
+Release notes: [release-notes/v0.6.0.md](release-notes/v0.6.0.md). The
 phases themselves are described under In Progress below. Landed after the
 v0.5.1 tag, and recorded here because the v0.5.1 section used to claim them:
 - [x] BLOB_GET is owner-only via a signed one-shot challenge (M10) - server,
