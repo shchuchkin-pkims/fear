@@ -69,7 +69,7 @@ jobs:
       # result only changes when the script (and the versions in it) do.
       - name: Restore static media libraries
         id: media-cache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: deps
           key: linux-media-ubuntu22-${{ hashFiles('.github/scripts/linux-media-deps.sh') }}
@@ -77,6 +77,15 @@ jobs:
       - name: Build static media libraries
         if: steps.media-cache.outputs.cache-hit != 'true'
         run: bash .github/scripts/linux-media-deps.sh deps
+
+      # Saved right away rather than at the end of the job: a later step
+      # failing would otherwise throw away a build that did not change.
+      - name: Save static media libraries
+        if: steps.media-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: deps
+          key: ${{ steps.media-cache.outputs.cache-primary-key }}
 
       - name: Configure root project
         run: |

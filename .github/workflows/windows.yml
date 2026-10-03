@@ -101,7 +101,7 @@ jobs:
       # the version or the script.
       - name: Restore minimal static FFmpeg
         id: ffmpeg-cache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: |
             lib/ffmpeg-win64/lib
@@ -116,6 +116,18 @@ jobs:
           git clone --quiet --depth 1 --branch "$FFMPEG_TAG" \
             https://github.com/FFmpeg/FFmpeg.git lib/ffmpeg-win64
           FEAR_NO_PACMAN=1 bash lib/build-ffmpeg-static.sh
+
+      # Saved right away rather than at the end of the job: a later step
+      # failing would otherwise throw away a build that did not change.
+      - name: Save minimal static FFmpeg
+        if: steps.ffmpeg-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            lib/ffmpeg-win64/lib
+            lib/ffmpeg-win64/include
+            lib/libvpx
+          key: ${{ steps.ffmpeg-cache.outputs.cache-primary-key }}
 
       - name: Stage MSYS2 libraries into lib/
         run: bash .github/scripts/windows-stage-deps.sh

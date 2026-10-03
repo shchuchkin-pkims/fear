@@ -17,6 +17,11 @@
 # args: [1] fear  [2] video_call
 set -u
 
+# Окно звонку не нужно, но SDL_Init требует видеодрайвер и без --no-video:
+# на машине без дисплея (CI) звонок иначе выходит сразу, а на машине с
+# дисплеем тест лез бы в сеанс того, кто за ней сидит.
+export SDL_VIDEODRIVER=dummy
+
 FEAR_BIN=$(readlink -f "${1:?usage: call_quit.sh /path/to/fear /path/to/video_call}")
 VC_BIN=$(readlink -f "${2:?missing video_call path}")
 
