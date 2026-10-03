@@ -124,7 +124,10 @@ jobs:
           cp LICENSE LICENSE.GPL-3.0 LICENSING.md "$R/"
           strip --strip-unneeded "$R/fear_gui" "$R"/bin/fear "$R"/bin/audio_call \
             "$R"/bin/video_call "$R"/bin/updater "$R"/bin/key-exchange
-          chmod +x "$R/fear_gui" "$R"/bin/*
+          chmod 755 "$R/fear_gui" "$R"/bin/fear "$R"/bin/audio_call \
+            "$R"/bin/video_call "$R"/bin/updater "$R"/bin/key-exchange
+          chmod 644 "$R"/bin/updater.conf "$R"/bin/cacert.pem "$R"/doc/manual.pdf \
+            "$R"/LICENSE "$R"/LICENSE.GPL-3.0 "$R"/LICENSING.md
 
           # The packages behind the libraries the programs link directly
           # (NEEDED), so README names them instead of guessing; apt brings
@@ -141,7 +144,7 @@ jobs:
                      path=$(printf '%s\n' "$deps" | awk -v so="$so" '$1 == so && $3 ~ /^\// {print $3}')
                      if [ -n "$path" ]; then owner "$path" | head -1 | cut -d: -f1 || true; fi
                    done
-                 done | sort -u | { grep -vE '^(libc6|libgcc-s1|libstdc\+\+6)$' || true; } | tr '\n' ' ')
+                 done | sort -u | { grep -vE '^(libc6|libgcc-s1|libstdc\+\+6)$' || true; } | xargs)
           echo "Runtime packages: $pkgs"
 
           {

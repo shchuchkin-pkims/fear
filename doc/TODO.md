@@ -19,13 +19,10 @@
 
 ## Completed
 
-### v0.5.1 - Audit remediation, test infrastructure, Phase C groundwork
-- [x] All five Critical audit findings (memory corruption in the media path,
-      server BLOB_PUT, desktop FILE_START; ECDH MITM bypass)
-- [x] Signed releases: Ed25519 signature in CI, mandatory verification in the
-      updater, Zip-Slip archives rejected
-- [x] Relay hardening: I/O timeouts, per-IP connection cap, blob quotas,
-      sender anti-spoofing
+### v0.6.0 - Phases C-F, complete release archives
+Released notes: [release-notes/v0.6.0.md](release-notes/v0.6.0.md). The
+phases themselves are described under In Progress below. Landed after the
+v0.5.1 tag, and recorded here because the v0.5.1 section used to claim them:
 - [x] BLOB_GET is owner-only via a signed one-shot challenge (M10) - server,
       desktop and Android
 - [x] Onboarding: identity created on first run, Connect no longer hard-locks
@@ -36,6 +33,19 @@
       test, and a protocol test for M10, all wired into ctest
 - [x] CI: those tests run on every push to dev/main; Android runs its JVM unit
       tests before building the APK
+- [x] Release archives that work: every program the GUI starts, in the layout
+      it and the updater expect; static FFmpeg and SDL3 on Linux, MSYS2 and a
+      minimal static FFmpeg on Windows; both checked in CI before packaging
+- [x] Live four-device test (two desktops, two phones): text, voice and video
+      12/12 each way; the relay sends media only to call connections
+
+### v0.5.1 - Audit remediation
+- [x] All five Critical audit findings (memory corruption in the media path,
+      server BLOB_PUT, desktop FILE_START; ECDH MITM bypass)
+- [x] Signed releases: Ed25519 signature in CI, mandatory verification in the
+      updater, Zip-Slip archives rejected
+- [x] Relay hardening: I/O timeouts, per-IP connection cap, blob quotas,
+      sender anti-spoofing
 
 ### v0.4.3 — RTT Latency & Video Call Improvements
 - [x] RTT ping/pong measurement in video calls (StatsPayload with hold-time compensation)
@@ -439,6 +449,23 @@
 ---
 
 ## Changelog
+
+### v0.6.0
+
+Not compatible with v0.5.x: rooms travel hashed, participants as session
+tags, chat under the epoch key schedule, calls under HELLO2 and per-sender
+keys. Full notes: [release-notes/v0.6.0.md](release-notes/v0.6.0.md).
+
+- Room key rotation on every membership change; chat under per-epoch keys
+- The relay no longer sees room names or display names; optional TLS
+- Group voice and video with per-sender keys; names under the video tiles
+- Offline inbox on the relay (`--inbox`), collected for all contacts at once
+- Android notifications without Google services
+- Noise suppression, microphone sensitivity, manual video settings, STUN
+- Desktop identity key encrypted at rest; one fingerprint on every platform
+- One desktop window; programs found only next to the application
+- Complete Linux and Windows release archives; licenses in every artifact
+- AGPL-3.0 (relay, console client) and GPL-3.0 (clients) instead of MIT
 
 ### v0.4.3
 
