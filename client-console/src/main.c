@@ -58,9 +58,9 @@ static void print_usage(const char *prog) {
         "  1. --create           Auto-generate room key (first person in room)\n"
         "  2. --join             Request room key via ECDH exchange (join existing room)\n"
         "  3. --auto             Probe the server: empty room → CREATE, otherwise → JOIN\n"
-        "  3. --key-file FILE    Read key from file (recommended for scripts)\n"
-        "  4. stdin              Read key from standard input (interactive or piped)\n"
-        "  5. --key BASE64       Direct key argument (DEPRECATED - insecure, visible in process list)\n"
+        "  4. --key-file FILE    Read key from file (recommended for scripts)\n"
+        "  5. stdin              Read key from standard input (interactive or piped)\n"
+        "  6. --key BASE64       Direct key argument (DEPRECATED - insecure, visible in process list)\n"
 
         "\nIdentity (optional Ed25519 signing):\n"
         "  gen-identity          Generate identity keypair (~/.fear/identity)\n"
@@ -68,8 +68,10 @@ static void print_usage(const char *prog) {
         "  --no-sign             Disable message signing even if identity exists\n"
 
         "\nNotes:\n"
-        "  * Generate a key once per conference with 'genkey'. Share it out-of-band.\n"
-        "  * The server sees only metadata (room/name), never plaintext.\n"
+        "  * --auto is the GUI's default. A key shared out-of-band (genkey) only\n"
+        "    founds the room: the room key rotates whenever someone joins or leaves.\n"
+        "  * The relay sees a hash of the room name and a fresh tag per connection,\n"
+        "    never names or plaintext. --tls also hides the frames on the wire.\n"
         "  * For NAT traversal, port-forward the server's TCP port or host it publicly.\n",
         prog, prog, prog, prog, prog);
 }

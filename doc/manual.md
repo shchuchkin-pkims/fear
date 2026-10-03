@@ -1,10 +1,10 @@
-# F.E.A.R. Project — User Manual
+# F.E.A.R. Project – User Manual
 
 ## Fully Encrypted Anonymous Routing
 
 ---
 
-**Version:** 1.4 (v0.4.3)
+**Version:** 2.0 (v0.6.0)
 **Author:** Shchuchkin E. Yu.
 
 ---
@@ -17,678 +17,432 @@
 ## Table of Contents
 
 1. [Introduction](#introduction)
-2. [Architecture and Security](#architecture-and-security)
-3. [System Requirements](#system-requirements)
-4. [Building the Project](#building-the-project)
-5. [Programs](#programs)
-6. [Quick Start Scenarios](#quick-start-scenarios)
-7. [Detailed Usage](#detailed-usage)
-8. [ECDH Key Exchange](#ecdh-key-exchange)
-9. [Identity Verification](#identity-verification)
-10. [Audio Calls](#audio-calls)
-11. [Video Calls](#video-calls)
-12. [File Transfer](#file-transfer)
-13. [Troubleshooting](#troubleshooting)
-14. [FAQ](#faq)
+2. [How F.E.A.R. Protects You](#how-fear-protects-you)
+3. [Installation](#installation)
+4. [Getting Started](#getting-started)
+5. [Rooms, Contacts and Personal Chats](#rooms-contacts-and-personal-chats)
+6. [Identity and Verification](#identity-and-verification)
+7. [Calls](#calls)
+8. [File Transfer](#file-transfer)
+9. [Settings](#settings)
+10. [Console Programs](#console-programs)
+11. [Running Your Own Relay](#running-your-own-relay)
+12. [Troubleshooting](#troubleshooting)
+13. [FAQ](#faq)
 
 ---
 
 ## Introduction
 
-**F.E.A.R. (Fully Encrypted Anonymous Routing)** is a cross-platform open-source messenger designed for maximum privacy and security.
+**F.E.A.R. (Fully Encrypted Anonymous Routing)** is an open-source messenger for Windows, Linux and Android. Messages, files and calls are encrypted on your device and decrypted only on the devices of the people you talk to. The server in the middle – the *relay* – passes encrypted data along and cannot read it.
 
 ### Key Features
 
-- **End-to-end encryption (E2EE):** All messages are encrypted on the sender's device and decrypted only on the recipient's device
-- **Zero-knowledge server:** The server cannot access message content, keys, or decrypted data
-- **ECDH key exchange:** Automatic key distribution via X25519 — no pre-shared secrets needed
-- **Identity verification:** Ed25519 keypairs with Trust On First Use (TOFU) model
-- **Encrypted voice calls:** Opus codec with AES-256-GCM over UDP
-- **Encrypted video calls:** VP8 codec with AES-256-GCM, SDL3 display, adaptive bitrate
-- **File transfer:** Encrypted file sharing with CRC32 integrity verification
-- **Open source:** Full transparency for audit and verification
+- **End-to-end encryption** of messages, files, voice and video (AES-256-GCM)
+- **Room keys that follow the room:** the key changes every time someone joins or leaves, so a newcomer cannot read what was said before, and someone who left cannot read what is said after
+- **A relay that knows little:** it sees a hash instead of the room name and a fresh random tag instead of your name
+- **Group voice and video calls** through the relay, with per-participant keys
+- **Personal chats and contacts**, with an encrypted contact list kept on the relay
+- **Offline delivery:** a message to a contact who is not online waits on the relay, sealed, until they collect it
+- **Identity you can verify:** an Ed25519 key per user, fingerprints that read the same on every platform, a warning when someone's key changes
+- **Encrypted backup** of your identity (file or QR code)
+- **Optional TLS** to the relay, and optional direct calls (STUN)
+- **Your own relay** in one command, or a Docker image
+- **Free software:** GPL-3.0 clients, AGPL-3.0 relay
 
-### What's New in v0.4.3
+### What's New in v0.6.0
 
-**RTT Latency Measurement:**
-- Real-time RTT (Round-Trip Time) display during audio and video calls
-- Video calls: color-coded overlay on SDL video window (green < 100ms, yellow 100-300ms, red > 300ms)
-- Audio calls: RTT stats exchange via encrypted stats packets every 2 seconds
-- Hold-time compensation for accurate RTT calculation
+- **Room key rotation** on every change of membership (forward secrecy within a room)
+- **Metadata privacy:** room names and display names no longer appear on the relay
+- **Group calls:** several people at once, each sender with its own key; names under the video tiles
+- **Offline inbox** on the relay for messages to contacts who are not online
+- **Android notifications without Google services**
+- **Noise suppression** and microphone sensitivity; manual video settings
+- **Optional TLS** to the relay; optional direct calls via STUN
+- **The desktop identity key is encrypted at rest** (system keyring / DPAPI)
+- **One desktop window** (the classic interface is gone; everything it had moved over)
+- **Complete release archives:** calls, updater and key exchange included
 
-**Video Call Improvements:**
-- Ring buffer for video capture — eliminates frame accumulation delay
-- TCP_NODELAY on media relay sockets for reduced latency
-- Latest-frame-only read strategy prevents stale frame buildup
-
-**Android:**
-- In-app update: check for new versions and install APK directly from the app (Menu > Check for Updates)
-- Menu button on the connection screen (theme, trusted keys, updates)
-- Online users list persists across theme changes
-
-### What's New in v0.4.1
-
-**ECDH Key Exchange:**
-- Automatic room key generation and distribution — no manual key sharing required
-- CLI: `--create` (generate key) and `--join` (receive key via ECDH)
-- GUI: Create Room / Join Room / Connect buttons
-- X25519 ephemeral keypairs with Ed25519-signed responses (MITM protection)
-
-**Identity Verification:**
-- Each client generates a persistent Ed25519 keypair
-- Peer public keys are saved on first contact (TOFU)
-- Key mismatch on reconnection triggers a security warning
-
-**Android v0.4.1:**
-- Full feature parity: ECDH, identity, video calls, file transfer
-- Light and dark theme toggle
-- Push notifications for background messages
+> **v0.6.0 does not talk to v0.5.x.** The wire format changed (hashed rooms, session tags, a new key schedule and call framing). Update every device and the relay together.
 
 ---
 
-## Architecture and Security
+## How F.E.A.R. Protects You
 
-### Security Model
-
-F.E.A.R. uses a client-server architecture with end-to-end encryption:
+### What the relay sees and what it does not
 
 ```
-[Client A] <——encrypted——> [Server] <——encrypted——> [Client B]
-                              |
-                    (cannot read content)
+[You] ──encrypted──> [Relay] ──encrypted──> [Others in the room]
+                       │
+          sees: IP addresses, timing, sizes,
+          a hash of the room name, a random tag per connection
+          never: content, keys, room names, display names
 ```
 
-The server performs routing only and has **no access to:**
-- Message content
-- Room encryption keys
-- Decrypted data
+| The relay sees | The relay does not see |
+|----------------|------------------------|
+| IP addresses of the connections | Messages, files, voice, video |
+| When and how much each connection sends | Any key |
+| `r:` + a hash of the room name | The room name itself |
+| A random 16-byte tag per connection, new each time | Display names (they travel inside the encryption) |
+| Your public key and handle, if you register a handle | Who your contacts are (the contact list is encrypted) |
 
-### Cryptographic Algorithms
+With **TLS** enabled, people watching the network (your provider, the owner of a Wi-Fi network) see only an encrypted stream instead of F.E.A.R. frames. TLS hides nothing from the relay itself.
 
-#### AES-256-GCM
+### Cryptography
 
-**Purpose:** Encryption of all messages, audio, and video data
+| Primitive | Used for |
+|-----------|----------|
+| **AES-256-GCM** | Chat messages, files, voice and video |
+| **X25519** | Delivering the room key to someone joining (ECDH); the key of a personal chat |
+| **Ed25519** | Your identity: signed identity announcements, signed key delivery |
+| **BLAKE2b** | Key derivation, the room hash on the wire, fingerprints |
 
-| Parameter | Value |
-|-----------|-------|
-| Key size | 256 bits (32 bytes) |
-| Mode | GCM (Galois/Counter Mode) |
-| Nonce size | 96 bits (12 bytes) |
-| Auth tag | 128 bits (16 bytes) |
+### Room keys and rotation
 
-AES-256-GCM provides:
-- **Confidentiality:** Data is unreadable without the key
-- **Authentication:** Tampering is detected via the auth tag
-- **Replay protection:** Each message uses a unique nonce
+A room has a key (`K_room`). When you **create** a room, your client draws a fresh one. When you **join**, a member delivers it to you over X25519, signed with their identity key so that nobody in between can substitute their own.
 
-#### X25519 (ECDH Key Exchange)
+Every time the membership changes, one member – chosen the same way by everyone – draws a new generation of the key and sends it to each member sealed with that member's own key. Messages are encrypted under per-epoch keys derived from the current generation. As a result:
 
-**Purpose:** Secure room key distribution without pre-shared secrets
+- someone who joins cannot read what was said before they arrived;
+- someone who leaves cannot read what is said after they left.
 
-The ECDH protocol allows two parties to derive a shared secret over an insecure channel. Combined with Ed25519 signatures, it prevents man-in-the-middle attacks.
+### Calls
 
-#### Ed25519
+Calls run in a separate program and over a separate connection to the same relay. Each participant encrypts what they send under their own key, derived for that call; announcements are authenticated, and replayed packets are dropped.
 
-**Purpose:** Identity signing and verification
+### Personal chats
 
-Each client maintains a persistent Ed25519 keypair. During ECDH key exchange, the room creator signs the response with their identity key. Peers can verify authenticity.
+A personal chat uses a key derived from your identity and your contact's identity (X25519), so it works even if the other person is not online when you open it. Its identifier on the relay is derived under that key: the relay cannot tell from it that the chat is personal, nor work out whose it is.
 
-#### BLAKE2b (Key Derivation)
+### What F.E.A.R. does not do
 
-**Purpose:** Deriving audio and video subkeys from the room master key
-
-- Audio subkey: `crypto_kdf(id=1, ctx="fearaudi", master_key)`
-- Video subkey: `crypto_kdf(id=2, ctx="fearvide", master_key)`
-
-#### CRC32
-
-**Purpose:** File transfer integrity verification (non-cryptographic)
-
-### Protocol Format
-
-Every TCP message follows this wire format:
-
-```
-[2 bytes: room_len]
-[room name]
-[2 bytes: name_len]
-[sender name]
-[2 bytes: nonce_len]
-[nonce (12 bytes)]
-[1 byte: message_type]
-[4 bytes: ciphertext_len]
-[ciphertext + auth_tag]
-```
-
-**Message types:**
-| Type | Name | Description |
-|------|------|-------------|
-| 0 | TEXT | Encrypted text message |
-| 1 | FILE_START | File transfer metadata |
-| 2 | FILE_CHUNK | File data chunk (8KB) |
-| 3 | FILE_END | File transfer completion |
-| 4 | USER_LIST | Room participants (service, zero nonce) |
-| 15 | KEY_REQUEST | ECDH key request (service, zero nonce) |
-| 16 | KEY_RESPONSE | ECDH key response (service, zero nonce) |
-| 17 | MEDIA_RELAY | TCP media relay (raw encrypted media packet) |
+- **No post-compromise security.** There is no Signal-style ratchet: someone who steals a room key reads that room until the next rotation.
+- **IP addresses are visible to the relay.** Use VPN or Tor if that matters to you, or run your own relay.
+- **The room hash is not secret.** A determined relay operator can guess common room names ("general") by hashing them.
+- **Identity announcements** (display names and the tags they belong to) are encrypted under the room's founding key, which every member who ever joined holds. A former member who also had the relay's traffic could learn who is in the room – but not what is said.
+- **Your device is trusted.** Malware running as you can read what you can read.
 
 ---
 
-## System Requirements
+## Installation
 
-### Minimum Requirements
+### Desktop (Windows and Linux)
 
-- **OS:** Windows 10/11 (64-bit) or Linux (Ubuntu 20.04+, Debian 11+)
-- **CPU:** Intel Core i3 / AMD Ryzen 3 or equivalent
-- **RAM:** 2 GB
-- **Disk:** 200 MB free space
-- **Network:** Internet or LAN connection
+Download the archive for your system from [Releases](https://github.com/shchuchkin-pkims/fear/releases):
 
-### Build Requirements
+- `fear-windows-x86_64-v0.6.0.zip`
+- `fear-linux-x86_64-v0.6.0.zip`
 
-- Git, CMake 3.15+, C++17 compiler (GCC 8+, MinGW-w64 8+)
-- **Libraries:** libsodium, Qt 6.2+, PortAudio, Opus, FFmpeg, libvpx, SDL3
+Extract it into a folder of its own and keep the layout as it is:
+
+```
+fear_gui(.exe)        – the application
+bin/                  – programs the application starts:
+    fear              – console client and relay
+    audio_call        – voice calls
+    video_call        – video calls
+    updater           – updates
+    key-exchange      – manual key exchange
+    updater.conf, cacert.pem
+doc/manual.pdf        – this manual
+LICENSE, LICENSE.GPL-3.0, LICENSING.md, README.txt
+```
+
+**Windows:** run `fear_gui.exe`. The build is not code-signed; SmartScreen will warn the first time – click "More info", then "Run anyway".
+
+**Linux:** run `./fear_gui`. The archive is built on Ubuntu 22.04 and runs on Ubuntu 22.04+ and Debian 12+. The libraries it needs are listed in `README.txt` with the exact `apt install` line. Video (FFmpeg) and window (SDL3) libraries are built into `video_call`.
+
+### Android
+
+Install the APK from [fear-mobile Releases](https://github.com/shchuchkin-pkims/fear-mobile/releases). Allow installation from unknown sources when Android asks.
+
+### Updating
+
+Desktop: **Check for updates** in the menu runs the updater. It downloads the new archive, checks its **Ed25519 signature** and refuses anything unsigned or signed by another key, then unpacks it over the installation. Android checks for updates from its menu as well.
+
+### Building from source
+
+See [BUILD.md](BUILD.md). In short: `./build.sh deps && ./build.sh` on Linux, `build.bat` on Windows (with the libraries in `lib/`).
 
 ---
 
-## Building the Project
+## Getting Started
 
-### Linux
+### First run
 
-```bash
-# Install dependencies (Ubuntu/Debian)
-./build.sh deps
+On first start the application creates your **identity** – an Ed25519 key pair – and asks for a display name. Make an **encrypted backup** of the identity soon (menu → **Export identity…**): without it, a lost device means a lost identity.
 
-# Build
-./build.sh
-```
+### Connecting to a room
 
-### Windows
+Menu → **Connect to room…** opens the connection dialog:
 
-```batch
-build.bat
-```
+| Field | Meaning |
+|-------|---------|
+| **Server** | A public relay (Netherlands, Russia) or your own: choose "Custom server…" and type the address |
+| **Port** | 8888 unless the relay says otherwise |
+| **Room** | Any name; everyone who types the same name on the same relay meets in the same room |
+| **Name** | Your display name in this room |
+| **Mode** | **Auto** (default): create the room if it is empty, otherwise join it. **Create**, **Join** and **Manual key** for special cases |
 
-See [BUILD.md](BUILD.md) for detailed instructions, Windows library setup, and troubleshooting.
+The dialog also shows whether your identity has a **handle** on this relay (`nickname@server`). Register one so that others can add you as a contact.
 
-### Build Output
+### The window
 
-```
-build/
-├── fear_gui          # GUI application
-└── bin/
-    ├── fear          # Console client/server
-    ├── audio_call    # Voice call utility
-    ├── video_call    # Video call utility
-    ├── key-exchange  # Key exchange utility
-    └── updater       # Update manager
-```
+- **Sidebar** – your contacts and your groups. **+** adds a contact, joins a room or creates a new one.
+- **Chat** – messages with a date above each day, the participants (click the room title), call buttons, the attach button.
+- **Search** – full-text search through local history.
+- **Tray icon** – closing the window hides it and keeps you connected. Use **Quit** to exit.
+- **Theme** – light or dark, from the menu; the choice is remembered.
+
+History is stored locally (SQLite in your user data folder). The relay keeps no chat history.
 
 ---
 
-## Programs
+## Rooms, Contacts and Personal Chats
 
-### 1. fear (Console Client/Server)
+### Groups (rooms)
 
-**Location:** `build/bin/fear`
+Anyone who knows the relay and the room name can enter the room and receive its key from a member. A room is private in the sense that nobody outside it can read it – not in the sense that the name is a password. Use a name that is hard to guess for a group you want to keep to yourselves, or **Manual key** to require a key shared out of band.
 
-#### Generate Room Key
+### Contacts
 
-```bash
-./fear genkey
-```
+Add a contact by handle (`nickname@server`). The contact list is stored on the relay encrypted with a key derived from your identity, so it follows you to another device after you restore your identity there. The relay cannot read it.
 
-Output:
-```
-z6aK3_k9I7rmpy6Sn-84QZ9Yc0p3T7VhzReWCKE0x4I
-Room key generated successfully.
-IMPORTANT: Copy the key above and share it securely.
-           The key is NOT saved to disk for security reasons.
-```
+### Personal chats
 
-The key is output to stdout only. In the GUI, it is automatically copied to clipboard.
+Click a contact to open a personal chat. Its key is derived from both identities; the other person does not need to be online.
 
-#### Start Server
+### Offline inbox
 
-```bash
-./fear server --port 7777
-```
-
-The server requires no keys — it only relays encrypted data.
-
-#### Connect as Client
-
-Three connection modes are available:
-
-**Create Room (auto-generate key):**
-```bash
-./fear client --host SERVER_IP --port 7777 \
-    --room myroom --name Alice --create
-```
-
-**Join Room (ECDH key exchange):**
-```bash
-./fear client --host SERVER_IP --port 7777 \
-    --room myroom --name Bob --join
-```
-
-**Connect with known key (stdin — recommended):**
-```bash
-echo "YOUR_KEY" | ./fear client --host SERVER_IP --port 7777 \
-    --room myroom --name Charlie
-```
-
-**Connect with key file:**
-```bash
-./fear client --host SERVER_IP --port 7777 \
-    --room myroom --name Charlie --key-file room_key.txt
-```
-
-**Arguments:**
-| Argument | Required | Description |
-|----------|----------|-------------|
-| `--host` | Yes | Server IP or hostname |
-| `--port` | Yes | Server TCP port (1024-65535) |
-| `--room` | Yes | Room name (1-255 chars) |
-| `--name` | Yes | Your username (1-255 chars) |
-| `--create` | No | Auto-generate key, create room |
-| `--join` | No | Join via ECDH key exchange |
-| `--key-file` | No | Read key from file |
-
-**In-chat commands:**
-- Type text and press Enter to send a message
-- `/sendfile path/to/file` to send a file
-- Ctrl+C to exit
-
-### 2. fear_gui (GUI Application)
-
-**Location:** `build/fear_gui`
-
-Launch:
-```bash
-cd build && ./fear_gui    # Linux
-fear_gui.exe              # Windows
-```
-
-**Connection modes:**
-- **Create Room:** Menu > Connection > Create Room — auto-generates key, copies to clipboard
-- **Join Room:** Menu > Connection > Join Room — ECDH exchange, no key needed
-- **Connect:** Menu > Connection > Connect — enter all fields manually
-
-**Features:**
-- Chat with message history
-- User list panel
-- File transfer button
-- Audio calls: Menu > Audio call > Start audio call
-- Video calls: Menu > Video call > Start video call
-- Key exchange: Menu > Keys > Key exchange
-- Update check: Menu > Help > Check for updates
-
-### 3. key-exchange (Key Exchange Utility)
-
-**Location:** `build/bin/key-exchange`
-
-Interactive utility for Curve25519 (ECDH) key exchange:
-
-```
-=== F.E.A.R. Key Exchange ===
-1. Generate key pair
-2. Encrypt message
-3. Decrypt message
-4. Exit
-```
-
-**Workflow:**
-1. Both users generate keypairs (option 1)
-2. Exchange public keys over any channel
-3. User A encrypts the room key with User B's public key (option 2)
-4. User B decrypts the room key (option 3)
-
-Public keys can be shared openly. The secret key must never be transmitted.
-
-### 4. audio_call (Voice Calls)
-
-**Location:** `build/bin/audio_call`
-
-```bash
-# Generate key
-./audio_call genkey
-
-# List audio devices
-./audio_call listdevices
-
-# Listen for incoming call
-echo "KEY" | ./audio_call listen 50000
-
-# Make a call
-echo "KEY" | ./audio_call call REMOTE_IP 50000
-```
-
-**Specs:** Opus codec, 48 kHz, adaptive bitrate, AES-256-GCM encryption.
-
-### 5. video_call (Video Calls)
-
-**Location:** `build/bin/video_call`
-
-```bash
-# Generate key
-./video_call genkey
-
-# List cameras and audio devices
-./video_call listdevices
-
-# Listen for incoming call
-echo "KEY" | ./video_call listen 50000
-
-# Make a call
-echo "KEY" | ./video_call call REMOTE_IP 50000
-
-# Options
-echo "KEY" | ./video_call call REMOTE_IP 50000 --quality high
-echo "KEY" | ./video_call listen 50000 --no-camera
-```
-
-**Options:**
-| Option | Description |
-|--------|-------------|
-| `--quality low\|medium\|high` | Video quality preset (default: medium) |
-| `--camera DEVICE` | Camera device |
-| `--no-camera` | Receive-only mode (no camera) |
-| `--no-video` | Audio only |
-| `--no-audio` | Video only |
-| `--width N --height N` | Custom resolution |
-| `--fps N` | Custom framerate |
-| `--bitrate N` | Custom bitrate (kbps) |
-
-### 6. updater (Update Manager)
-
-**Location:** `build/bin/updater`
-
-```bash
-./updater
-```
-
-Checks for new versions, downloads, and applies updates.
+If your contact is not online, your message waits on the relay in a sealed **inbox** addressed by a blinded value only the two of you can compute. Clients collect waiting messages automatically (on the desktop every 20 seconds, across all contacts at once). How long messages wait is the relay operator's choice: 30 days by default, or none at all. When a message could not be delivered within that time, the client says so rather than pretending it arrived.
 
 ---
 
-## Quick Start Scenarios
+## Identity and Verification
 
-### Scenario 1: Two Users on LAN
+### Fingerprints
 
-**Step 1:** Alice generates a key and starts the server:
-```bash
-./fear genkey
-# Output: z6aK3_k9I7rmpy6Sn-84QZ9Yc0p3T7VhzReWCKE0x4I
+Every identity has a fingerprint: `40:f6:8f:4a:d2:4e:57:5b` (BLAKE2b, 8 bytes). The short form `name#40f68f4a` is its first 4 bytes. The value is the same on Windows, Linux and Android – **compare it with your contact over a channel you trust** (in person, a call) to be sure nobody is in between.
 
-./fear server --port 7777
-```
+### Trust On First Use
 
-**Step 2:** Alice connects and creates a room:
-```bash
-./fear client --host 127.0.0.1 --port 7777 \
-    --room myroom --name Alice --create
-```
+The first key seen for a contact is remembered. If it later changes, the application shows a warning. It can be a reinstall without a backup – or an attack. Ask the person before you trust the new key. Menu → **Trusted keys** lists remembered keys and lets you mark them as verified.
 
-**Step 3:** Alice shares her IP (e.g., 192.168.1.10) and the key with Bob.
+### Backup and restore
 
-**Step 4:** Bob joins:
-```bash
-echo "z6aK3_k9I7rmpy6Sn-84QZ9Yc0p3T7VhzReWCKE0x4I" | \
-    ./fear client --host 192.168.1.10 --port 7777 \
-    --room myroom --name Bob
-```
+Menu → **Export identity…** writes an encrypted `.fbk` file or shows a QR code; the password must be at least 12 characters. **Import identity…** restores it on another desktop or on Android (and the other way round). After a restore, your handle is found again automatically.
 
-They can now chat securely.
+### Storage
 
-### Scenario 2: ECDH Key Exchange (No Pre-Shared Key)
+| Platform | Identity | Protection |
+|----------|----------|------------|
+| Linux | `~/.fear/identity` | Secret key wrapped by a key in the system keyring (libsecret) |
+| Windows | `%APPDATA%\fear\identity` | Secret key protected with DPAPI |
+| Android | app storage | EncryptedFile backed by the Android Keystore |
 
-**Step 1:** Alice starts the server and creates a room:
-```bash
-./fear server --port 7777
-./fear client --host 127.0.0.1 --port 7777 \
-    --room myroom --name Alice --create
-```
-
-**Step 2:** Alice tells Bob the server IP, port, and room name (no key needed).
-
-**Step 3:** Bob joins via ECDH:
-```bash
-./fear client --host 192.168.1.10 --port 7777 \
-    --room myroom --name Bob --join
-```
-
-The key exchange happens automatically. Bob receives the room key via encrypted ECDH channel.
-
-### Scenario 3: GUI Usage
-
-1. Launch `fear_gui`
-2. Menu > Connection > Create Room
-3. Fill in server, port, room, name — click **Create**
-4. Key is auto-generated and copied to clipboard
-5. Share key with participant (or have them use **Join Room**)
-6. Participant: Menu > Connection > Join Room — click **Join**
-7. Chat, send files, start audio/video calls
+Without a running keyring (headless Linux) the desktop falls back to a file readable only by you, and says so.
 
 ---
 
-## ECDH Key Exchange
+## Calls
 
-### How It Works
+### Starting and answering
 
-When `--create` is used, the client generates a random room key. When another client connects with `--join`:
+Press the **phone** (voice) or **camera** (video) button in a room. Everyone in the room receives an invitation; answering joins the call. Calls go through the same relay as the chat.
 
-1. Joiner sends `KEY_REQUEST` with their ephemeral X25519 public key
-2. Creator generates their own ephemeral X25519 keypair
-3. Creator encrypts the room key using `crypto_box` (shared secret from X25519)
-4. Creator signs the response with their Ed25519 identity key
-5. Creator sends `KEY_RESPONSE` with encrypted key + signature
-6. Joiner verifies the Ed25519 signature and decrypts the room key
+- **Voice:** up to 8 voices are mixed at once; the others are heard as soon as they speak.
+- **Video:** the desktop shows up to 4 pictures at once – the active speaker large, the others in a strip. Names appear under the tiles (the desktop video window transliterates Cyrillic names, its font is ASCII-only).
+- **Hang up** from the call window or by closing it; the call program wipes its keys on exit.
 
-**Security guarantees:**
-- The room key never travels in plaintext
-- Ed25519 signature prevents man-in-the-middle attacks
-- Ephemeral keypairs provide forward secrecy for the exchange
-
----
-
-## Identity Verification
-
-### TOFU (Trust On First Use)
-
-Each F.E.A.R. client generates a persistent Ed25519 keypair stored in `.fear/identity/`. When connecting to a peer for the first time, their public key is saved locally. On subsequent connections, the key is compared:
-
-- **Match:** Connection proceeds normally
-- **Mismatch:** Security warning — the peer's identity may have changed (or an attacker is present)
-
-### Trusted Keys Management
-
-In the GUI, trusted keys can be managed via Menu > Keys > Trusted keys.
-
----
-
-## Audio Calls
-
-### Requirements
-
-- Microphone and speakers/headphones
-- Direct network connection between peers, or TCP media relay via server
-- Low network latency (< 100ms recommended)
-
-### TCP Media Relay
-
-When direct UDP connections are blocked (NAT, VPN, firewall), calls can be relayed through the TCP server. In the GUI and Android app, a **Relay** button appears when connected to a remote server. The relay uses MSG_TYPE_MEDIA_RELAY frames over a dedicated TCP connection.
-
-### Setup via GUI
-
-1. Menu > Audio call > Start audio call
-2. Generate key (auto-copied to clipboard) or enter existing key
-3. Select audio input/output devices
-4. **Receiver:** Enter local port, click "Start Listening"
-5. **Caller:** Enter remote IP and port, click "Start Call"
-
-### Setup via Console
-
-**Receiver:**
-```bash
-./audio_call genkey
-echo "KEY" | ./audio_call listen 50000
-```
-
-**Caller:**
-```bash
-echo "KEY" | ./audio_call call 192.168.1.100 50000
-```
-
-Both parties must use the same key.
-
----
-
-## Video Calls
-
-### Requirements
-
-- Webcam (optional — "no camera" mode available)
-- Microphone and speakers/headphones
-- Direct network connection between peers
-
-### Quality Presets
+### Quality
 
 | Preset | Resolution | FPS | Bitrate |
 |--------|-----------|-----|---------|
-| LOW | 320x240 | 15 | 200 kbps |
-| MEDIUM | 640x480 | 25 | 500 kbps |
-| HIGH | 1280x720 | 30 | 1500 kbps |
+| Low | 320×240 | 15 | 200 kbit/s |
+| Medium | 640×480 | 25 | 500 kbit/s |
+| High | 1280×720 | 30 | 1500 kbit/s |
 
-### Setup via GUI
+The desktop steps down when packets are lost or the delay grows; the Android app lowers its bitrate when the network does not keep up and returns to your setting when it clears. Width, height, frame rate and bitrate can be set by hand in **Settings → Video**.
 
-1. Menu > Video call > Start video call
-2. Generate key or enter existing key
-3. Select camera (or "No camera" for receive-only)
-4. Choose quality preset
-5. **Receiver:** Click "Start Listening"
-6. **Caller:** Enter remote IP and port, click "Start Call"
+### Direct calls (optional)
 
-### Setup via Console
-
-**Receiver:**
-```bash
-echo "KEY" | ./video_call listen 50000 --quality medium
-```
-
-**Caller:**
-```bash
-echo "KEY" | ./video_call call 192.168.1.100 50000 --quality medium
-```
-
-### Features
-
-- **Peer disconnect detection:** If no data for 5 seconds, a black frame is displayed
-- **Auto reconnect:** When a peer reconnects, decoder and fragment buffer reset automatically
-- **No camera mode:** Receive video without sending — use `--no-camera` or select in GUI
+With a **STUN server** set in **Settings → Audio**, calls try a direct path first. It is shorter and the relay operator does not see the call stream – but **your IP address is revealed to the people you call and to the STUN server**. The field is empty by default, which means always through the relay.
 
 ---
 
 ## File Transfer
 
-### Sending a File
+Use the **attach** button in a chat. The recipient sees the file name and size and chooses **Accept** (saved to `Downloads`), **Save as…** or **Reject**; **Settings → Privacy** can accept files automatically. Files are encrypted like messages and checked for integrity on arrival.
 
-**GUI:** Click "Send file" button, select file.
+---
 
-**Console:**
+## Settings
+
+| Tab | What is there |
+|-----|---------------|
+| **General** | Path to the console client; **TLS** to the relay and an optional certificate pin |
+| **Chat** | Chat font family and size |
+| **Audio** | Default devices, **noise suppression** (off/low/medium/high), microphone sensitivity, STUN server |
+| **Video** | Default camera, resolution, frame rate, bitrate |
+| **Privacy** | Whether notifications show the message text, automatic acceptance of files |
+| **Identity** | Whether you have an identity key, its fingerprint, how many keys you trust |
+
+**Noise suppression** on the desktop cuts low hum and closes a gate between words: background noise you hear in pauses goes away; it is not removed from under the voice. On Android the system noise suppressor is used, and can be switched off on phones where it cuts quiet speech.
+
+---
+
+## Console Programs
+
+The desktop application starts these itself. They are also useful on their own – for servers, scripts and testing.
+
+### fear – console client and relay
+
 ```bash
-/sendfile /path/to/file.pdf
+fear --version
+fear genkey                     # print a random room key
+fear gen-identity               # create ~/.fear/identity
+fear server [--port N] [--inbox off|30d|Nh] [--tls-cert FILE --tls-key FILE]
+fear client --host HOST --port N --room ROOM [--name NAME]
+            [--auto | --create | --join | --key-file FILE]
+            [--identity-file FILE] [--no-sign] [--tls] [--tls-pin SHA256HEX]
 ```
 
-### Receiving a File
+| Client option | Meaning |
+|---------------|---------|
+| `--auto` | Ask the relay: empty room – create it, otherwise join (what the GUI does by default) |
+| `--create` | Create the room with a fresh key |
+| `--join` | Receive the key from a member (X25519, signed) |
+| `--key-file FILE` | Read a pre-shared key from a file; without any of these, the key is read from stdin |
+| `--tls`, `--tls-pin` | Connect over TLS; with a pin, accept only that certificate |
 
-Files are automatically saved to the `Downloads/` directory.
+A key passed in by hand only founds the room: it still rotates whenever someone joins or leaves.
 
-### Integrity Verification
+In the chat: type and press Enter to send; `/sendfile PATH` sends a file; Ctrl+C exits.
 
-F.E.A.R. verifies file integrity using CRC32 checksums. Corrupted files are automatically deleted.
+### audio_call and video_call
 
-### Limitations
+Normally started by the application for a call in the room. On their own:
 
-- Chunk size: 8192 bytes
-- Files are encrypted with the room key
-- No file size limit (bounded by available memory)
+```bash
+audio_call listdevices
+video_call listdevices
+video_call relay HOST PORT --room ROOM --name TAG --call-id HEX32 [options]
+```
+
+Useful options: `--quality low|medium|high`, `--width`, `--height`, `--fps`, `--bitrate`, `--camera DEVICE`, `--no-camera` (receive only), `--no-video`, `--no-audio`, `--mic-gain dB`, `--noise-suppress off|low|medium|high`, `--stun HOST[:PORT]` (port 3478 by default). The key is read from stdin or `--key-file`.
+
+### updater
+
+Checks the latest release, verifies its signature and installs it over the current folder. Run by **Check for updates** in the application.
+
+### key-exchange
+
+An interactive X25519 tool for passing a room key to someone over any channel when you cannot use **Join**: both sides generate key pairs, exchange public keys, one encrypts the room key for the other.
+
+---
+
+## Running Your Own Relay
+
+Your own relay keeps the metadata – who connects when, and from where – in your hands.
+
+### From the archive
+
+```bash
+./bin/fear server --port 8888
+```
+
+The relay needs no keys; it cannot decrypt anything. It keeps its state (handles, encrypted contact lists, the offline inbox) in `fear-server.sqlite` in its working directory.
+
+### Docker
+
+```bash
+docker run -d --restart=unless-stopped --name fear-server \
+    -p 8888:8888 -v fear-data:/var/lib/fear \
+    ghcr.io/shchuchkin-pkims/fear-server:latest
+```
+
+### Options
+
+| Option | Meaning |
+|--------|---------|
+| `--port N` | TCP port, 8888 by default |
+| `--inbox 30d \| Nh \| off` | How long the offline inbox keeps messages. `off` stores nothing and discards what was stored. Per recipient at most 200 messages or 5 MB |
+| `--tls-cert FILE --tls-key FILE` | Accept TLS connections. Clients then need `--tls` (or the TLS box in Settings) |
+
+The relay accepts up to 16 connections per IP address and 100 in total, and closes a connection that has been silent for 4 minutes (clients send a keep-alive at least once a minute).
+
+On the desktop, **Run a relay here…** starts a relay on your machine for a LAN.
+
+### Administration
+
+`fear_admin` (Linux, built from source with Qt 6) works on the relay's database on the same machine: registered handles, stored blobs, the inbox, blocked keys, live sessions. It has no network interface by design.
 
 ---
 
 ## Troubleshooting
 
-### Connection Issues
+**Cannot connect**
+- Check the server address and port; check that the relay is running and the port is open.
+- If the relay uses TLS, enable TLS in **Settings → General**; if it does not, disable it.
 
-**"Connection refused":**
-- Verify the server is running
-- Check IP address and port
-- Check firewall settings
+**Connected, but nobody appears, names stay as short tags, messages do not arrive**
+- Everyone must run v0.6.0 – including the relay.
+- The console client says it outright: *"Cannot read who else is here… You are in this room with a different room key"*. Everyone should leave and rejoin, or pick a room name nobody is using yet.
 
-**"Name already exists in room":**
-- Choose a different username
-- Wait for the previous session to disconnect
+**A contact's key changed**
+- Ask them over another channel whether they reinstalled. Compare fingerprints before trusting the new key.
 
-### Encryption Issues
+**No sound or picture in a call**
+- Check the devices in **Settings → Audio / Video** and the system permissions for the microphone and camera.
+- On Linux, `bin/video_call listdevices` shows what the program sees.
 
-**Messages not decrypting:**
-- All participants must use the same room key
-- Verify key was not corrupted during copy (should be 44 Base64 chars)
-- Regenerate key and redistribute
+**Video stutters**
+- Wi-Fi at 2.4 GHz is the usual cause; a cable or 5 GHz helps. Lower the quality in **Settings → Video**.
 
-### Call Issues
+**The settings show no devices, or the application cannot find its programs**
+- Keep the archive layout: the programs must be in `bin/` next to the application.
 
-**No audio/video:**
-- Check microphone/camera permissions
-- Verify correct device is selected
-- Check firewall allows UDP traffic on the call port
-
-**High latency:**
-- Use wired connection instead of Wi-Fi
-- Close bandwidth-intensive applications
-- Check network latency: `ping REMOTE_IP`
-
-### Build Issues
-
-See [BUILD.md](BUILD.md) for detailed troubleshooting.
+**Linux: the application does not start**
+- Install the packages listed in `README.txt`. Run `./fear_gui` from a terminal to see which library is missing.
 
 ---
 
 ## FAQ
 
-**Q: Is F.E.A.R. fully anonymous?**
+**Q: Can the relay read my messages?**
 
-A: F.E.A.R. provides confidentiality of message content but does not hide the fact of communication. The server and network observers can see IP addresses, connection times, and data volumes. For full anonymity, use F.E.A.R. over VPN or Tor.
+A: No. It has no keys. It routes encrypted frames by the room hash.
 
-**Q: Do I need to trust the server?**
+**Q: Does anything keep my messages?**
 
-A: The server cannot read your messages (E2EE). However, it can see metadata (who communicates with whom, when). For maximum security, run your own server.
+A: Your own devices keep local history. The relay keeps nothing of a live chat; the **offline inbox** keeps sealed messages for contacts who are not online, for as long as the operator allows (30 days by default), and deletes them once collected.
 
-**Q: How often should keys be changed?**
+**Q: Is F.E.A.R. anonymous?**
 
-A: Change the room key when adding or removing participants, and periodically for long-term rooms. With `--create` / `--join`, each room session can use a fresh key easily.
+A: It hides content, room names and display names from the relay. It does not hide that you connect, from which IP address, or when and how much you send. For that, use VPN or Tor, or your own relay.
 
-**Q: What if a room key is compromised?**
+**Q: Do I need to change room keys?**
 
-A: Generate a new key (`./fear genkey`), create a new room, and redistribute the key to trusted participants only.
+A: No. The room key changes by itself whenever someone joins or leaves.
 
-**Q: Does F.E.A.R. log messages?**
+**Q: How many people can be in a room?**
 
-A: No. Messages exist only in memory during the session. The server does not store messages.
+A: The relay accepts up to 100 connections. In a call, up to 8 voices are mixed and the desktop shows up to 4 pictures at once.
 
-**Q: Can I use group chats?**
+**Q: Does it work with v0.5?**
 
-A: Yes. Any number of users can join a room. All messages are encrypted with the shared room key.
+A: No. v0.6.0 changed the wire format. Update all devices and the relay together.
 
 **Q: Is there a mobile app?**
 
-A: Yes. An Android client is available at [fear-mobile](https://github.com/shchuchkin-pkims/fear-mobile). It is fully compatible with the desktop server and supports all features including ECDH, identity verification, audio/video calls, file transfer, themes, and push notifications.
+A: Yes, for Android: [fear-mobile](https://github.com/shchuchkin-pkims/fear-mobile). It speaks the same protocol, including rotation, group calls and the offline inbox, and shows notifications without Google services.
 
 ---
 
 ## License
 
-F.E.A.R. is free software. The server (`client-console/`, `identity/`, `Dockerfile`, `web/server.js`) is licensed under the **GNU AGPL-3.0-or-later**; the clients (`gui/`, `audio_call/`, `video_call/`, `key-exchange/`, `updater/`, `web/public/`) under the **GNU GPL-3.0-or-later**. See [LICENSING.md](../LICENSING.md) for the full mapping, and [LICENSE](../LICENSE) and [LICENSE.GPL-3.0](../LICENSE.GPL-3.0) for the texts.
+F.E.A.R. is free software. The relay and console client (`client-console/`, `identity/`, `Dockerfile`, `web/server.js`) are licensed under the **GNU AGPL-3.0-or-later**; the clients (`gui/`, `audio_call/`, `video_call/`, `key-exchange/`, `updater/`, `web/public/`, the Android app) under the **GNU GPL-3.0-or-later**. See [LICENSING.md](../LICENSING.md) for the full mapping, and [LICENSE](../LICENSE) and [LICENSE.GPL-3.0](../LICENSE.GPL-3.0) for the texts.
 
 ---
 
@@ -696,12 +450,13 @@ F.E.A.R. is free software. The server (`client-console/`, `identity/`, `Dockerfi
 
 **GitHub:** https://github.com/shchuchkin-pkims/fear
 **Issues:** https://github.com/shchuchkin-pkims/fear/issues
+**Project site:** https://fear-project.ru
 
 ### Reporting Bugs
 
 1. Open a GitHub issue
-2. Include: F.E.A.R. version, OS, steps to reproduce, expected vs actual behavior
-3. Attach logs if available
+2. Include: F.E.A.R. version, OS, steps to reproduce, expected vs actual behaviour
+3. Attach logs if available (run the program from a terminal)
 
 ---
 
