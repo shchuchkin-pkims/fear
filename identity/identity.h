@@ -131,7 +131,10 @@ int identity_default_known_keys_path(char *buf, size_t bufsize);
 
 /**
  * Compute human-readable fingerprint of a public key.
- * Format: "ab:cd:ef:01:23:45:67:89" (first 8 bytes of BLAKE2b hash).
+ * Format: "ab:cd:ef:01:23:45:67:89" - BLAKE2b with an 8-byte output, the same
+ * on every platform. Not the first 8 bytes of BLAKE2b-256: the output length
+ * is a BLAKE2b parameter, so the two are unrelated numbers. The short form
+ * ("name#ab cdef01") is the first 4 bytes of this same hash.
  *
  * @param pk   32-byte public key
  * @param out  Output buffer (at least IDENTITY_FINGERPRINT_LEN bytes)

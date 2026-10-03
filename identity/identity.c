@@ -586,8 +586,11 @@ int identity_inbox_addr(const uint8_t k_pm[32],
 
 char *identity_pk_fingerprint(const uint8_t pk[IDENTITY_PK_BYTES],
                               char out[IDENTITY_FINGERPRINT_LEN]) {
-    /* BLAKE2b hash of public key, take first 8 bytes */
-    uint8_t hash[32];
+    /* BLAKE2b с 8-байтовым выходом - не первые 8 байт BLAKE2b-256: длина
+     * выхода входит в параметры BLAKE2b, и это разные числа. Так считают
+     * Android, веб и GUI; ядро раньше брало префикс BLAKE2b-256, и отпечаток
+     * одного ключа на ПК и на телефоне не совпадал. Эталон - test_identity. */
+    uint8_t hash[8];
     crypto_generichash(hash, sizeof(hash), pk, IDENTITY_PK_BYTES, NULL, 0);
 
     /* Format as xx:xx:xx:xx:xx:xx:xx:xx */

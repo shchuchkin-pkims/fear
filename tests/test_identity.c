@@ -270,5 +270,19 @@ int main(void) {
         }
     }
 
+    /* --- fingerprint: one value on every platform ------------------------ */
+    {
+        /* BLAKE2b with an 8-byte output, not a prefix of BLAKE2b-256. The same
+         * vector is pinned in the Android FingerprintTest and was computed a
+         * third time with Python's hashlib.blake2b(digest_size=8). Before the
+         * fix this side printed cb:2f:51:60:fc:1f:7e:05 for the same key, and
+         * a phone and a PC could never agree on whom they were talking to. */
+        uint8_t vk[IDENTITY_PK_BYTES];
+        for (int i = 0; i < IDENTITY_PK_BYTES; i++) vk[i] = (uint8_t)i;
+        char fp[IDENTITY_FINGERPRINT_LEN];
+        identity_pk_fingerprint(vk, fp);
+        CHECK(strcmp(fp, "40:f6:8f:4a:d2:4e:57:5b") == 0);
+    }
+
     return t_report("test_identity");
 }

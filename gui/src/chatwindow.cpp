@@ -1181,14 +1181,12 @@ void ChatWindow::openPeerProfile(const QString &senderName) {
                               nullptr, &binLen, nullptr,
                               sodium_base64_VARIANT_URLSAFE_NO_PADDING) == 0
             && binLen == sizeof(pk)) {
-            unsigned char hash[32];
-            crypto_generichash(hash, sizeof(hash), pk, sizeof(pk), nullptr, 0);
-            QString fp;
-            for (int i = 0; i < 32; ++i) {
-                if (i > 0) fp += ':';
-                fp += QString("%1").arg(hash[i], 2, 16, QChar('0'));
-            }
-            fingerprint = fp;
+            /* Тот же отпечаток, что на телефоне и в остальном GUI: его и
+             * сверяют вслух. Раньше здесь было 32 байта BLAKE2b-256, и
+             * короткий «#xxxxxxxx» из профиля не совпадал с остальными. */
+            char fp[IDENTITY_FINGERPRINT_LEN];
+            identity_pk_fingerprint(pk, fp);
+            fingerprint = QString::fromLatin1(fp);
         }
     }
 
