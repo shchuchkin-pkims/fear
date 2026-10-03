@@ -548,9 +548,8 @@ QString VideoCallDialog::findVideoCallApp() {
     QStringList possiblePaths = {
         QApplication::applicationDirPath() + "/video_call",
         QApplication::applicationDirPath() + "/bin/video_call",
-        QApplication::applicationDirPath() + "/../bin/video_call",
-        "video_call",
-        "./video_call"
+        QApplication::applicationDirPath() + "/../bin/video_call"
+        /* Без голого имени и "./": см. AudioCallManager::findAudioCallApp. */
     };
 
 #ifdef Q_OS_WIN

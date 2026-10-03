@@ -18,6 +18,7 @@
 #include <QFileDialog>
 #include <QMessageBox>
 #include <QProcess>
+#include <QCoreApplication>
 #include <sodium.h>
 
 #ifdef Q_OS_WIN
@@ -25,6 +26,27 @@
 #else
 #define FEAR_DIR (QDir::homePath() + "/.fear")
 #endif
+
+/*
+ * Программа звонка - от каталога приложения, тем же поиском, что у
+ * менеджеров звонков. Раньше здесь стоял "./bin/audio_call" от рабочего
+ * каталога: GUI, запущенный ярлыком или из другой папки, не находил своей
+ * программы и показывал пустые списки устройств, а запущенный из папки,
+ * куда пишет кто-то другой, выполнил бы чужой файл с правами пользователя.
+ */
+static QString findCallBinary(const QString &name) {
+    const QString appDir = QCoreApplication::applicationDirPath();
+#ifdef Q_OS_WIN
+    const QString exe = name + QStringLiteral(".exe");
+#else
+    const QString exe = name;
+#endif
+    for (const QString &p : { appDir + "/bin/" + exe, appDir + "/" + exe,
+                              appDir + "/../bin/" + exe }) {
+        if (QFileInfo(p).isFile()) return p;
+    }
+    return QString();
+}
 
 SettingsDialog::SettingsDialog(QSettings *settings, QWidget *parent)
     : QDialog(parent), settings(settings) {
@@ -168,13 +190,8 @@ void SettingsDialog::setupAudioTab(QTabWidget *tabs) {
     audioOutputCombo->addItem("System default");
 
     /* Try to get device list from audio_call binary */
-    QString audioCallPath;
-#ifdef Q_OS_WIN
-    audioCallPath = "./bin/audio_call.exe";
-#else
-    audioCallPath = "./bin/audio_call";
-#endif
-    if (QFileInfo(audioCallPath).isFile()) {
+    const QString audioCallPath = findCallBinary(QStringLiteral("audio_call"));
+    if (!audioCallPath.isEmpty()) {
         QProcess p;
         p.setProcessChannelMode(QProcess::ForwardedErrorChannel);
         p.start(audioCallPath, QStringList() << "listdevices");
@@ -333,13 +350,8 @@ void SettingsDialog::setupVideoTab(QTabWidget *tabs) {
     videoCameraCombo->addItem("Default", "");
 
     /* Enumerate cameras via video_call listdevices */
-    QString videoCallPath;
-#ifdef Q_OS_WIN
-    videoCallPath = "./bin/video_call.exe";
-#else
-    videoCallPath = "./bin/video_call";
-#endif
-    if (QFileInfo(videoCallPath).isFile()) {
+    const QString videoCallPath = findCallBinary(QStringLiteral("video_call"));
+    if (!videoCallPath.isEmpty()) {
         QProcess p;
         p.setProcessChannelMode(QProcess::ForwardedErrorChannel);
         p.start(videoCallPath, QStringList() << "listdevices");

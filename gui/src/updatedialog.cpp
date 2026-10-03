@@ -82,39 +82,29 @@ void UpdateDialog::checkVersion() {
     // Let GUI update
     QApplication::processEvents();
 
-    QString fearPath = m_cliPath;
-    if (fearPath.isEmpty() || !QFile::exists(fearPath)) {
+    /* От каталога приложения, а не от рабочего и не через PATH: "./bin/fear"
+     * и голое "fear" запустили бы чужой файл, окажись GUI запущен из папки,
+     * куда пишет кто-то другой. */
+    const QString appDir = QApplication::applicationDirPath();
 #ifdef Q_OS_WIN
-        fearPath = "./bin/fear.exe";
-        if (!QFile::exists(fearPath)) {
-            fearPath = "fear.exe";
-        }
+    const QString exe = QStringLiteral("fear.exe");
 #else
-        fearPath = "./bin/fear";
-        if (!QFile::exists(fearPath)) {
-            fearPath = "fear";
-        }
+    const QString exe = QStringLiteral("fear");
 #endif
+    QString fearPath = m_cliPath;
+    if (fearPath.isEmpty() || !QFileInfo(fearPath).isFile()) {
+        fearPath = appDir + "/bin/" + exe;
+        if (!QFileInfo(fearPath).isFile()) fearPath = appDir + "/" + exe;
     }
 
-    if (!QFile::exists(fearPath)) {
-#ifdef Q_OS_WIN
-        m_versionText->setPlainText("Error: fear.exe not found!\n"
+    if (!QFileInfo(fearPath).isFile()) {
+        m_versionText->setPlainText("Error: " + exe + " not found!\n"
                                     "Searched paths:\n"
                                     "- " + m_cliPath + "\n"
-                                    "- ./bin/fear.exe\n"
-                                    "- fear.exe\n\n"
+                                    "- " + appDir + "/bin/" + exe + "\n"
+                                    "- " + appDir + "/" + exe + "\n\n"
                                     "Please set the correct CLI path in File -> Set CLI path...");
-        m_statusLabel->setText("Error: fear.exe not found");
-#else
-        m_versionText->setPlainText("Error: fear not found!\n"
-                                    "Searched paths:\n"
-                                    "- " + m_cliPath + "\n"
-                                    "- ./bin/fear\n"
-                                    "- fear\n\n"
-                                    "Please set the correct CLI path in File -> Set CLI path...");
-        m_statusLabel->setText("Error: fear not found");
-#endif
+        m_statusLabel->setText("Error: " + exe + " not found");
 
         return;
     }

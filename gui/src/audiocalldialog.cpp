@@ -412,9 +412,8 @@ QString AudioCallDialog::findAudioCallApp() {
     QStringList possiblePaths = {
         QApplication::applicationDirPath() + "/audio_call",
         QApplication::applicationDirPath() + "/bin/audio_call",
-        QApplication::applicationDirPath() + "/../bin/audio_call",
-        "audio_call",
-        "./audio_call"
+        QApplication::applicationDirPath() + "/../bin/audio_call"
+        /* Без голого имени и "./": см. AudioCallManager::findAudioCallApp. */
     };
 
 #ifdef Q_OS_WIN

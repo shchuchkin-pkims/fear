@@ -7,6 +7,7 @@
 #include "backend.h"
 #include <sodium.h>
 #include <QFile>
+#include <QFileInfo>
 #include <QDir>
 #include <QDebug>
 #include <QGuiApplication>
@@ -313,17 +314,10 @@ QStringList Backend::getRecentMessages(int &outLastId) {
 bool Backend::generateKeypair(const QString &outPath) {
     Q_UNUSED(outPath);  // Not used anymore - genkey writes to room_key.txt
 
-    // Check if executable exists
-    if (cliPath.isEmpty() || !QFile::exists(cliPath)) {
-        QString defaultPath = "./bin/fear";
-        if (!QFile::exists(defaultPath)) {
-            defaultPath = "fear";
-            if (!QFile::exists(defaultPath)) {
-                emit error("CLI executable not found. Please set the correct path to fear");
-                return false;
-            }
-        }
-        cliPath = defaultPath;
+    // Тем же поиском, что везде: от каталога приложения, не от рабочего.
+    if (!resolveCliPath()) {
+        emit error("CLI executable not found. Please set the correct path to fear");
+        return false;
     }
 
     QProcess p;
@@ -456,13 +450,22 @@ bool Backend::resolveCliPath() {
      * directory the GUI was started from. */
     const QString appDir = QGuiApplication::applicationDirPath();
 #ifdef Q_OS_WIN
-    const QString defaultPath = appDir + "/bin/fear.exe";
+    const QString exe = QStringLiteral("fear.exe");
 #else
-    const QString defaultPath = appDir + "/bin/fear";
+    const QString exe = QStringLiteral("fear");
 #endif
-    if (!QFile::exists(defaultPath)) return false;
-    cliPath = defaultPath;
-    return true;
+    /* bin/ рядом с GUI - раскладка релиза (pack_release, CI). Рядом с самим
+     * GUI - раскладка, в которой CI до 0.6.0 выкладывал архивы: клиент лежал
+     * возле fear_gui, GUI искал его только в bin/ и не находил вовсе. Обе
+     * точки - в каталоге приложения, не в рабочем. isFile: каталог build/fear
+     * при запуске из дерева сборки - не программа. */
+    for (const QString &candidate : { appDir + "/bin/" + exe, appDir + "/" + exe }) {
+        if (QFileInfo(candidate).isFile()) {
+            cliPath = candidate;
+            return true;
+        }
+    }
+    return false;
 }
 
 bool Backend::generateIdentity(bool copyToClipboard) {
