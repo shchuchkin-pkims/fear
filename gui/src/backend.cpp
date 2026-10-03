@@ -576,6 +576,17 @@ void Backend::parseClientOutput(const QString &s) {
             continue;
         }
 
+        // Имя по метке - для подписей под плитками видео. Звонок знает
+        // участников только по метке; см. VideoCallManager::setPeerName.
+        if (t.startsWith("[ROSTER] ")) {
+            const QString rest = t.mid(9);
+            const int sp = rest.indexOf(QLatin1Char(' '));
+            if (sp > 0 && videoManager) {
+                videoManager->setPeerName(rest.left(sp), rest.mid(sp + 1).trimmed());
+            }
+            continue;
+        }
+
         // Capture room key from CLI output (CREATE or JOIN mode)
         // [create] Room key generated: <b64>
         // [join] Room key: <b64>

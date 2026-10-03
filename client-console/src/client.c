@@ -253,6 +253,26 @@ static void roster_snapshot_present(void) {
     }
 }
 
+/*
+ * Сообщить GUI, как зовут метку: «[ROSTER] <метка> <имя>».
+ *
+ * Звонок идёт отдельным процессом и знает участников только по метке из
+ * HELLO2: имени там нет, потому что HELLO2 не зашифрован и имя в нём прочёл
+ * бы ретранслятор. GUI пересылает эти строки процессу звонка, и под плиткой
+ * видео оказывается имя, а не метка. Управляющие символы - '?': имя не должно
+ * разорвать построчный протокол.
+ */
+static void roster_print_name(const char *tag, const char *display) {
+    char clean[MAX_NAME];
+    size_t n = 0;
+    for (const unsigned char *p = (const unsigned char *)display; *p && n + 1 < sizeof clean; p++) {
+        clean[n++] = (*p < 0x20 || *p == 0x7F) ? '?' : (char)*p;
+    }
+    clean[n] = '\0';
+    printf("[ROSTER] %s %s\n", tag, clean);
+    fflush(stdout);
+}
+
 /** Remember, or update, one member's identity key and announced name. */
 static void roster_note_identity(const char *tag, const uint8_t *pk, const char *display) {
     if (!tag || !pk) return;
@@ -260,12 +280,16 @@ static void roster_note_identity(const char *tag, const uint8_t *pk, const char 
         if (strcmp(g_roster[i].tag, tag) != 0) continue;
         memcpy(g_roster[i].pk, pk, IDENTITY_PK_BYTES);
         g_roster[i].has_identity = 1;
-        if (display && display[0]) snprintf(g_roster[i].display, MAX_NAME, "%s", display);
+        if (display && display[0] && strcmp(g_roster[i].display, display) != 0) {
+            snprintf(g_roster[i].display, MAX_NAME, "%s", display);
+            roster_print_name(tag, display);
+        }
         return;
     }
     if (g_roster_count >= ROSTER_MAX) return;
     snprintf(g_roster[g_roster_count].tag, IDENTITY_SESSION_TAG_LEN, "%s", tag);
     snprintf(g_roster[g_roster_count].display, MAX_NAME, "%s", display ? display : "");
+    if (display && display[0]) roster_print_name(tag, display);
     memcpy(g_roster[g_roster_count].pk, pk, IDENTITY_PK_BYTES);
     g_roster[g_roster_count].has_identity = 1;
     /*

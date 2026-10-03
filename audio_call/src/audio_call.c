@@ -1110,7 +1110,11 @@ static THREAD_RET th_recv_func(void *arg) {
             /* TCP relay: read media frame from server */
             n = tcp_relay_recv_media(c, rbuf, (int)sizeof(rbuf));
             if (n < 0) {
-                fprintf(stderr, "[relay] TCP connection lost\n");
+                /* -1 is also how the reader unwinds when we are the ones
+                 * stopping - that is not a lost connection. */
+                if (atomic_load(&c->running)) {
+                    fprintf(stderr, "[relay] TCP connection lost\n");
+                }
                 atomic_store(&c->running, 0);
                 break;
             }
@@ -1918,6 +1922,11 @@ static void setup_signal(void) {
     sigemptyset(&sa.sa_mask);
     sa.sa_flags = 0;
     sigaction(SIGINT, &sa, NULL);
+    /* SIGTERM is how the GUI hangs up. Left at its default it killed the
+     * process outright - no teardown, no key wiping, no word to the peers -
+     * and once SDL was up it became a window-close event instead. Either way
+     * it was not the clean stop Ctrl+C gets; now it is the same one. */
+    sigaction(SIGTERM, &sa, NULL);
 #endif
 }
 

@@ -173,7 +173,8 @@ bool VideoCallManager::startCall(const QString &remoteIp, quint16 remotePort, co
         callProcess = nullptr;
         return false;
     }
-    callProcess->closeWriteChannel();
+    /* Канал не закрываем: за ключом по нему идут имена участников. */
+    sendPeerNames();
 
     emit callStarted();
     return true;
@@ -235,7 +236,8 @@ bool VideoCallManager::startListening(quint16 localPort, const QString &key,
         callProcess = nullptr;
         return false;
     }
-    callProcess->closeWriteChannel();
+    /* Канал не закрываем: за ключом по нему идут имена участников. */
+    sendPeerNames();
 
     emit listeningStarted();
     return true;
@@ -298,7 +300,8 @@ bool VideoCallManager::startRelay(const QString &serverIp, quint16 serverPort,
         callProcess = nullptr;
         return false;
     }
-    callProcess->closeWriteChannel();
+    /* Канал не закрываем: за ключом по нему идут имена участников. */
+    sendPeerNames();
 
     emit callStarted();
     return true;
@@ -380,4 +383,26 @@ QString VideoCallManager::findVideoCallApp() {
     }
 
     return QString();
+}
+
+static QByteArray peerNameLine(const QString &tag, QString name) {
+    // Одна строка на имя: перевод строки внутри имени разорвал бы протокол.
+    name.replace(QLatin1Char('\n'), QLatin1Char(' ')).replace(QLatin1Char('\r'), QLatin1Char(' '));
+    return QStringLiteral("name %1 %2\n").arg(tag, name).toUtf8();
+}
+
+void VideoCallManager::sendPeerNames() {
+    if (!callProcess) return;
+    for (auto it = peerNames.cbegin(); it != peerNames.cend(); ++it) {
+        callProcess->write(peerNameLine(it.key(), it.value()));
+    }
+}
+
+void VideoCallManager::setPeerName(const QString &tag, const QString &name) {
+    if (tag.isEmpty() || name.isEmpty() || tag.contains(QLatin1Char(' '))) return;
+    if (peerNames.value(tag) == name) return;
+    peerNames.insert(tag, name);
+    if (callProcess && callProcess->state() == QProcess::Running) {
+        callProcess->write(peerNameLine(tag, name));
+    }
 }

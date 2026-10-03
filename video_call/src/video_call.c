@@ -168,6 +168,9 @@ static int g_have_call_id = 0;
 
 /* ===== VideoCall state ===== */
 
+/* Подпись под плиткой: имя из реестра чата, транслитерированное, или метка. */
+#define VC_LABEL_BYTES 28
+
 /**
  * One rendered participant on the audio path: its Opus decoder, its jitter
  * buffer, and enough bookkeeping to decide who gives up a decoder when a new
@@ -215,7 +218,7 @@ typedef struct {
     uint64_t      pic_ms;    /**< when that picture was decoded */
     uint64_t      shown_ms;  /**< pic_ms of the last picture counted as shown */
     /** Caption: the name this participant announced, or its SID if none. */
-    char          label[MH_NAME_BYTES + 1];
+    char          label[VC_LABEL_BYTES];   /* имя участника или его метка */
 } VidSlot;
 
 typedef struct VideoCall {
@@ -463,13 +466,39 @@ static int tcp_send_all(socket_t fd, const void *buf, size_t len) {
     return 0;
 }
 
-static int tcp_recv_all(socket_t fd, void *buf, size_t len) {
+/**
+ * Read exactly `len` bytes from the relay, treating a receive timeout as "not
+ * yet" rather than as a failure - the same contract as audio_call.
+ *
+ * The socket carries a 200 ms timeout so the receive thread can notice the
+ * call ending. Before it had one, the thread sat in recv forever whenever
+ * nothing was arriving - the last participant left, or the others hung up
+ * first - and video_call_stop blocked in pthread_join. The process never
+ * exited on its own: the GUI waited two seconds and SIGKILLed it, so none of
+ * the teardown ever ran, not the report and not the key wiping, and the
+ * camera stayed busy for whoever called next. The UDP path got its timeout
+ * long ago; relay mode, the default, had been missed.
+ *
+ * A timeout in the middle of a frame keeps reading the same frame: giving up
+ * there would leave the stream desynchronised.
+ */
+static int tcp_recv_all(VideoCall *vc, void *buf, size_t len) {
     uint8_t *p = (uint8_t *)buf;
     size_t got = 0;
     while (got < len) {
-        int n = recv(fd, (char *)(p + got), (int)(len - got), 0);
-        if (n <= 0) return -1;
-        got += (size_t)n;
+        int n = recv(vc->tcp_sock, (char *)(p + got), (int)(len - got), 0);
+        if (n > 0) { got += (size_t)n; continue; }
+        if (n == 0) return -1;   /* relay closed */
+#ifdef _WIN32
+        int err = WSAGetLastError();
+        if (err == WSAETIMEDOUT || err == WSAEWOULDBLOCK) {
+#else
+        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+#endif
+            if (!atomic_load(&vc->running)) return -1;
+            continue;
+        }
+        return -1;
     }
     return 0;
 }
@@ -497,6 +526,20 @@ static int tcp_relay_connect(VideoCall *vc, const char *ip, uint16_t port) {
     /* Disable Nagle's algorithm for low-latency media relay */
     int flag = 1;
     setsockopt(vc->tcp_sock, IPPROTO_TCP, TCP_NODELAY, (const char *)&flag, sizeof(flag));
+    /* Bound how long recv may block - see tcp_recv_all. Same 200 ms as the
+     * UDP socket and as audio_call. */
+    {
+#ifdef _WIN32
+        DWORD rcv_to = 200;
+        setsockopt(vc->tcp_sock, SOL_SOCKET, SO_RCVTIMEO,
+                   (const char *)&rcv_to, sizeof rcv_to);
+#else
+        struct timeval rcv_to;
+        rcv_to.tv_sec = 0;
+        rcv_to.tv_usec = 200000;
+        setsockopt(vc->tcp_sock, SOL_SOCKET, SO_RCVTIMEO, &rcv_to, sizeof rcv_to);
+#endif
+    }
     printf("TCP relay connected to %s:%u\n", ip, port);
     return 0;
 }
@@ -597,30 +640,30 @@ static int tcp_relay_recv_media(VideoCall *vc, uint8_t *out, int out_size) {
         uint8_t skip[512];
 
         /* room_len */
-        if (tcp_recv_all(vc->tcp_sock, hdr2, 2) < 0) return -1;
+        if (tcp_recv_all(vc, hdr2, 2) < 0) return -1;
         uint16_t room_len = (uint16_t)(hdr2[0] | (hdr2[1] << 8));
         if (room_len > 255) return -1;
-        if (tcp_recv_all(vc->tcp_sock, skip, room_len) < 0) return -1;
+        if (tcp_recv_all(vc, skip, room_len) < 0) return -1;
 
         /* name_len + name */
-        if (tcp_recv_all(vc->tcp_sock, hdr2, 2) < 0) return -1;
+        if (tcp_recv_all(vc, hdr2, 2) < 0) return -1;
         uint16_t name_len = (uint16_t)(hdr2[0] | (hdr2[1] << 8));
         if (name_len > 255) return -1;
-        if (tcp_recv_all(vc->tcp_sock, skip, name_len) < 0) return -1;
+        if (tcp_recv_all(vc, skip, name_len) < 0) return -1;
 
         /* nonce_len + nonce */
-        if (tcp_recv_all(vc->tcp_sock, hdr2, 2) < 0) return -1;
+        if (tcp_recv_all(vc, hdr2, 2) < 0) return -1;
         uint16_t nonce_len = (uint16_t)(hdr2[0] | (hdr2[1] << 8));
         if (nonce_len > sizeof(skip)) return -1;
-        if (nonce_len > 0 && tcp_recv_all(vc->tcp_sock, skip, nonce_len) < 0) return -1;
+        if (nonce_len > 0 && tcp_recv_all(vc, skip, nonce_len) < 0) return -1;
 
         /* type */
         uint8_t type;
-        if (tcp_recv_all(vc->tcp_sock, &type, 1) < 0) return -1;
+        if (tcp_recv_all(vc, &type, 1) < 0) return -1;
 
         /* clen */
         uint8_t clenbuf[4];
-        if (tcp_recv_all(vc->tcp_sock, clenbuf, 4) < 0) return -1;
+        if (tcp_recv_all(vc, clenbuf, 4) < 0) return -1;
         uint32_t clen = (uint32_t)(clenbuf[0] | (clenbuf[1] << 8) |
                                     (clenbuf[2] << 16) | (clenbuf[3] << 24));
 
@@ -629,7 +672,7 @@ static int tcp_relay_recv_media(VideoCall *vc, uint8_t *out, int out_size) {
          * untrusted relay server (no room key required). */
         if (type == MSG_TYPE_MEDIA_RELAY && clen > 0 &&
             out_size > 0 && clen <= (uint32_t)out_size) {
-            if (tcp_recv_all(vc->tcp_sock, out, clen) < 0) return -1;
+            if (tcp_recv_all(vc, out, clen) < 0) return -1;
             return (int)clen;
         }
 
@@ -637,7 +680,7 @@ static int tcp_relay_recv_media(VideoCall *vc, uint8_t *out, int out_size) {
         uint32_t remaining = clen;
         while (remaining > 0) {
             uint32_t chunk = remaining > sizeof(skip) ? sizeof(skip) : remaining;
-            if (tcp_recv_all(vc->tcp_sock, skip, chunk) < 0) return -1;
+            if (tcp_recv_all(vc, skip, chunk) < 0) return -1;
             remaining -= chunk;
         }
         /* Loop to read next frame */
@@ -708,6 +751,7 @@ static int vc_setup_media_keys(VideoCall *vc) {
 
 /** Defined with vid_acquire below; the HELLO handler needs it first. */
 static void vc_slot_label(const VideoCall *vc, int slot, char *out, size_t cap);
+static void vc_relabel(VideoCall *vc, VidSlot *v, int force);
 
 /* ===== HELLO2 handshake ===== */
 
@@ -818,7 +862,7 @@ static void handle_hello(VideoCall *vc, const uint8_t *buf, size_t len) {
         snprintf(vc->peer_name[idx], sizeof vc->peer_name[idx], "%s", h.name);
         for (int i = 0; i < VC_MAX_VIDEO; i++) {
             if (vc->vid[i].slot != idx) continue;
-            vc_slot_label(vc, idx, vc->vid[i].label, sizeof vc->vid[i].label);
+            vc_relabel(vc, &vc->vid[i], 0);
         }
     }
 
@@ -1067,6 +1111,208 @@ static void vid_teardown(VideoCall *vc) {
     }
 }
 
+/* ===== Имена участников ===== */
+
+/*
+ * Имя участника - по его метке сессии, от того, кто запустил звонок.
+ *
+ * В HELLO2 едут первые 16 знаков метки сессии, а не имя, и это не недосмотр:
+ * HELLO2 аутентифицирован, но не зашифрован, и имя в нём прочёл бы
+ * ретранслятор - ровно то, что Phase D убрала из его журнала. Поэтому
+ * подпись под плиткой была меткой, бессмысленной для человека.
+ *
+ * Имена знает GUI: в реестр чата они приходят подписанными анонсами внутри
+ * сквозного шифрования. Он передаёт их сюда строками в stdin - тем же
+ * каналом, по которому пришёл ключ, - и досылает новых участников по ходу:
+ *
+ *     name <метка сессии> <отображаемое имя до конца строки>
+ *
+ * На провод имена отсюда не уходят. Встроенный шрифт SDL знает только ASCII,
+ * поэтому кириллица транслитерируется, а прочие буквы становятся '?'. Без
+ * GUI строк нет, и подпись остаётся меткой, как раньше.
+ */
+#define VC_NAMES_MAX 32
+
+typedef struct {
+    char tag[48];
+    char display[96];
+} VcName;
+
+static VcName     g_names[VC_NAMES_MAX];
+static int        g_names_count = 0;
+static atomic_int g_names_dirty;
+#ifdef _WIN32
+static CRITICAL_SECTION g_names_lock;
+#define NAMES_LOCK()   EnterCriticalSection(&g_names_lock)
+#define NAMES_UNLOCK() LeaveCriticalSection(&g_names_lock)
+#else
+static pthread_mutex_t g_names_lock = PTHREAD_MUTEX_INITIALIZER;
+#define NAMES_LOCK()   pthread_mutex_lock(&g_names_lock)
+#define NAMES_UNLOCK() pthread_mutex_unlock(&g_names_lock)
+#endif
+
+static void vc_names_put(const char *tag, const char *display) {
+    /* Метка сессии - 32 знака; длиннее поля - не метка, и обрезанная она
+     * не совпала бы сама с собой при следующем приходе. */
+    if (strlen(tag) >= sizeof g_names[0].tag) return;
+    NAMES_LOCK();
+    int i;
+    for (i = 0; i < g_names_count; i++) {
+        if (strcmp(g_names[i].tag, tag) == 0) break;
+    }
+    if (i == g_names_count) {
+        if (g_names_count == VC_NAMES_MAX) i = VC_NAMES_MAX - 1;  /* полный - последний уступает */
+        else g_names_count++;
+        memcpy(g_names[i].tag, tag, strlen(tag) + 1);
+    }
+    /* Длинное имя обрезается: под плиткой его всё равно сократит подпись. */
+    snprintf(g_names[i].display, sizeof g_names[i].display, "%.*s",
+             (int)sizeof g_names[i].display - 1, display);
+    NAMES_UNLOCK();
+    atomic_store(&g_names_dirty, 1);
+}
+
+/*
+ * UTF-8 -> ASCII для встроенного шрифта SDL. Кириллица - транслитерацией
+ * (Ё/ё учтены отдельно), печатный ASCII - как есть, остальное - '?'. Длинное
+ * обрезается многоточием: подпись не должна вылезать из плитки.
+ */
+static void vc_ascii_label(const char *in, char *out, size_t cap) {
+    static const char *const ru[64] = {
+        "A","B","V","G","D","E","Zh","Z","I","Y","K","L","M","N","O","P",
+        "R","S","T","U","F","Kh","Ts","Ch","Sh","Shch","","Y","","E","Yu","Ya",
+        "a","b","v","g","d","e","zh","z","i","y","k","l","m","n","o","p",
+        "r","s","t","u","f","kh","ts","ch","sh","shch","","y","","e","yu","ya"
+    };
+    if (!out || cap == 0) return;
+    size_t n = 0;
+    const unsigned char *p = (const unsigned char *)in;
+    while (*p) {
+        const char *piece = "?";
+        char one[2] = {0, 0};
+        if (*p < 0x80) {
+            one[0] = (*p >= 0x20 && *p < 0x7F) ? (char)*p : '?';
+            piece = one;
+            p += 1;
+        } else if ((*p & 0xE0) == 0xC0 && (p[1] & 0xC0) == 0x80) {
+            unsigned cp = ((unsigned)(*p & 0x1F) << 6) | (unsigned)(p[1] & 0x3F);
+            if (cp >= 0x410 && cp <= 0x44F) piece = ru[cp - 0x410];
+            else if (cp == 0x401) piece = "Yo";
+            else if (cp == 0x451) piece = "yo";
+            p += 2;
+        } else {
+            /* Многобайтная последовательность другой письменности - один '?'. */
+            p += 1;
+            while ((*p & 0xC0) == 0x80) p++;
+        }
+        size_t len = strlen(piece);
+        if (n + len + 1 > cap) {
+            if (cap >= 4) {
+                size_t keep = n < cap - 4 ? n : cap - 4;
+                memcpy(out + keep, "...", 3);
+                n = keep + 3;
+            }
+            break;
+        }
+        memcpy(out + n, piece, len);
+        n += len;
+    }
+    out[n < cap ? n : cap - 1] = '\0';
+}
+
+/* Имя для метки или её начала, уже в ASCII. 0 - имени не знаем. */
+static int vc_name_for(const char *tag_prefix, char *out, size_t cap) {
+    size_t plen = strlen(tag_prefix);
+    if (plen == 0) return 0;
+    int found = 0;
+    NAMES_LOCK();
+    for (int i = 0; i < g_names_count; i++) {
+        if (strncmp(g_names[i].tag, tag_prefix, plen) == 0 && g_names[i].display[0]) {
+            vc_ascii_label(g_names[i].display, out, cap);
+            found = out[0] != '\0';
+            break;
+        }
+    }
+    NAMES_UNLOCK();
+    return found;
+}
+
+static THREAD_RET vc_names_reader(void *arg) {
+    (void)arg;
+    char line[256];
+    while (fgets(line, sizeof line, stdin)) {
+        line[strcspn(line, "\r\n")] = '\0';
+        if (strncmp(line, "name ", 5) != 0) continue;
+        char *tag = line + 5;
+        char *sp = strchr(tag, ' ');
+        if (!sp || sp == tag) continue;
+        *sp = '\0';
+        vc_names_put(tag, sp + 1);
+    }
+    return 0;   /* EOF: тот, кто запустил звонок, закрыл канал */
+}
+
+/* Слушать имена после ключа - только когда stdin не терминал. */
+static void vc_names_start(void) {
+    if (isatty(fileno(stdin))) return;
+#ifdef _WIN32
+    /* g_names_lock инициализирован в main(): им пользуется и подпись плитки,
+     * даже когда этот поток не запущен (ключ из файла, stdin - терминал). */
+    HANDLE h = CreateThread(NULL, 0, vc_names_reader, NULL, 0, NULL);
+    if (h) CloseHandle(h);
+#else
+    pthread_t th;
+    if (pthread_create(&th, NULL, vc_names_reader, NULL) == 0) pthread_detach(th);
+#endif
+}
+
+/**
+ * Caption for a participant: the name it announced, or its SID when it
+ * announced none. Never empty, because an unlabelled cell in a grid of four
+ * is worse than a hex tag.
+ */
+static void vc_slot_label(const VideoCall *vc, int slot, char *out, size_t cap) {
+    if (!out || cap == 0) return;
+    if (slot >= 0 && slot < MS_MAX_SLOTS && vc->peer_name[slot][0] != '\0') {
+        if (vc_name_for(vc->peer_name[slot], out, cap)) return;
+        snprintf(out, cap, "%s", vc->peer_name[slot]);
+        return;
+    }
+    uint8_t sid[MK_SID_BYTES];
+    vc_sid_of(vc, slot, sid);
+    snprintf(out, cap, "%02x%02x%02x", sid[0], sid[1], sid[2]);
+}
+
+/*
+ * Пересчитать подпись видимого участника и сказать, если она стала другой:
+ * «[LABEL] <sid> <подпись>». Так видно, что под плиткой теперь имя, а не
+ * метка, - и в журнале звонка GUI, и там, где на окно не посмотреть.
+ *
+ * Только поток приёма, и без disp_lock на руках: подпись строится из его
+ * данных, а копию для показа он кладёт под замком, который берёт сам.
+ */
+static void vc_relabel(VideoCall *vc, VidSlot *v, int force) {
+    char fresh[VC_LABEL_BYTES];
+    vc_slot_label(vc, v->slot, fresh, sizeof fresh);
+    if (!force && strcmp(fresh, v->label) == 0) return;
+#ifdef _WIN32
+    EnterCriticalSection(&vc->disp_lock);
+#else
+    pthread_mutex_lock(&vc->disp_lock);
+#endif
+    snprintf(v->label, sizeof v->label, "%s", fresh);
+#ifdef _WIN32
+    LeaveCriticalSection(&vc->disp_lock);
+#else
+    pthread_mutex_unlock(&vc->disp_lock);
+#endif
+    atomic_store(&vc->disp_new_frame, 1);   /* перерисовать с новой подписью */
+    uint8_t sid[MK_SID_BYTES];
+    vc_sid_of(vc, v->slot, sid);
+    printf("[LABEL] %02x%02x%02x %s\n", sid[0], sid[1], sid[2], fresh);
+    fflush(stdout);
+}
+
 /**
  * The reassembler and VP8 decoder for a sender, creating or reassigning one
  * if this is a picture we are not currently rendering. Receive thread only.
@@ -1079,22 +1325,6 @@ static void vid_teardown(VideoCall *vc) {
  *
  * Returns NULL only if a decoder cannot be created at all.
  */
-/**
- * Caption for a participant: the name it announced, or its SID when it
- * announced none. Never empty, because an unlabelled cell in a grid of four
- * is worse than a hex tag.
- */
-static void vc_slot_label(const VideoCall *vc, int slot, char *out, size_t cap) {
-    if (!out || cap == 0) return;
-    if (slot >= 0 && slot < MS_MAX_SLOTS && vc->peer_name[slot][0] != '\0') {
-        snprintf(out, cap, "%s", vc->peer_name[slot]);
-        return;
-    }
-    uint8_t sid[MK_SID_BYTES];
-    vc_sid_of(vc, slot, sid);
-    snprintf(out, cap, "%02x%02x%02x", sid[0], sid[1], sid[2]);
-}
-
 static VidSlot *vid_acquire(VideoCall *vc, int slot) {
     VidSlot *chosen = NULL;
 
@@ -1149,8 +1379,9 @@ static VidSlot *vid_acquire(VideoCall *vc, int slot) {
     chosen->frames = 0;
     chosen->shown = 0;
     /* Resolved here, on the thread that owns the sender table and the name
-     * table, so the display side only ever reads the copy. */
-    vc_slot_label(vc, slot, chosen->label, sizeof chosen->label);
+     * table, so the display side only ever reads the copy. Через vc_relabel,
+     * чтобы и первая подпись плитки попала в журнал звонка. */
+    vc_relabel(vc, chosen, 1);
     return chosen;
 }
 
@@ -1660,11 +1891,24 @@ static THREAD_RET th_recv_func(void *arg) {
     while (atomic_load(&vc->running)) {
         int n;
 
+        /* Новые имена из GUI - здесь, а не в потоке показа: подпись строится
+         * из peer_name и таблицы отправителей, а ими владеет этот поток. Пакеты
+         * в звонке идут непрерывно, так что проверка случается часто. */
+        if (atomic_exchange(&g_names_dirty, 0)) {
+            for (int i = 0; i < VC_MAX_VIDEO; i++) {
+                if (vc->vid[i].slot >= 0) vc_relabel(vc, &vc->vid[i], 0);
+            }
+        }
+
         if (vc->relay_mode && vc->tcp_sock) {
             /* TCP relay: read media frame from server */
             n = tcp_relay_recv_media(vc, rbuf, MAX_PACKET_SIZE);
             if (n < 0) {
-                fprintf(stderr, "[relay] TCP connection lost\n");
+                /* -1 is also how the reader unwinds when we are the ones
+                 * stopping - that is not a lost connection. */
+                if (atomic_load(&vc->running)) {
+                    fprintf(stderr, "[relay] TCP connection lost\n");
+                }
                 atomic_store(&vc->running, 0);
                 break;
             }
@@ -2182,6 +2426,11 @@ static void setup_signal(void) {
     sigemptyset(&sa.sa_mask);
     sa.sa_flags = 0;
     sigaction(SIGINT, &sa, NULL);
+    /* SIGTERM is how the GUI hangs up. Left at its default it killed the
+     * process outright - no teardown, no key wiping, no word to the peers -
+     * and once SDL was up it became a window-close event instead. Either way
+     * it was not the clean stop Ctrl+C gets; now it is the same one. */
+    sigaction(SIGTERM, &sa, NULL);
 #endif
 }
 
@@ -2328,6 +2577,8 @@ static int resolve_key(const CallOptions *opts, uint8_t key[AES_GCM_KEY_LEN]) {
         if (read_key_from_stdin(key_buffer, sizeof(key_buffer), is_interactive) != 0)
             return -1;
         hexkey = key_buffer;
+        /* За ключом по тому же каналу идут имена участников - см. vc_names_put. */
+        vc_names_start();
     }
 
     if (hex2bytes(hexkey, key, AES_GCM_KEY_LEN) != 0) {
@@ -2749,6 +3000,11 @@ static int start_video_call(const char *remote_ip, uint16_t remote_port,
 }
 
 int main(int argc, char **argv) {
+#ifdef _WIN32
+    /* Раньше всего: таблицу имён читает подпись плитки, а поток, который её
+     * пополняет, запускается не всегда. */
+    InitializeCriticalSection(&g_names_lock);
+#endif
     /* Настройки микрофона разбираются раньше выбора режима - см. audio_call. */
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--mic-gain") == 0 && i + 1 < argc) {

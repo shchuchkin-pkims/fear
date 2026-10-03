@@ -157,6 +157,15 @@ if(TARGET fear)
     set_tests_properties(server_caps PROPERTIES TIMEOUT 90)
 endif()
 
+# Звонок обязан завершаться по SIGINT и SIGTERM, даже если в нём тихо: в
+# режиме relay поток приёма висел в recv без таймаута, и процесс не выходил.
+if(NOT WIN32 AND TARGET fear AND TARGET video_call)
+    add_test(NAME call_quit
+             COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/call_quit.sh
+                     $<TARGET_FILE:fear> $<TARGET_FILE:video_call>)
+    set_tests_properties(call_quit PROPERTIES TIMEOUT 60)
+endif()
+
 # Кому релей рассылает медиа. Медиа уходило во все соединения комнаты, кроме
 # сокета отправителя, - в чаты и обратно в чат самого отправителя. Ни один
 # тест этого не видел: media_loopback ходит через собственный хаб, а не через
