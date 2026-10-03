@@ -2296,6 +2296,12 @@ static int parse_options(int argc, char **argv, int start_idx, CallOptions *opts
             opts->relay_room = argv[++i];
         } else if (strcmp(argv[i], "--name") == 0 && i + 1 < argc) {
             opts->relay_name = argv[++i];
+        } else if ((strcmp(argv[i], "--mic-gain") == 0 ||
+                    strcmp(argv[i], "--stun") == 0 ||
+                    strcmp(argv[i], "--noise-suppress") == 0) && i + 1 < argc) {
+            /* Разобран предварительным проходом. Значение пропускаем вместе с
+             * флагом: иначе «--mic-gain 6» ниже стало бы локальным портом 6. */
+            i++;
         } else {
             /* Treat as local port if numeric */
             char *endptr;

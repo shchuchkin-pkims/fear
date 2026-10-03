@@ -26,7 +26,7 @@
  * - unzip utility (for archive extraction)
  *
  * @author F.E.A.R. Project contributors
- * @license MIT (free to use)
+ * @license GPL-3.0-or-later (see LICENSING.md)
  * @version 1.0
  */
 

@@ -115,6 +115,14 @@ add_test(NAME integration_rotation
          COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/smoke_rotation.sh $<TARGET_FILE:fear>)
 set_tests_properties(integration_rotation PROPERTIES TIMEOUT 120)
 
+# Тот же выбор ротатора, но через ECDH-вход, которого smoke_rotation не
+# делает: там ключ раздаётся всем заранее. Вошедший по ECDH терял список о
+# собственном приходе и следующий вход принимал за свой - а избранным
+# ротатором тогда не ротировал никто.
+add_test(NAME integration_join_rotation
+         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/smoke_join_rotation.sh $<TARGET_FILE:fear>)
+set_tests_properties(integration_join_rotation PROPERTIES TIMEOUT 120)
+
 # Трёхсторонний медиа-loopback: три процесса через hub, каждый расшифровывает
 # двух других. Единственный тест, способный поймать инверсию ролей или
 # несогласованную соль - модульные тесты живут внутри одного процесса.
@@ -147,6 +155,18 @@ if(TARGET fear)
              COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/server_caps.sh
                      $<TARGET_FILE:fear> $<TARGET_FILE:load_server>)
     set_tests_properties(server_caps PROPERTIES TIMEOUT 90)
+endif()
+
+# Кому релей рассылает медиа. Медиа уходило во все соединения комнаты, кроме
+# сокета отправителя, - в чаты и обратно в чат самого отправителя. Ни один
+# тест этого не видел: media_loopback ходит через собственный хаб, а не через
+# fear server.
+if(NOT WIN32 AND TARGET fear)
+    add_executable(test_media_routing test_media_routing.c)
+    add_test(NAME media_routing
+             COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/media_routing.sh
+                     $<TARGET_FILE:fear> $<TARGET_FILE:test_media_routing>)
+    set_tests_properties(media_routing PROPERTIES TIMEOUT 60)
 endif()
 
 # Протокольный тест M10: BLOB_GET доступен только владельцу pk (подписанный

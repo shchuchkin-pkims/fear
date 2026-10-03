@@ -688,7 +688,7 @@ A: Yes. An Android client is available at [fear-mobile](https://github.com/shchu
 
 ## License
 
-F.E.A.R. Project is distributed under the **MIT License**.
+F.E.A.R. is free software. The server (`client-console/`, `identity/`, `Dockerfile`, `web/server.js`) is licensed under the **GNU AGPL-3.0-or-later**; the clients (`gui/`, `audio_call/`, `video_call/`, `key-exchange/`, `updater/`, `web/public/`) under the **GNU GPL-3.0-or-later**. See [LICENSING.md](../LICENSING.md) for the full mapping, and [LICENSE](../LICENSE) and [LICENSE.GPL-3.0](../LICENSE.GPL-3.0) for the texts.
 
 ---
 

@@ -255,6 +255,9 @@ static void broadcast(client_t *clients, int *nclients, const char *room,
 
     /* Frame is valid, broadcast to room participants */
     (void)room; /* Suppress unused parameter warning */
+    /* Метка сессии отправителя. Совпадение с меткой соединения проверено при
+     * приёме кадра (anti-spoofing), так что ей можно верить. */
+    const char *sender_tag = (const char *)(frame + 2 + room_len + 2);
 
     for (int i = 0; i < *nclients; i++) {
         if (clients[i].fd == from) {
@@ -269,6 +272,28 @@ static void broadcast(client_t *clients, int *nclients, const char *room,
         /* Only send to clients in same room */
         if (strcmp(clients[i].room, room) != 0) {
             continue;
+        }
+
+        /*
+         * Медиа - только звонкам, и не тому же участнику.
+         *
+         * У участника два соединения под одной меткой сессии: чат и звонок.
+         * Рассылка исключала только сокет отправителя, и медиа уходило во все
+         * прочие - в чат каждого участника, где его читают и выбрасывают, и в
+         * чат самого отправителя, то есть его же поток возвращался к нему
+         * обратно. На телефоне это лишняя полоса видео вниз по Wi-Fi: ничего
+         * не показывает, а эфир у выгрузки вверх отнимает - Wi-Fi
+         * полудуплексный. Замер на живом звонке: 211 МБ за сеанс в сокет чата
+         * телефона и 90 КБ его собственного видео в очереди на выгрузку.
+         */
+        if (is_media) {
+            if (!clients[i].is_media_relay) {
+                continue;
+            }
+            if (strlen(clients[i].name) == name_len &&
+                memcmp(clients[i].name, sender_tag, name_len) == 0) {
+                continue;
+            }
         }
 
         /*

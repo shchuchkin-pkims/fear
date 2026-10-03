@@ -1921,6 +1921,22 @@ static void setup_signal(void) {
 #endif
 }
 
+/*
+ * Флаги, которые разбирает предварительный проход в main (микрофон и STUN).
+ * Каждый берёт ровно одно значение.
+ *
+ * Ветки режимов обязаны их пропускать вместе со значением. Раньше не
+ * пропускали: «--noise-suppress medium» проваливалось в позиционные номера
+ * устройств, atoi превращал оба слова в ноль, и звонок открывал устройство 0 -
+ * на обычном ПК это звуковой выход HDMI на монитор, без микрофона. Звонок при
+ * этом соединялся, ключи сходились, и никто никого не слышал.
+ */
+static int is_prepass_flag(const char *a) {
+    return strcmp(a, "--mic-gain") == 0 ||
+           strcmp(a, "--stun") == 0 ||
+           strcmp(a, "--noise-suppress") == 0;
+}
+
 int main(int argc, char **argv) {
     /*
      * Настройки микрофона разбираются раньше выбора режима: они одинаково
@@ -2086,6 +2102,13 @@ int main(int argc, char **argv) {
             } else if (strcmp(argv[arg_idx], "--no-sign") == 0) {
                 no_sign = 1;
                 arg_idx++;
+            } else if (is_prepass_flag(argv[arg_idx]) && arg_idx + 1 < argc) {
+                arg_idx += 2;   /* уже разобран предварительным проходом */
+            } else if (strncmp(argv[arg_idx], "--", 2) == 0) {
+                /* Незнакомый флаг - ошибка, а не номер устройства: молча
+                 * превращённый в ноль, он открывает чужое устройство. */
+                fprintf(stderr, "Error: unknown option %s\n", argv[arg_idx]);
+                return 1;
             } else {
                 // Legacy positional arguments: [hexkey] [local_bind_port] [input_dev] [output_dev]
                 if (hexkey_arg == NULL && strlen(argv[arg_idx]) == 64) {
@@ -2233,6 +2256,13 @@ int main(int argc, char **argv) {
             } else if (strcmp(argv[arg_idx], "--no-sign") == 0) {
                 no_sign = 1;
                 arg_idx++;
+            } else if (is_prepass_flag(argv[arg_idx]) && arg_idx + 1 < argc) {
+                arg_idx += 2;   /* уже разобран предварительным проходом */
+            } else if (strncmp(argv[arg_idx], "--", 2) == 0) {
+                /* Незнакомый флаг - ошибка, а не номер устройства: молча
+                 * превращённый в ноль, он открывает чужое устройство. */
+                fprintf(stderr, "Error: unknown option %s\n", argv[arg_idx]);
+                return 1;
             } else {
                 // Legacy positional arguments: [hexkey] [input_dev] [output_dev]
                 if (hexkey_arg == NULL && strlen(argv[arg_idx]) == 64) {
@@ -2378,6 +2408,13 @@ int main(int argc, char **argv) {
                 relay_room = argv[arg_idx + 1]; arg_idx += 2;
             } else if (strcmp(argv[arg_idx], "--name") == 0 && arg_idx + 1 < argc) {
                 relay_name = argv[arg_idx + 1]; arg_idx += 2;
+            } else if (is_prepass_flag(argv[arg_idx]) && arg_idx + 1 < argc) {
+                arg_idx += 2;   /* уже разобран предварительным проходом */
+            } else if (strncmp(argv[arg_idx], "--", 2) == 0) {
+                /* Незнакомый флаг - ошибка, а не номер устройства: молча
+                 * превращённый в ноль, он открывает чужое устройство. */
+                fprintf(stderr, "Error: unknown option %s\n", argv[arg_idx]);
+                return 1;
             } else {
                 if (input_dev == -1) { input_dev = atoi(argv[arg_idx]); arg_idx++; }
                 else if (output_dev == -1) { output_dev = atoi(argv[arg_idx]); arg_idx++; }

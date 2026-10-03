@@ -13,7 +13,9 @@ PORT="${3:-47911}"
 WORK="$(mktemp -d /tmp/fear-caps-XXXXXX)"
 trap 'kill "${SRV_PID:-0}" 2>/dev/null; rm -rf "$WORK"' EXIT
 
-( cd "$WORK" && "$SERVER" server --port "$PORT" >server.log 2>&1 ) &
+# exec: иначе $! - это PID подоболочки, ловушка убивала её, а сервер
+# оставался сиротой на порту, и следующий прогон падал на bind.
+( cd "$WORK" && exec "$SERVER" server --port "$PORT" >server.log 2>&1 ) &
 SRV_PID=$!
 
 for _ in $(seq 1 40); do

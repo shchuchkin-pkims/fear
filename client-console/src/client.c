@@ -198,6 +198,8 @@ static int g_rk_ready = 0;
 #define ROT_DEADLINE_MS 6000   /**< stop waiting on a member that stays silent */
 
 static int      g_rot_pending  = 0;
+/* Диагностика выбора ротатора. Включается FEAR_ROT_DEBUG=1 и только ей. */
+static int      g_rot_debug    = 0;
 static uint64_t g_rot_settle_at = 0;
 static uint64_t g_rot_deadline  = 0;
 
@@ -266,7 +268,23 @@ static void roster_note_identity(const char *tag, const uint8_t *pk, const char 
     snprintf(g_roster[g_roster_count].display, MAX_NAME, "%s", display ? display : "");
     memcpy(g_roster[g_roster_count].pk, pk, IDENTITY_PK_BYTES);
     g_roster[g_roster_count].has_identity = 1;
-    g_roster[g_roster_count].present = 1;
+    /*
+     * Присутствие - слово сервера, а не вывод из услышанного кадра.
+     *
+     * Вошедший объявляется сразу, и его анонс обгоняет список участников,
+     * который рассылает ретранслятор. Заведи мы запись присутствующей -
+     * пришедший следом список не изменил бы ничего: все метки уже на месте,
+     * `changed` остался бы нулём, и смена состава пропала бы молча. Вместе с
+     * ней не взвелась бы ротация, а избранный ротатор - тот, кто проиграл эту
+     * гонку, - промолчал бы. Вошедший остаётся на нулевом поколении: он не
+     * читает комнату, а комната не читает его, едва истечёт льготная минута
+     * прошлого поколения.
+     *
+     * Поэтому здесь только личность. Присутствие выставит roster_set_present,
+     * когда сервер скажет, и ровно тогда это будет считаться изменением.
+     */
+    g_roster[g_roster_count].present = 0;
+    g_roster[g_roster_count].was_present = 0;
     g_roster_count++;
 }
 
@@ -542,6 +560,26 @@ static int send_service_frame(sock_t s, const char *room, const char *name,
     return rc;
 }
 
+/*
+ * Список участников, пришедший, пока мы ждали ключ комнаты.
+ *
+ * Ретранслятор рассылает его в ту же секунду, как зарегистрировал нас, - а
+ * регистрирует нас KEY_REQUEST, то есть задолго до ответа с ключом. Ожидание
+ * ключа читает кадры само и раньше выбрасывало всё, что не ответ. Вместе с
+ * прочим пропадал и этот список - единственная весть о нашем собственном
+ * приходе.
+ *
+ * Без него первым учтённым списком становилась СЛЕДУЮЩАЯ смена состава, и мы
+ * принимали чужой вход за свой: а в свой приход участник в выборах не
+ * участвует. Если избранным ротатором для этого входа были мы, не ротировал
+ * никто - и вошедший оставался на нулевом поколении, глухим к комнате.
+ *
+ * Хранится последний: если за время ожидания состав менялся ещё раз, наш
+ * приход - это комната, какой она стала к его концу.
+ */
+static uint8_t *g_join_userlist = NULL;
+static size_t   g_join_userlist_len = 0;
+
 /**
  * @brief Perform ECDH key exchange as a joiner
  *
@@ -625,6 +663,18 @@ static int ecdh_join_room(sock_t s, const char *room, const char *name, uint8_t 
         int is_zero_nonce = 1;
         for (int i = 0; i < CRYPTO_NPUBBYTES; i++) {
             if (nonce[i] != 0) { is_zero_nonce = 0; break; }
+        }
+
+        /* Свой приход: сохранить, а не выбросить. См. g_join_userlist. */
+        if (type_buf[0] == MSG_TYPE_USER_LIST && is_zero_nonce &&
+            strcmp(room_in, room) == 0) {
+            uint8_t *copy = (uint8_t *)malloc(clen ? clen : 1);
+            if (copy) {
+                memcpy(copy, payload, clen);
+                free(g_join_userlist);
+                g_join_userlist = copy;
+                g_join_userlist_len = clen;
+            }
         }
 
         if (type_buf[0] == MSG_TYPE_KEY_RESPONSE && is_zero_nonce &&
@@ -1471,20 +1521,68 @@ static void rotation_rotate_now(sock_t s, const char *room, const char *myname,
  */
 static void rotation_tick(sock_t s, const char *room, const char *myname,
                           const uint8_t *active_key) {
-    if (!g_rot_pending || !g_has_identity || !g_rk_ready) return;
+    const int dbg = g_rot_debug;
+
+    if (!g_rot_pending || !g_has_identity || !g_rk_ready) {
+        if (dbg && g_rot_pending) {
+            printf("[rot-dbg] pending but idle: has_identity=%d rk_ready=%d\n",
+                   g_has_identity, g_rk_ready);
+            fflush(stdout);
+        }
+        return;
+    }
 
     uint64_t now = rot_now_ms();
     if (now < g_rot_settle_at) return;
-    if (!roster_identities_complete() && now < g_rot_deadline) return;
+    if (!roster_identities_complete() && now < g_rot_deadline) {
+        if (dbg) {
+            printf("[rot-dbg] waiting: roster incomplete, %llu ms of deadline left\n",
+                   (unsigned long long)(g_rot_deadline - now));
+            fflush(stdout);
+        }
+        return;
+    }
 
     g_rot_pending = 0;
 
     rk_member_t members[ROSTER_MAX];
     size_t nmem = roster_continuing(members, ROSTER_MAX);
+
+    if (dbg) {
+        char mine[24];
+        identity_pk_fingerprint(g_identity_pk, mine);
+        printf("[rot-dbg] electing over %zu continuing member(s), complete=%d, me=%s\n",
+               nmem, roster_identities_complete(), mine);
+        for (size_t i = 0; i < nmem; i++) {
+            char fp[24];
+            identity_pk_fingerprint(members[i].pk, fp);
+            printf("[rot-dbg]   member %zu: has_identity=%d pk=%s %s%s\n",
+                   i, members[i].has_identity, fp,
+                   members[i].has_identity &&
+                   memcmp(members[i].pk, g_identity_pk, IDENTITY_PK_BYTES) == 0
+                       ? "(me)" : "",
+                   members[i].has_identity &&
+                   memcmp(members[i].pk, g_identity_pk, IDENTITY_PK_BYTES) < 0
+                       ? "(lower than me)" : "");
+        }
+        printf("[rot-dbg] full roster (%d entries):\n", g_roster_count);
+        for (int i = 0; i < g_roster_count; i++) {
+            char fp[24];
+            identity_pk_fingerprint(g_roster[i].pk, fp);
+            printf("[rot-dbg]   tag=%s present=%d was_present=%d has_identity=%d pk=%s\n",
+                   g_roster[i].tag, g_roster[i].present, g_roster[i].was_present,
+                   g_roster[i].has_identity, fp);
+        }
+        fflush(stdout);
+    }
+
     /* Every member reaches this same answer from the same roster, so exactly
      * one of them goes on. */
     if (rk_is_rotator(members, nmem, g_identity_pk)) {
         rotation_rotate_now(s, room, myname, active_key);
+    } else if (dbg) {
+        printf("[rot-dbg] verdict: not me, standing by\n");
+        fflush(stdout);
     }
 }
 
@@ -2142,6 +2240,90 @@ static int message_is_blank(const uint8_t *p, size_t len) {
     return 1;
 }
 
+/**
+ * Разобрать список участников от ретранслятора и учесть его в реестре.
+ *
+ * Один путь на два входа: основной цикл приёма и восстановление после
+ * ECDH-входа, когда список пришёл раньше ключа комнаты (см.
+ * g_join_userlist). Расходиться им нельзя - первый учтённый список и есть
+ * «наш приход», от которого считаются все следующие смены состава.
+ */
+static void handle_user_list(sock_t s, const char *room, const uint8_t *key,
+                             const char *myname,
+                             const uint8_t *plain, size_t plen) {
+    // Обрабатываем список участников
+    if (plen >= 2) {
+        uint16_t count = rd_u16(plain);
+        const uint8_t *p = plain + 2;
+        size_t remaining = plen - 2;
+
+        /* В списке метки, а не имена: ретранслятор имён не видит.
+         * Разворачивать их в имена будем из реестра, ниже, когда он
+         * уже учтёт этот самый список. */
+        static char tags[ROSTER_MAX][IDENTITY_SESSION_TAG_LEN];
+        int ntags = 0;
+
+        for (uint16_t i = 0; i < count && remaining >= 2; i++) {
+            uint16_t utag_len = rd_u16(p);
+            p += 2;
+            remaining -= 2;
+
+            if (utag_len > remaining) break;
+
+            if (ntags < ROSTER_MAX && utag_len < IDENTITY_SESSION_TAG_LEN) {
+                memcpy(tags[ntags], p, utag_len);
+                tags[ntags][utag_len] = 0;
+                ntags++;
+            }
+
+            p += utag_len;
+            remaining -= utag_len;
+        }
+
+        /* A membership change is the whole trigger: somebody joined, so
+         * they must not read what came before, or somebody left, so they
+         * must not read what comes after. Only the member the room agrees
+         * on rotates, and every member reaches that answer from this same
+         * list, so there is nothing to coordinate. */
+        /* Taken before the new list is applied, and not again while a
+         * rotation is already pending - a burst of arrivals is one
+         * change, from the room as it stood before any of them. */
+        if (g_saw_first_user_list && !g_rot_pending) {
+            roster_snapshot_present();
+            g_have_before = 1;
+        }
+
+        int changed = roster_set_present(tags, ntags);
+        roster_print_users();
+
+        if (!g_saw_first_user_list) {
+            /* Our own arrival. Somebody who was already here rotates for
+             * it; we take this list as our starting point and leave the
+             * "before" set empty, because we did not see one. Marking
+             * ourselves as having been here would put us in an election
+             * the members who really were here are running without us -
+             * and two members rotating at once splits the room. */
+            g_saw_first_user_list = 1;
+        } else if (changed && g_has_identity && g_rk_ready) {
+            /* Say who we are again. A member that just joined has never
+             * heard our announcement - it was sent before they arrived -
+             * and rotation has to address a bundle to them by identity
+             * key. This is the same thing the call beacon does, for the
+             * same reason. */
+            send_identity_announce(s, room, myname, key,
+                                   g_identity_sk, g_identity_pk);
+
+            uint64_t now = rot_now_ms();
+            g_rot_settle_at = now + ROT_SETTLE_MS;
+            /* The deadline is set once per pending rotation, not on every
+             * change: a room somebody keeps joining and leaving would
+             * otherwise never reach it. */
+            if (!g_rot_pending) g_rot_deadline = now + ROT_DEADLINE_MS;
+            g_rot_pending = 1;
+        }
+    }
+}
+
 int recv_and_decrypt(sock_t s, const char *room, const uint8_t *key, const char *myname) {
     uint8_t hdr2[2];
     if (recv_all(s, hdr2, 2) < 0) return -1;
@@ -2460,77 +2642,7 @@ int recv_and_decrypt(sock_t s, const char *room, const uint8_t *key, const char 
             }
         }
     } else if (msg_type == MSG_TYPE_USER_LIST) {
-        // Обрабатываем список участников
-        if (plen >= 2) {
-            uint16_t count = rd_u16(plain);
-            const uint8_t *p = plain + 2;
-            size_t remaining = plen - 2;
-
-            /* В списке метки, а не имена: ретранслятор имён не видит.
-             * Разворачивать их в имена будем из реестра, ниже, когда он
-             * уже учтёт этот самый список. */
-            static char tags[ROSTER_MAX][IDENTITY_SESSION_TAG_LEN];
-            int ntags = 0;
-
-            for (uint16_t i = 0; i < count && remaining >= 2; i++) {
-                uint16_t utag_len = rd_u16(p);
-                p += 2;
-                remaining -= 2;
-
-                if (utag_len > remaining) break;
-
-                if (ntags < ROSTER_MAX && utag_len < IDENTITY_SESSION_TAG_LEN) {
-                    memcpy(tags[ntags], p, utag_len);
-                    tags[ntags][utag_len] = 0;
-                    ntags++;
-                }
-
-                p += utag_len;
-                remaining -= utag_len;
-            }
-
-            /* A membership change is the whole trigger: somebody joined, so
-             * they must not read what came before, or somebody left, so they
-             * must not read what comes after. Only the member the room agrees
-             * on rotates, and every member reaches that answer from this same
-             * list, so there is nothing to coordinate. */
-            /* Taken before the new list is applied, and not again while a
-             * rotation is already pending - a burst of arrivals is one
-             * change, from the room as it stood before any of them. */
-            if (g_saw_first_user_list && !g_rot_pending) {
-                roster_snapshot_present();
-                g_have_before = 1;
-            }
-
-            int changed = roster_set_present(tags, ntags);
-            roster_print_users();
-
-            if (!g_saw_first_user_list) {
-                /* Our own arrival. Somebody who was already here rotates for
-                 * it; we take this list as our starting point and leave the
-                 * "before" set empty, because we did not see one. Marking
-                 * ourselves as having been here would put us in an election
-                 * the members who really were here are running without us -
-                 * and two members rotating at once splits the room. */
-                g_saw_first_user_list = 1;
-            } else if (changed && g_has_identity && g_rk_ready) {
-                /* Say who we are again. A member that just joined has never
-                 * heard our announcement - it was sent before they arrived -
-                 * and rotation has to address a bundle to them by identity
-                 * key. This is the same thing the call beacon does, for the
-                 * same reason. */
-                send_identity_announce(s, room, myname, key,
-                                       g_identity_sk, g_identity_pk);
-
-                uint64_t now = rot_now_ms();
-                g_rot_settle_at = now + ROT_SETTLE_MS;
-                /* The deadline is set once per pending rotation, not on every
-                 * change: a room somebody keeps joining and leaving would
-                 * otherwise never reach it. */
-                if (!g_rot_pending) g_rot_deadline = now + ROT_DEADLINE_MS;
-                g_rot_pending = 1;
-            }
-        }
+        handle_user_list(s, room, key, myname, plain, (size_t)plen);
     } else if (msg_type >= MSG_TYPE_FILE_START && msg_type <= MSG_TYPE_FILE_END) {
         handle_file_message(plain, (size_t)plen, msg_type, room_in, name, key, myname);
     } else if (msg_type >= MSG_TYPE_SIGNED_FILE_START && msg_type <= MSG_TYPE_SIGNED_FILE_END) {
@@ -2886,6 +2998,8 @@ void run_client(const char *host, uint16_t port, const char *room, const char *n
     g_room = room;
     g_name = name;
 
+    g_rot_debug = (getenv("FEAR_ROT_DEBUG") != NULL);
+
     /* Generation zero: what the room key exchange produced. Everything after
      * it arrives in a rotation bundle. */
     rk_init(&g_rk, 0, active_key);
@@ -2914,6 +3028,16 @@ void run_client(const char *host, uint16_t port, const char *room, const char *n
             close_socket(s);
             return;
         }
+    }
+
+    /* Свой приход, услышанный во время ожидания ключа. Учитываем его первым
+     * списком - ровно так, как его учёл бы основной цикл, приди он позже. */
+    if (g_join_userlist) {
+        handle_user_list(s, room, active_key, name,
+                         g_join_userlist, g_join_userlist_len);
+        free(g_join_userlist);
+        g_join_userlist = NULL;
+        g_join_userlist_len = 0;
     }
 
     /* Phase B-8: start the heartbeat thread now that g_sock/g_room/g_name
