@@ -10,6 +10,7 @@
 #include "server_db.h"
 
 #include <stdio.h>
+#include <stdlib.h>   /* mkdtemp: без объявления GCC 14+ не соберёт тест */
 #include <string.h>
 #include <unistd.h>
 

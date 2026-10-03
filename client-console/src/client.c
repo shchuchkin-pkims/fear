@@ -1782,7 +1782,7 @@ static void inbox_handle_result(sock_t s, const char *myname,
         cf_key_t ck;
         ck.version = 0;
         memcpy(ck.key, w->k_pm, KS_KEY_BYTES);
-        unsigned long long plen = 0;
+        size_t plen = 0;   /* size_t, как в cf_open: GCC 14+ иначе не соберёт */
         cf_status_t st = cf_open(&ck, 1, w->room, "inbox", sealed, slen, nonce,
                                  plain, slen, &plen);
         if (st != CF_OK || plen < 1) { free(plain); continue; }
