@@ -190,6 +190,10 @@ jobs:
             --no-opengl-sw \
             --compiler-runtime \
             "$R/fear_gui.exe"
+          # windeployqt brings every SQL driver Qt has. History needs only
+          # SQLite; the others import client libraries of Firebird, MySQL and
+          # PostgreSQL that are not here and are of no use to a messenger.
+          find "$R/sqldrivers" -name '*.dll' ! -name 'qsqlite*.dll' -print -delete
 
           # DLLs from MSYS2 go next to whatever loads them: Windows looks for
           # a DLL in the directory of the program first, and fear_gui.exe and
