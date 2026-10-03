@@ -2630,6 +2630,8 @@ static int start_video_call(const char *remote_ip, uint16_t remote_port,
     vc->has_identity = 0;
     vc->peer_verified = 0;
     identity_default_known_keys_path(vc->known_keys_path, sizeof(vc->known_keys_path));
+    /* Записи звонков до 0.6.0 лежат под отпечатком старой формулы. */
+    identity_known_keys_upgrade(vc->known_keys_path);
     if (!opts->no_sign) {
         char id_path[512];
         if (opts->identity_file) {

@@ -278,10 +278,62 @@ int main(void) {
          * fix this side printed cb:2f:51:60:fc:1f:7e:05 for the same key, and
          * a phone and a PC could never agree on whom they were talking to. */
         uint8_t vk[IDENTITY_PK_BYTES];
-        for (int i = 0; i < IDENTITY_PK_BYTES; i++) vk[i] = (uint8_t)i;
+        for (size_t i = 0; i < IDENTITY_PK_BYTES; i++) vk[i] = (uint8_t)i;
         char fp[IDENTITY_FINGERPRINT_LEN];
         identity_pk_fingerprint(vk, fp);
         CHECK(strcmp(fp, "40:f6:8f:4a:d2:4e:57:5b") == 0);
+    }
+
+    /* --- known_keys after the fingerprint change ------------------------
+     *
+     * video_call files a peer under its fingerprint, and before 0.6.0 that
+     * was the BLAKE2b-256 prefix. The upgrade renames those entries instead
+     * of letting the next call file a second one beside it, keeps the
+     * "verified" mark, merges an entry a call already made under the new
+     * name, and leaves everything else alone.
+     */
+    {
+        char up[600];
+        snprintf(up, sizeof up, "%s/known_keys_upgrade", dir);
+
+        uint8_t vk[IDENTITY_PK_BYTES];
+        for (size_t i = 0; i < IDENTITY_PK_BYTES; i++) vk[i] = (uint8_t)i;
+        char vk_b64[128], pkb_b64[128];
+        CHECK(sodium_bin2base64(vk_b64, sizeof vk_b64, vk, IDENTITY_PK_BYTES,
+                                sodium_base64_VARIANT_URLSAFE_NO_PADDING) != NULL);
+        CHECK(sodium_bin2base64(pkb_b64, sizeof pkb_b64, pk_b, IDENTITY_PK_BYTES,
+                                sodium_base64_VARIANT_URLSAFE_NO_PADDING) != NULL);
+
+        FILE *f = fopen(up, "w");
+        CHECK(f != NULL);
+        fprintf(f, "alice\t%s\t1\n", pkb_b64);                       /* chat entry */
+        fprintf(f, "cb:2f:51:60:fc:1f:7e:05\t%s\t1\n", vk_b64);      /* old formula */
+        fprintf(f, "40:f6:8f:4a:d2:4e:57:5b\t%s\t0\n", vk_b64);      /* a call since */
+        fprintf(f, "00:11:22:33:44:55:66:77\t%s\t0\n", pkb_b64);     /* not its key */
+        fclose(f);
+
+        CHECK(identity_known_keys_upgrade(up) == 1);
+        CHECK(identity_tofu_check(up, "40:f6:8f:4a:d2:4e:57:5b", vk) == TOFU_KEY_MATCH_VERIFIED);
+        CHECK(identity_tofu_check(up, "alice", pk_b) == TOFU_KEY_MATCH_VERIFIED);
+
+        f = fopen(up, "r");
+        CHECK(f != NULL);
+        char all[2048];
+        size_t n = fread(all, 1, sizeof all - 1, f);
+        all[n] = '\0';
+        fclose(f);
+        CHECK(strstr(all, "cb:2f:51:60") == NULL);
+        CHECK(strstr(all, "00:11:22:33:44:55:66:77\t") != NULL);
+        /* One entry for the key, not two. */
+        const char *first = strstr(all, "40:f6:8f:4a:d2:4e:57:5b\t");
+        CHECK(first != NULL && strstr(first + 1, "40:f6:8f:4a:d2:4e:57:5b\t") == NULL);
+
+        /* Nothing left to do the second time. */
+        CHECK(identity_known_keys_upgrade(up) == 0);
+        /* No file is not an error. */
+        char none[600];
+        snprintf(none, sizeof none, "%s/no_such_known_keys", dir);
+        CHECK(identity_known_keys_upgrade(none) == 0);
     }
 
     return t_report("test_identity");

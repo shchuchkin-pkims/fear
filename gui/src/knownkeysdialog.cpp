@@ -14,6 +14,10 @@
 #include <QDir>
 #include <sodium.h>
 
+extern "C" {
+#include "identity.h"
+}
+
 /* We re-implement the identity module functions in C++ here
  * since the GUI links against libsodium directly.
  * The known_keys format: name\tpk_base64\tverified\n */
@@ -79,6 +83,13 @@ void KnownKeysDialog::setupUI() {
 
 void KnownKeysDialog::refreshTable() {
     table->setRowCount(0);
+
+    /* Записи звонков до 0.6.0 - под отпечатком старой формулы: показываем их
+     * уже переименованными, как их увидит следующий звонок. */
+    char kk[512];
+    if (identity_default_known_keys_path(kk, sizeof kk) == 0) {
+        identity_known_keys_upgrade(kk);
+    }
 
     QFile file(knownKeysPath());
     if (!file.open(QIODevice::ReadOnly | QIODevice::Text)) {

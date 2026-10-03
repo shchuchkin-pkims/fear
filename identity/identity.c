@@ -601,66 +601,91 @@ char *identity_pk_fingerprint(const uint8_t pk[IDENTITY_PK_BYTES],
     return out;
 }
 
-/**
- * Helper: rewrite known_keys file.
- * Reads all entries, applies transform, writes back.
- * transform returns: 0 = keep as-is, 1 = modified (write new values), -1 = delete
- */
+/** One line of known_keys: name, base64url public key, verified flag. */
 typedef struct {
     char name[256];
     char pk_b64[256];
     int verified;
 } known_key_entry_t;
 
+#define KNOWN_KEYS_MAX 1024
+
+/*
+ * Прочитать known_keys целиком. Массив в куче: на стеке 1024 записи по
+ * полкилобайта - это полмегабайта на массив, а у потока на Windows весь стек
+ * мегабайт. Нет файла - пустой список, не ошибка. NULL - только нехватка
+ * памяти.
+ */
+static known_key_entry_t *load_known_keys(const char *db_path, int *count) {
+    *count = 0;
+    known_key_entry_t *entries = calloc(KNOWN_KEYS_MAX, sizeof *entries);
+    if (!entries) return NULL;
+
+    FILE *f = fopen(db_path, "r");
+    if (!f) return entries;
+    char line[1024];
+    while (fgets(line, sizeof(line), f) && *count < KNOWN_KEYS_MAX) {
+        size_t len = strlen(line);
+        while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r' ||
+                           line[len - 1] == ' ')) {
+            line[--len] = '\0';
+        }
+        if (len == 0) continue;
+
+        char *tab1 = strchr(line, '\t');
+        if (!tab1) continue;
+
+        known_key_entry_t *e = &entries[*count];
+        size_t name_len = (size_t)(tab1 - line);
+        if (name_len >= sizeof(e->name)) name_len = sizeof(e->name) - 1;
+        memcpy(e->name, line, name_len);
+        e->name[name_len] = '\0';
+
+        const char *rest = tab1 + 1;
+        char *tab2 = strchr(rest, '\t');
+        if (tab2) {
+            size_t pk_len = (size_t)(tab2 - rest);
+            if (pk_len >= sizeof(e->pk_b64)) pk_len = sizeof(e->pk_b64) - 1;
+            memcpy(e->pk_b64, rest, pk_len);
+            e->pk_b64[pk_len] = '\0';
+            e->verified = atoi(tab2 + 1);
+        } else {
+            strncpy(e->pk_b64, rest, sizeof(e->pk_b64) - 1);
+            e->pk_b64[sizeof(e->pk_b64) - 1] = '\0';
+            e->verified = 0;
+        }
+        (*count)++;
+    }
+    fclose(f);
+    return entries;
+}
+
+static int store_known_keys(const char *db_path, const known_key_entry_t *entries,
+                            int count) {
+    FILE *f = fopen(db_path, "w");
+    if (!f) return -1;
+    for (int i = 0; i < count; i++) {
+        fprintf(f, "%s\t%s\t%d\n", entries[i].name, entries[i].pk_b64, entries[i].verified);
+    }
+    fclose(f);
+    return 0;
+}
+
+/**
+ * Helper: rewrite known_keys file.
+ * Reads all entries, applies transform, writes back.
+ * transform returns: 0 = keep as-is, 1 = modified (write new values), -1 = delete
+ */
 static int rewrite_known_keys(const char *db_path,
                                int (*transform)(known_key_entry_t *entry, void *ctx),
                                void *ctx) {
-    /* Read all entries */
-    known_key_entry_t entries[1024];
     int count = 0;
+    known_key_entry_t *entries = load_known_keys(db_path, &count);
+    if (!entries) return -1;
+
+    /* Apply transform, compacting in place */
+    int kept = 0;
     int changed = 0;
-
-    FILE *f = fopen(db_path, "r");
-    if (f) {
-        char line[1024];
-        while (fgets(line, sizeof(line), f) && count < 1024) {
-            size_t len = strlen(line);
-            while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r' ||
-                               line[len - 1] == ' ')) {
-                line[--len] = '\0';
-            }
-            if (len == 0) continue;
-
-            char *tab1 = strchr(line, '\t');
-            if (!tab1) continue;
-
-            known_key_entry_t *e = &entries[count];
-            size_t name_len = (size_t)(tab1 - line);
-            if (name_len >= sizeof(e->name)) name_len = sizeof(e->name) - 1;
-            memcpy(e->name, line, name_len);
-            e->name[name_len] = '\0';
-
-            const char *rest = tab1 + 1;
-            char *tab2 = strchr(rest, '\t');
-            if (tab2) {
-                size_t pk_len = (size_t)(tab2 - rest);
-                if (pk_len >= sizeof(e->pk_b64)) pk_len = sizeof(e->pk_b64) - 1;
-                memcpy(e->pk_b64, rest, pk_len);
-                e->pk_b64[pk_len] = '\0';
-                e->verified = atoi(tab2 + 1);
-            } else {
-                strncpy(e->pk_b64, rest, sizeof(e->pk_b64) - 1);
-                e->pk_b64[sizeof(e->pk_b64) - 1] = '\0';
-                e->verified = 0;
-            }
-            count++;
-        }
-        fclose(f);
-    }
-
-    /* Apply transform */
-    int new_count = 0;
-    known_key_entry_t result[1024];
     for (int i = 0; i < count; i++) {
         int rc = transform(&entries[i], ctx);
         if (rc == -1) {
@@ -668,19 +693,77 @@ static int rewrite_known_keys(const char *db_path,
             continue;
         }
         if (rc == 1) changed = 1; /* modified */
-        result[new_count++] = entries[i];
+        if (kept != i) entries[kept] = entries[i];
+        kept++;
     }
 
-    if (!changed) return -1; /* nothing changed = name not found */
+    /* nothing changed = name not found */
+    int ret = changed ? store_known_keys(db_path, entries, kept) : -1;
+    free(entries);
+    return ret;
+}
 
-    /* Write back */
-    f = fopen(db_path, "w");
-    if (!f) return -1;
-    for (int i = 0; i < new_count; i++) {
-        fprintf(f, "%s\t%s\t%d\n", result[i].name, result[i].pk_b64, result[i].verified);
+/* Отпечаток по формуле до 0.6.0: первые 8 байт BLAKE2b-256. Только для
+ * identity_known_keys_upgrade. */
+static void legacy_pk_fingerprint(const uint8_t pk[IDENTITY_PK_BYTES],
+                                  char out[IDENTITY_FINGERPRINT_LEN]) {
+    uint8_t hash[32];
+    crypto_generichash(hash, sizeof(hash), pk, IDENTITY_PK_BYTES, NULL, 0);
+    for (int i = 0; i < 8; i++) {
+        snprintf(out + i * 3, 4, "%02x%s", hash[i], (i < 7) ? ":" : "");
     }
-    fclose(f);
-    return 0;
+    out[23] = '\0';
+}
+
+int identity_known_keys_upgrade(const char *db_path) {
+    if (!db_path) return -1;
+    int count = 0;
+    known_key_entry_t *e = load_known_keys(db_path, &count);
+    if (!e) return -1;
+
+    int renamed = 0;
+    for (int i = 0; i < count; i++) {
+        if (strlen(e[i].name) != IDENTITY_FINGERPRINT_LEN - 1) continue;
+        uint8_t pk[IDENTITY_PK_BYTES];
+        size_t pk_len = 0;
+        if (sodium_base642bin(pk, sizeof pk, e[i].pk_b64, strlen(e[i].pk_b64),
+                              NULL, &pk_len, NULL,
+                              sodium_base64_VARIANT_URLSAFE_NO_PADDING) != 0 ||
+            pk_len != sizeof pk) {
+            continue;
+        }
+        char old_fp[IDENTITY_FINGERPRINT_LEN];
+        legacy_pk_fingerprint(pk, old_fp);
+        if (strcmp(e[i].name, old_fp) != 0) continue;
+        identity_pk_fingerprint(pk, e[i].name);
+        renamed++;
+    }
+    if (renamed == 0) {
+        free(e);
+        return 0;
+    }
+
+    /* Звонок после обновления мог уже завести запись под новой меткой: та же
+     * метка и тот же ключ - одна запись, «проверен», если был хоть где-то. */
+    int kept = 0;
+    for (int i = 0; i < count; i++) {
+        int dup = -1;
+        for (int j = 0; j < kept; j++) {
+            if (strcmp(e[j].name, e[i].name) == 0 && strcmp(e[j].pk_b64, e[i].pk_b64) == 0) {
+                dup = j;
+                break;
+            }
+        }
+        if (dup >= 0) {
+            if (e[i].verified) e[dup].verified = 1;
+            continue;
+        }
+        if (kept != i) e[kept] = e[i];
+        kept++;
+    }
+    int rc = store_known_keys(db_path, e, kept) == 0 ? renamed : -1;
+    free(e);
+    return rc;
 }
 
 static int transform_mark_verified(known_key_entry_t *entry, void *ctx) {

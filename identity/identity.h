@@ -143,6 +143,20 @@ int identity_default_known_keys_path(char *buf, size_t bufsize);
 char *identity_pk_fingerprint(const uint8_t pk[IDENTITY_PK_BYTES],
                               char out[IDENTITY_FINGERPRINT_LEN]);
 
+/**
+ * Переименовать в known_keys записи, заведённые под отпечатком старой формулы
+ * (первые 8 байт BLAKE2b-256, до 0.6.0), в отпечаток нынешней.
+ *
+ * video_call заносит собеседников под их отпечатком. Без переименования
+ * первый звонок после обновления завёл бы вторую запись того же ключа, а
+ * отметка «проверен» осталась бы на старой. Совпавшие после переименования
+ * записи сливаются, «проверен» сохраняется, если стоял хоть на одной. Записи
+ * под именами (их заводит чат) не трогаются. Повторный вызов ничего не меняет.
+ *
+ * @return число переименованных записей, 0 - менять нечего, -1 - ошибка
+ */
+int identity_known_keys_upgrade(const char *db_path);
+
 /* "pm:" + 22-char base64url(16-byte blake2b) + null = 26 bytes */
 #define IDENTITY_PM_ROOM_ID_LEN 32
 
