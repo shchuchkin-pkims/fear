@@ -84,10 +84,11 @@ else()
     message(STATUS "Using system libraries on Linux")
 endif()
 
-# Опция «только GUI и консольный клиент» — пропускает audio_call,
-# video_call, key-exchange, updater. Нужно для Windows-сборки в CI, где
-# у нас нет prebuilt opus / portaudio / ffmpeg / sdl3, а основные
-# артефакты — fear.exe и fear_gui.exe.
+# Опция «только консольный клиент»: пропускает audio_call, video_call,
+# key-exchange и updater с их зависимостями (opus, portaudio, ffmpeg, sdl3,
+# curl). Её берёт workflow юнит-тестов, которому звонки не нужны. Релизные
+# сборки CI до 0.6.0 тоже шли с ней - и выкладывали архивы без звонков и
+# без программы обновления; теперь они собирают всё (linux.yml, windows.yml).
 option(FEAR_GUI_ONLY "Skip audio_call/video_call/key-exchange/updater subprojects" OFF)
 
 # Включение субмодулей
