@@ -136,7 +136,10 @@ Sidebar::Sidebar(QWidget *parent) : QWidget(parent) {
     connect(m_menuBtn, &QPushButton::clicked, this, [this]() {
         emit menuRequested(m_menuBtn->mapToGlobal(QPoint(0, m_menuBtn->height() + 4)));
     });
-    connect(m_search, &QLineEdit::textChanged, this, &Sidebar::searchChanged);
+    connect(m_search, &QLineEdit::textChanged, this, [this](const QString &text) {
+        rebuildLists();
+        emit searchChanged(text);
+    });
     connect(m_dmList,    &QListWidget::itemSelectionChanged,
             this,        &Sidebar::onDmSelectionChanged);
     connect(m_groupList, &QListWidget::itemSelectionChanged,
@@ -231,8 +234,14 @@ void Sidebar::rebuildLists() {
     m_dmList->clear();
     m_groupList->clear();
 
+    // The search box narrows both sections to chats whose name or the line
+    // under it (a contact's handle, a group's last message) has the text.
+    const QString needle = m_search->text().trimmed();
     QVector<ChatListEntry> dms, groups;
     for (const auto &e : m_entries) {
+        if (!needle.isEmpty() && !e.title.contains(needle, Qt::CaseInsensitive)
+                              && !e.preview.contains(needle, Qt::CaseInsensitive))
+            continue;
         (e.kind == ChatKind::Dm ? dms : groups).append(e);
     }
     auto byActivityDesc = [](const ChatListEntry &a, const ChatListEntry &b) {
@@ -245,6 +254,10 @@ void Sidebar::rebuildLists() {
         for (const auto &e : src) {
             auto *item = new QListWidgetItem(list);
             item->setData(Qt::UserRole, e.id);
+            // The row is drawn by a widget, so a screen reader would find
+            // nothing to read without this.
+            item->setData(Qt::AccessibleTextRole, e.unread > 0
+                ? tr("%1, %n unread", nullptr, e.unread).arg(e.title) : e.title);
             item->setSizeHint(QSize(280, 64));
             auto *w = new ChatListItem(list);
             list->setItemWidget(item, w);
