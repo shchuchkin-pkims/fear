@@ -284,6 +284,32 @@ int main(void) {
         CHECK(strcmp(fp, "40:f6:8f:4a:d2:4e:57:5b") == 0);
     }
 
+    /* --- offline inbox: one mailbox per direction -------------------------
+     *
+     * The address depends on the recipient, so the two sides of a pair use
+     * two mailboxes. With one shared mailbox each side collected its own
+     * letters too, showed them as incoming and deleted them from the relay
+     * before the other side could. The vector is pinned on Android as well
+     * (MailboxTest) and was computed a third time with Python's hashlib.
+     */
+    {
+        uint8_t k[32], a[IDENTITY_PK_BYTES], b[IDENTITY_PK_BYTES];
+        for (int i = 0; i < 32; i++) {
+            k[i] = (uint8_t)i;
+            a[i] = (uint8_t)(32 + i);
+            b[i] = (uint8_t)(64 + i);
+        }
+        uint8_t to_a[IDENTITY_INBOX_ADDR_BYTES], to_b[IDENTITY_INBOX_ADDR_BYTES];
+        CHECK(identity_inbox_addr(k, a, to_a) == 0);
+        CHECK(identity_inbox_addr(k, b, to_b) == 0);
+        char hex[2 * IDENTITY_INBOX_ADDR_BYTES + 1];
+        sodium_bin2hex(hex, sizeof hex, to_a, sizeof to_a);
+        CHECK(strcmp(hex, "f28bfab028371d40570de2bee5a7aac50c2870ee79dc76f64b06796cfc233787") == 0);
+        sodium_bin2hex(hex, sizeof hex, to_b, sizeof to_b);
+        CHECK(strcmp(hex, "87ce0c2c561b4dd809ec8e6931df61cf93c24134c80d9b3c53bfbcb804ed5c76") == 0);
+        CHECK(memcmp(to_a, to_b, sizeof to_a) != 0);
+    }
+
     /* --- known_keys after the fingerprint change ------------------------
      *
      * video_call files a peer under its fingerprint, and before 0.6.0 that

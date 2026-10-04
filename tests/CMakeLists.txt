@@ -157,6 +157,19 @@ if(TARGET fear)
     set_tests_properties(server_caps PROPERTIES TIMEOUT 90)
 endif()
 
+# Личное письмо через офлайн-ящик - адресату и только ему: не отправителю
+# обратно и не третьему в общей комнате. pm_keys выводит ключ пары и
+# идентификатор личной комнаты так же, как GUI.
+add_executable(pm_keys pm_keys.c ${IDENTITY_DIR}/identity.c ${IDENTITY_DIR}/identity_at_rest.c)
+target_include_directories(pm_keys PRIVATE ${IDENTITY_DIR} ${TEST_SODIUM_INCLUDE})
+target_link_libraries(pm_keys PRIVATE ${TEST_SODIUM_LIBS} fear_secret_store)
+if(TARGET fear)
+    add_test(NAME inbox_direction
+             COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/inbox_direction.sh
+                     $<TARGET_FILE:fear> $<TARGET_FILE:pm_keys>)
+    set_tests_properties(inbox_direction PROPERTIES TIMEOUT 90)
+endif()
+
 # Звонок обязан завершаться по SIGINT и SIGTERM, даже если в нём тихо: в
 # режиме relay поток приёма висел в recv без таймаута, и процесс не выходил.
 if(NOT WIN32 AND TARGET fear AND TARGET video_call)

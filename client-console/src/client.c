@@ -159,9 +159,10 @@ static const uint8_t *g_room_key = NULL;
 #define INBOX_POLL_MS   20000
 
 typedef struct {
-    char    room[MAX_ROOM];                  /**< pm:… - куда класть сообщения */
-    uint8_t k_pm[KS_KEY_BYTES];              /**< он же ключ комнаты */
-    uint8_t addr[IDENTITY_INBOX_ADDR_BYTES]; /**< слепой адрес */
+    char    room[MAX_ROOM];                      /**< pm:… - куда класть сообщения */
+    uint8_t k_pm[KS_KEY_BYTES];                  /**< он же ключ комнаты */
+    uint8_t addr_in[IDENTITY_INBOX_ADDR_BYTES];  /**< ящик, куда пишут нам: его и спрашиваем */
+    uint8_t addr_out[IDENTITY_INBOX_ADDR_BYTES]; /**< ящик собеседника: туда пишем мы */
 } inbox_watch_t;
 
 /* Метка комнаты на проводе - её несут все кадры этого соединения. Ящик
@@ -1618,18 +1619,32 @@ static inbox_watch_t *inbox_find_room(const char *room) {
     return NULL;
 }
 
-/** …и по адресу, чтобы понять, каким ключом открывать пришедшее письмо. */
+/** …и по адресу, чтобы понять, каким ключом открывать пришедшее письмо.
+ *  Только наш входящий: письма, которые мы сами положили собеседнику, не наши. */
 static inbox_watch_t *inbox_find_addr(const uint8_t *addr) {
     for (int i = 0; i < g_inbox_count; i++) {
-        if (memcmp(g_inbox[i].addr, addr, IDENTITY_INBOX_ADDR_BYTES) == 0) {
+        if (memcmp(g_inbox[i].addr_in, addr, IDENTITY_INBOX_ADDR_BYTES) == 0) {
             return &g_inbox[i];
         }
     }
     return NULL;
 }
 
-/** Взять ящик под наблюдение. Повторный вызов обновляет ключ. */
-static int inbox_watch(const char *room, const uint8_t k_pm[KS_KEY_BYTES]) {
+/**
+ * Взять ящики пары под наблюдение. Повторный вызов обновляет ключ.
+ *
+ * Ящиков два, по одному на направление (identity_inbox_addr): свой - с
+ * нашим открытым ключом, его и спрашиваем; ящик собеседника - с его, туда
+ * пишем. Поэтому без собственной личности ящиком не воспользоваться.
+ */
+static int inbox_watch(const char *room, const uint8_t k_pm[KS_KEY_BYTES],
+                       const uint8_t their_pk[IDENTITY_PK_BYTES]) {
+    if (!g_has_identity) return -1;
+    uint8_t in[IDENTITY_INBOX_ADDR_BYTES], out[IDENTITY_INBOX_ADDR_BYTES];
+    if (identity_inbox_addr(k_pm, g_identity_pk, in) != 0 ||
+        identity_inbox_addr(k_pm, their_pk, out) != 0) {
+        return -1;
+    }
     inbox_watch_t *w = inbox_find_room(room);
     if (!w) {
         if (g_inbox_count >= INBOX_MAX_WATCH) return -1;
@@ -1637,7 +1652,8 @@ static int inbox_watch(const char *room, const uint8_t k_pm[KS_KEY_BYTES]) {
         snprintf(w->room, sizeof w->room, "%s", room);
     }
     memcpy(w->k_pm, k_pm, KS_KEY_BYTES);
-    if (identity_inbox_addr(k_pm, w->addr) != 0) return -1;
+    memcpy(w->addr_in, in, sizeof in);
+    memcpy(w->addr_out, out, sizeof out);
     /* Спросить сразу, а не через двадцать секунд: человек только что открыл
      * приложение и ждёт свою почту, а не отсчёта таймера. */
     g_inbox_next_poll = 0;
@@ -1687,7 +1703,7 @@ static int inbox_send(sock_t s, const inbox_watch_t *w, const char *myname,
     size_t blen = IDENTITY_INBOX_ADDR_BYTES + CRYPTO_NPUBBYTES + clen;
     uint8_t *body = (uint8_t *)malloc(blen);
     if (!body) { free(cipher); return -1; }
-    memcpy(body, w->addr, IDENTITY_INBOX_ADDR_BYTES);
+    memcpy(body, w->addr_out, IDENTITY_INBOX_ADDR_BYTES);
     memcpy(body + IDENTITY_INBOX_ADDR_BYTES, nonce, CRYPTO_NPUBBYTES);
     memcpy(body + IDENTITY_INBOX_ADDR_BYTES + CRYPTO_NPUBBYTES, cipher, clen);
     free(cipher);
@@ -1708,7 +1724,7 @@ static void inbox_poll(sock_t s, const char *room, const char *myname) {
     wr_u16(body, (uint16_t)g_inbox_count);
     for (int i = 0; i < g_inbox_count; i++) {
         memcpy(body + 2 + (size_t)i * IDENTITY_INBOX_ADDR_BYTES,
-               g_inbox[i].addr, IDENTITY_INBOX_ADDR_BYTES);
+               g_inbox[i].addr_in, IDENTITY_INBOX_ADDR_BYTES);
     }
     send_service_frame(s, room, myname, (uint8_t)MSG_TYPE_INBOX_FETCH, body, blen);
     free(body);
@@ -1721,7 +1737,7 @@ static void inbox_ack(sock_t s, const char *myname, const inbox_watch_t *w,
     size_t blen = IDENTITY_INBOX_ADDR_BYTES + 2 + n * 8;
     uint8_t *body = (uint8_t *)malloc(blen);
     if (!body) return;
-    memcpy(body, w->addr, IDENTITY_INBOX_ADDR_BYTES);
+    memcpy(body, w->addr_in, IDENTITY_INBOX_ADDR_BYTES);
     wr_u16(body + IDENTITY_INBOX_ADDR_BYTES, (uint16_t)n);
     uint8_t *p = body + IDENTITY_INBOX_ADDR_BYTES + 2;
     for (size_t i = 0; i < n; i++) {
@@ -1812,35 +1828,43 @@ static void inbox_handle_result(sock_t s, const char *myname,
 }
 
 /**
- * /inbox-add <комната> <ключ-пары-base64url>
+ * /inbox-add <комната> <ключ-пары-base64url> <открытый-ключ-собеседника-base64url>
  *
  * Список контактов ведёт интерфейс, а не консольный клиент, поэтому ключи
  * приходят снаружи. Ключ пары - он же ключ личной комнаты, так что
- * интерфейс уже умеет его выводить.
+ * интерфейс уже умеет его выводить; открытый ключ собеседника нужен, чтобы
+ * найти его ящик (см. inbox_watch).
  */
 static void handle_inbox_add(const char *arg) {
     if (!arg) return;
     char room[MAX_ROOM];
     char keyb64[128];
+    char pkb64[128];
     /* Ширина полей написана числом, а буферы под неё проверены здесь же:
      * иначе изменение MAX_ROOM однажды сделало бы запись мимо буфера. */
     _Static_assert(MAX_ROOM > 200, "room buffer smaller than the scan width");
-    if (sscanf(arg, "%200s %127s", room, keyb64) != 2) {
-        printf("[inbox] usage: /inbox-add <room> <key-base64url>\n");
+    if (sscanf(arg, "%200s %127s %127s", room, keyb64, pkb64) != 3) {
+        printf("[inbox] usage: /inbox-add <room> <key-base64url> <peer-pk-base64url>\n");
         fflush(stdout);
         return;
     }
     uint8_t key[KS_KEY_BYTES];
-    size_t klen = 0;
+    uint8_t their_pk[IDENTITY_PK_BYTES];
+    size_t klen = 0, pklen = 0;
     if (sodium_base642bin(key, sizeof key, keyb64, strlen(keyb64), NULL, &klen,
                           NULL, sodium_base64_VARIANT_URLSAFE_NO_PADDING) != 0 ||
-        klen != KS_KEY_BYTES) {
+        klen != KS_KEY_BYTES ||
+        sodium_base642bin(their_pk, sizeof their_pk, pkb64, strlen(pkb64), NULL, &pklen,
+                          NULL, sodium_base64_VARIANT_URLSAFE_NO_PADDING) != 0 ||
+        pklen != IDENTITY_PK_BYTES) {
         printf("[inbox] bad key\n");
+        sodium_memzero(key, sizeof key);
         fflush(stdout);
         return;
     }
-    if (inbox_watch(room, key) != 0) {
-        printf("[inbox] cannot watch more mailboxes\n");
+    if (inbox_watch(room, key, their_pk) != 0) {
+        printf(g_has_identity ? "[inbox] cannot watch more mailboxes\n"
+                              : "[inbox] no identity - cannot use a mailbox\n");
     } else {
         printf("[inbox] watching %s\n", room);
     }

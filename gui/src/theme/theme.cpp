@@ -43,7 +43,7 @@ QColor Theme::bubbleSelf() const      { return m_mode == Dark ? QColor("#2B5278"
 QColor Theme::bubblePeer() const      { return m_mode == Dark ? QColor("#3A3D42") : QColor("#FFFFFF"); }
 QColor Theme::bubbleSelfText() const  { return m_mode == Dark ? QColor("#FFFFFF") : QColor("#000000"); }
 QColor Theme::bubblePeerText() const  { return m_mode == Dark ? QColor("#FFFFFF") : QColor("#000000"); }
-QColor Theme::unreadBadge() const     { return m_mode == Dark ? QColor("#5288C1") : QColor("#4DCD5E"); }
+QColor Theme::unreadBadge() const     { return m_mode == Dark ? QColor("#5288C1") : QColor("#40A7E3"); }
 
 QColor Theme::avatarColor(const QString &seed) const {
     static const QColor palette[] = {

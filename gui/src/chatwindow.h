@@ -26,6 +26,8 @@ public:
 
 protected:
     void showEvent(QShowEvent *) override;
+    /** Окно стало активным - открытый чат прочитан. */
+    void changeEvent(QEvent *e) override;
 
 private:
     void requestConnect();
@@ -121,6 +123,14 @@ private:
     QSet<QString> m_seenPeers;        // unique non-self senders heard from
     int           m_reportedCount = 0; // last count from server [USERS] broadcast
     QSet<QString> m_keyChangePrompted; // "(peer)/(fp)" pairs already raised modally
+
+    /* Непрочитанные по комнатам - число на значке в списке чатов. Растут,
+     * когда письмо пришло в неоткрытый чат или сообщение - пока окно не
+     * активно; обнуляются, когда чат открыт в активном окне. Хранятся в
+     * QSettings: письмо из ящика второй раз не придёт. */
+    QHash<QString, int> m_unread;
+    void bumpUnread(const QString &room);
+    void markRead(const QString &room);
 
     /** A room member announced a call: ask whether to join it. */
     void handleCallInvite(const QString &sender, const QString &callId,

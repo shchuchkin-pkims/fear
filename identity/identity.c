@@ -576,12 +576,17 @@ int identity_pm_room_key(const uint8_t my_sk[IDENTITY_SK_BYTES],
 }
 
 int identity_inbox_addr(const uint8_t k_pm[32],
+                        const uint8_t recipient_pk[IDENTITY_PK_BYTES],
                         uint8_t out[IDENTITY_INBOX_ADDR_BYTES]) {
-    if (!k_pm || !out) return -1;
-    static const char ctx[] = "fear.inbox.v1";
-    return crypto_generichash(out, IDENTITY_INBOX_ADDR_BYTES,
-                              (const uint8_t *)ctx, sizeof(ctx) - 1,
-                              k_pm, 32) == 0 ? 0 : -1;
+    if (!k_pm || !recipient_pk || !out) return -1;
+    static const char ctx[] = "fear.inbox.v2";
+    crypto_generichash_state st;
+    if (crypto_generichash_init(&st, k_pm, 32, IDENTITY_INBOX_ADDR_BYTES) != 0) return -1;
+    crypto_generichash_update(&st, (const uint8_t *)ctx, sizeof(ctx) - 1);
+    crypto_generichash_update(&st, recipient_pk, IDENTITY_PK_BYTES);
+    int rc = crypto_generichash_final(&st, out, IDENTITY_INBOX_ADDR_BYTES);
+    sodium_memzero(&st, sizeof st);
+    return rc == 0 ? 0 : -1;
 }
 
 char *identity_pk_fingerprint(const uint8_t pk[IDENTITY_PK_BYTES],

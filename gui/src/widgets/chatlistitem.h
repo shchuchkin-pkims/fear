@@ -40,6 +40,7 @@ protected:
 
 private:
     void applyColors();
+    void styleBadge();
 
 private:
     Avatar  *m_avatar;

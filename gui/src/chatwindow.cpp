@@ -66,6 +66,17 @@ ChatWindow::ChatWindow(QWidget *parent) : QMainWindow(parent) {
     setWindowTitle(QStringLiteral("F.E.A.R."));
     resize(1200, 780);
 
+    /* Непрочитанные - одним значением: названия комнат могут содержать «/»,
+     * а QSettings принял бы его за вложенную группу. */
+    {
+        QSettings s("fear-messenger", "fear-gui");
+        const QVariantMap saved = s.value("chats/unread").toMap();
+        for (auto it = saved.constBegin(); it != saved.constEnd(); ++it) {
+            const int n = it.value().toInt();
+            if (n > 0) m_unread.insert(it.key(), n);
+        }
+    }
+
     if (QScreen *s = QGuiApplication::screenAt(QCursor::pos())) {
         const QRect g = s->availableGeometry();
         move(g.x() + (g.width() - 1200) / 2, g.y() + (g.height() - 780) / 2);
@@ -192,6 +203,33 @@ void ChatWindow::closeEvent(QCloseEvent *e) {
     QMainWindow::closeEvent(e);
 }
 
+static void saveUnread(const QHash<QString, int> &unread) {
+    QVariantMap m;
+    for (auto it = unread.constBegin(); it != unread.constEnd(); ++it) m.insert(it.key(), it.value());
+    QSettings s("fear-messenger", "fear-gui");
+    s.setValue("chats/unread", m);
+}
+
+void ChatWindow::bumpUnread(const QString &room) {
+    if (room.isEmpty()) return;
+    m_unread[room] += 1;
+    saveUnread(m_unread);
+    rebuildSidebarChats();
+}
+
+void ChatWindow::markRead(const QString &room) {
+    if (!m_unread.remove(room)) return;
+    saveUnread(m_unread);
+    rebuildSidebarChats();
+}
+
+void ChatWindow::changeEvent(QEvent *e) {
+    QMainWindow::changeEvent(e);
+    if (e->type() == QEvent::ActivationChange && isActiveWindow()) {
+        markRead(m_backend ? m_backend->currentRoom : QString());
+    }
+}
+
 void ChatWindow::showEvent(QShowEvent *e) {
     QMainWindow::showEvent(e);
     if (!m_connectShown) {
@@ -248,6 +286,8 @@ void ChatWindow::handleConnected() {
     /* Сначала перенос: ящики и чаты адресуются новым идентификатором, и
      * заполнить его надо до того, как ими воспользуются. */
     migrateDmRooms();
+    /* Комната открыта - то, что в ней накопилось, теперь на экране. */
+    if (isActiveWindow()) markRead(m_backend->currentRoom);
     /* Ящики контактов - сразу после подключения: письмо могло прийти,
      * пока нас не было, и ждать его до следующего изменения списка
      * контактов незачем. */
@@ -560,6 +600,9 @@ void ChatWindow::appendParsedLine(const QString &line) {
     msg.fromSelf  = (msg.sender == m_backend->currentName);
     msg.delivered = true;
     m_chatArea->appendMessage(msg);
+    /* Окно не активно (свёрнуто, в лотке, поверх другое) - сообщение пока
+     * никто не видел. */
+    if (!msg.fromSelf && !isActiveWindow()) bumpUnread(m_backend->currentRoom);
 
     // Persist to local history (Phase A §9a). Skip when no room is set
     // (defensive — should never happen once connected).
@@ -1019,9 +1062,11 @@ void ChatWindow::handleInboxMessage(const QString &roomId, const QString &sender
         m.text      = text;
         m.timestamp = QDateTime::fromMSecsSinceEpoch(now);
         m_chatArea->appendMessage(m);
+        if (!isActiveWindow()) bumpUnread(roomId);
     } else {
-        /* Чат не открыт - пусть его строка в списке скажет, что там новое. */
-        rebuildSidebarChats();
+        /* Чат не открыт - пусть его строка в списке скажет, сколько там
+         * нового. */
+        bumpUnread(roomId);
         statusBar()->showMessage(tr("New message from %1").arg(sender), 5000);
     }
 }
@@ -1131,9 +1176,11 @@ void ChatWindow::registerInboxWatches() {
             sodium_memzero(k_pm, sizeof k_pm);
             continue;
         }
+        /* Открытый ключ собеседника - чтобы класть письма в его ящик, а
+         * спрашивать только свой (identity_inbox_addr). */
         m_backend->sendMessage(QString(),
-            QStringLiteral("/inbox-add %1 %2")
-                .arg(QString::fromLatin1(roomBuf), QString::fromLatin1(keyB64)));
+            QStringLiteral("/inbox-add %1 %2 %3")
+                .arg(QString::fromLatin1(roomBuf), QString::fromLatin1(keyB64), c.pk));
         sodium_memzero(k_pm, sizeof k_pm);
         sodium_memzero(keyB64, sizeof keyB64);
     }
@@ -1247,6 +1294,7 @@ void ChatWindow::rebuildSidebarChats() {
             const auto ts = historyTs.value(e.id, 0);
             e.lastActivity = ts ? QDateTime::fromMSecsSinceEpoch(ts)
                                 : QDateTime::currentDateTime();
+            e.unread       = m_unread.value(e.id, 0);
             chats.append(e);
         }
     }
@@ -1271,6 +1319,7 @@ void ChatWindow::rebuildSidebarChats() {
         const auto ts = historyTs.value(room, 0);
         e.lastActivity = ts ? QDateTime::fromMSecsSinceEpoch(ts)
                             : QDateTime::currentDateTime();
+        e.unread       = m_unread.value(room, 0);
         chats.append(e);
     }
 

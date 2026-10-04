@@ -42,9 +42,9 @@ ChatListItem::ChatListItem(QWidget *parent) : QWidget(parent) {
     m_badge->setAlignment(Qt::AlignCenter);
     m_badge->setMinimumSize(20, 20);
     m_badge->setMaximumHeight(20);
-    m_badge->setStyleSheet(QString(
-        "background-color: %1; color: white; border-radius: 10px; padding: 0 6px; font-size: 11px; font-weight: 600;"
-    ).arg(Theme::instance().unreadBadge().name()));
+    styleBadge();
+    connect(&Theme::instance(), &Theme::modeChanged, this,
+            [this](Theme::Mode){ styleBadge(); });
     m_badge->hide();
 
     auto *root = new QHBoxLayout(this);
@@ -99,6 +99,13 @@ void ChatListItem::setEntry(const ChatListEntry &e) {
     } else {
         m_badge->hide();
     }
+}
+
+/* Голубой круг с белым числом, как счётчик у Telegram; цвет - от темы. */
+void ChatListItem::styleBadge() {
+    m_badge->setStyleSheet(QString(
+        "background-color: %1; color: white; border-radius: 10px; padding: 0 6px; font-size: 11px; font-weight: 600;"
+    ).arg(Theme::instance().unreadBadge().name()));
 }
 
 void ChatListItem::paintEvent(QPaintEvent *) {
