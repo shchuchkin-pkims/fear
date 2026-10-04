@@ -1,6 +1,6 @@
 /**
  * @file key-exchange.c
- * @author Evgeny Shchuchkin (shchuchkin-pkims@yandex.ru)
+ * @author Evgenii Shchuchkin (shchuchkin-pkims@yandex.ru)
  * @brief Secure key exchange using libsodium (Curve25519) for F.E.A.R. project messenger
  * @version 0.2
  * @date 2025-10-16

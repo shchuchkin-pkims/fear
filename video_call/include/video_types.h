@@ -36,25 +36,12 @@ typedef int socket_t;
 /** Quality/stats report packet */
 #define PKT_TYPE_STATS      0x04
 
-/** HELLO handshake packet */
-#define PKT_TYPE_HELLO      0x7F
-
-/* ===== HELLO Handshake ===== */
-
-/** Audio-only HELLO: [0x7F][prefix(4)] = 5 bytes */
-#define HELLO_SIZE_AUDIO    5
-
-/** Video HELLO: [0x7F][prefix(4)][flags(1)][width(2)][height(2)][fps(1)] = 11 bytes */
-#define HELLO_SIZE_VIDEO    11
-
-/** HELLO flag: video capability */
-#define HELLO_FLAG_VIDEO    0x01
-
-/** HELLO flag: audio capability */
-#define HELLO_FLAG_AUDIO    0x02
-
-/** HELLO flag: Ed25519 identity present (pk + sig appended) */
-#define HELLO_FLAG_IDENTITY 0x04
+/* The HELLO handshake and the media packet framing moved out of this header
+ * with the group-call work: the layouts now live in identity/media_hello.h
+ * and identity/media_packet.h, shared with the Android port and pinned by
+ * test vectors on both sides. The old length tiers, the 4-byte nonce prefix
+ * and the two KDF sub-key contexts are gone with them - there is one key per
+ * sender per counter domain now, not one per stream per call. */
 
 /* ===== Encryption ===== */
 
@@ -66,21 +53,6 @@ typedef int socket_t;
 
 /** AES-GCM authentication tag size (16 bytes) */
 #define VIDEO_TAG_SIZE      16
-
-/** Nonce prefix length (4 bytes, sender-specific) */
-#define NONCE_PREFIX_LEN    4
-
-/** KDF context for audio sub-key derivation */
-#define KDF_CONTEXT_AUDIO   "fearaudi"
-
-/** KDF context for video sub-key derivation */
-#define KDF_CONTEXT_VIDEO   "fearvide"
-
-/** KDF sub-key ID for audio */
-#define KDF_SUBKEY_AUDIO    1
-
-/** KDF sub-key ID for video */
-#define KDF_SUBKEY_VIDEO    2
 
 /* ===== Network Protocol ===== */
 

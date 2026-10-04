@@ -110,13 +110,21 @@ int audio_encrypt_packet(const uint8_t *opus, size_t opus_len,
 int audio_decrypt_packet(const uint8_t *pkt, size_t pkt_len,
                          const uint8_t key[AUDIO_KEY_SIZE],
                          const uint8_t remote_prefix[4],
-                         uint8_t *opus_out, size_t *opus_len) {
+                         uint8_t *opus_out, size_t opus_cap, size_t *opus_len) {
     if (!pkt || !key || !remote_prefix || !opus_out || !opus_len) {
         return -1;
     }
 
     /* Validate minimum packet size: 1 (ver) + 8 (seq) + 16 (tag) */
     if (pkt_len < 1 + 8 + AES_GCM_ABYTES) {
+        return -1;
+    }
+
+    /* Upper bound BEFORE decrypting. crypto_aead_aes256gcm_decrypt() writes
+     * (ciphertext_len - ABYTES) bytes into opus_out and takes no output-capacity
+     * argument; libsodium also touches that buffer when tag verification fails.
+     * Without this check an oversized packet overflows the caller's buffer. */
+    if (pkt_len - (1 + 8) - AES_GCM_ABYTES > opus_cap) {
         return -1;
     }
 
@@ -203,13 +211,18 @@ int audio_encrypt(const uint8_t *plaintext, size_t plaintext_len,
  */
 int audio_decrypt(const uint8_t *ciphertext, size_t ciphertext_len,
                   const uint8_t key[AUDIO_KEY_SIZE],
-                  uint8_t *plaintext, size_t *plaintext_len) {
+                  uint8_t *plaintext, size_t plaintext_cap, size_t *plaintext_len) {
     if (!ciphertext || !key || !plaintext || !plaintext_len) {
         return -1;
     }
 
     /* Validate minimum size */
     if (ciphertext_len < AES_GCM_NONCE_LEN + AES_GCM_ABYTES) {
+        return -1;
+    }
+
+    /* Upper bound before decrypting - see audio_decrypt_packet() for rationale. */
+    if (ciphertext_len - AES_GCM_NONCE_LEN - AES_GCM_ABYTES > plaintext_cap) {
         return -1;
     }
 

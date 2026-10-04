@@ -33,10 +33,19 @@ if(WIN32)
         message(FATAL_ERROR "Curl lib directory not found: ${CURL_LIBRARY_DIR}")
     endif()
 
+    # libsodium — проверка Ed25519-подписи скачанного обновления
+    if(NOT DEFINED LIBSODIUM_ROOT)
+        set(LIBSODIUM_ROOT "${CMAKE_SOURCE_DIR}/../lib/libsodium-win64")
+    endif()
+
     # Настройка include директорий и линковка для Windows
-    target_include_directories(updater PRIVATE "${CURL_INCLUDE_DIR}")
+    target_include_directories(updater PRIVATE
+        "${CURL_INCLUDE_DIR}"
+        "${LIBSODIUM_ROOT}/include"
+    )
     target_link_libraries(updater PRIVATE
         "${CURL_LIBRARY_DIR}/libcurl.dll.a"
+        "${LIBSODIUM_ROOT}/lib/libsodium.dll.a"
         ws2_32
         bcrypt
         crypt32
@@ -44,12 +53,25 @@ if(WIN32)
 
     message(STATUS "CURL_DIR: ${CURL_DIR}")
 else()
-    # Для Linux и macOS - используем системную libcurl
+    # Для Linux и macOS - используем системные libcurl и libsodium
     find_package(PkgConfig REQUIRED)
     pkg_check_modules(CURL REQUIRED libcurl)
+    pkg_check_modules(SODIUM REQUIRED libsodium)
 
-    target_include_directories(updater PRIVATE ${CURL_INCLUDE_DIRS})
-    target_link_libraries(updater PRIVATE ${CURL_LIBRARIES})
+    target_include_directories(updater PRIVATE ${CURL_INCLUDE_DIRS} ${SODIUM_INCLUDE_DIRS})
+    target_link_libraries(updater PRIVATE ${CURL_LIBRARIES} ${SODIUM_LIBRARIES})
 
     message(STATUS "Using system libcurl: ${CURL_VERSION}")
+    message(STATUS "Using system libsodium: ${SODIUM_VERSION}")
+endif()
+
+# Инструмент подписи релизов. Нужен только мейнтейнеру и CI: updater
+# отказывается ставить архив без корректной Ed25519-подписи.
+add_executable(fear-sign tools/fear-sign.c)
+if(WIN32)
+    target_include_directories(fear-sign PRIVATE "${LIBSODIUM_ROOT}/include")
+    target_link_libraries(fear-sign PRIVATE "${LIBSODIUM_ROOT}/lib/libsodium.dll.a")
+else()
+    target_include_directories(fear-sign PRIVATE ${SODIUM_INCLUDE_DIRS})
+    target_link_libraries(fear-sign PRIVATE ${SODIUM_LIBRARIES})
 endif()

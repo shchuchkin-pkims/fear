@@ -3,6 +3,7 @@
  * @brief Implementation of audio call process manager
  */
 
+#include <QSettings>
 #include "audiocallmanager.h"
 #include <QApplication>
 #include <QFile>
@@ -84,11 +85,44 @@ bool AudioCallManager::startCall(const QString &remoteIp, quint16 remotePort, co
     // Instead, we pass it via stdin
     QStringList args;
     args << "call" << remoteIp << QString::number(remotePort);
+    if (!callId.isEmpty()) {
+        args << "--call-id" << callId;
+    }
     // NOTE: NO key argument here for security!
 
     // Pass identity file if available
     if (!identityFilePath.isEmpty() && QFile::exists(identityFilePath)) {
         args << "--identity-file" << identityFilePath;
+    }
+
+    /*
+     * Настройки микрофона из общих настроек программы.
+     *
+     * Читаются здесь, а не запоминаются при старте: человек может открыть
+     * настройки и подвинуть ползунок между звонками, и следующий звонок
+     * должен пойти уже с новым значением, без перезапуска программы.
+     */
+    {
+        QSettings st;
+        const int gain = st.value(QStringLiteral("audio/micGainDb"), 0).toInt();
+        const QString ns = st.value(QStringLiteral("audio/noiseSuppress"),
+                                    QStringLiteral("medium")).toString();
+        if (gain != 0) args << QStringLiteral("--mic-gain") << QString::number(gain);
+        args << QStringLiteral("--noise-suppress") << ns;
+    }
+
+    /*
+     * Сервер, у которого спросить свой адрес снаружи.
+     *
+     * Пусто - не спрашивать. Так по умолчанию, и это осознанно: прямой
+     * звонок раскрывает ваш адрес собеседнику, чего ретранслятор не делает.
+     * Выигрыш - меньше задержка и оператор ретранслятора не видит потока;
+     * цена - собеседник видит, откуда вы. Решать это за человека нельзя.
+     */
+    {
+        QSettings st;
+        const QString stun = st.value(QStringLiteral("call/stunServer")).toString().trimmed();
+        if (!stun.isEmpty()) args << QStringLiteral("--stun") << stun;
     }
 
     if (localPort > 0) {
@@ -160,11 +194,44 @@ bool AudioCallManager::startListening(quint16 localPort, const QString &key,
     // Instead, we pass it via stdin
     QStringList args;
     args << "listen" << QString::number(localPort);
+    if (!callId.isEmpty()) {
+        args << "--call-id" << callId;
+    }
     // NOTE: NO key argument here for security!
 
     // Pass identity file if available
     if (!identityFilePath.isEmpty() && QFile::exists(identityFilePath)) {
         args << "--identity-file" << identityFilePath;
+    }
+
+    /*
+     * Настройки микрофона из общих настроек программы.
+     *
+     * Читаются здесь, а не запоминаются при старте: человек может открыть
+     * настройки и подвинуть ползунок между звонками, и следующий звонок
+     * должен пойти уже с новым значением, без перезапуска программы.
+     */
+    {
+        QSettings st;
+        const int gain = st.value(QStringLiteral("audio/micGainDb"), 0).toInt();
+        const QString ns = st.value(QStringLiteral("audio/noiseSuppress"),
+                                    QStringLiteral("medium")).toString();
+        if (gain != 0) args << QStringLiteral("--mic-gain") << QString::number(gain);
+        args << QStringLiteral("--noise-suppress") << ns;
+    }
+
+    /*
+     * Сервер, у которого спросить свой адрес снаружи.
+     *
+     * Пусто - не спрашивать. Так по умолчанию, и это осознанно: прямой
+     * звонок раскрывает ваш адрес собеседнику, чего ретранслятор не делает.
+     * Выигрыш - меньше задержка и оператор ретранслятора не видит потока;
+     * цена - собеседник видит, откуда вы. Решать это за человека нельзя.
+     */
+    {
+        QSettings st;
+        const QString stun = st.value(QStringLiteral("call/stunServer")).toString().trimmed();
+        if (!stun.isEmpty()) args << QStringLiteral("--stun") << stun;
     }
 
     // Add device parameters
@@ -230,9 +297,42 @@ bool AudioCallManager::startRelay(const QString &serverIp, quint16 serverPort,
     QStringList args;
     args << "relay" << serverIp << QString::number(serverPort)
          << "--room" << room << "--name" << name;
+    if (!callId.isEmpty()) {
+        args << "--call-id" << callId;
+    }
 
     if (!identityFilePath.isEmpty() && QFile::exists(identityFilePath)) {
         args << "--identity-file" << identityFilePath;
+    }
+
+    /*
+     * Настройки микрофона из общих настроек программы.
+     *
+     * Читаются здесь, а не запоминаются при старте: человек может открыть
+     * настройки и подвинуть ползунок между звонками, и следующий звонок
+     * должен пойти уже с новым значением, без перезапуска программы.
+     */
+    {
+        QSettings st;
+        const int gain = st.value(QStringLiteral("audio/micGainDb"), 0).toInt();
+        const QString ns = st.value(QStringLiteral("audio/noiseSuppress"),
+                                    QStringLiteral("medium")).toString();
+        if (gain != 0) args << QStringLiteral("--mic-gain") << QString::number(gain);
+        args << QStringLiteral("--noise-suppress") << ns;
+    }
+
+    /*
+     * Сервер, у которого спросить свой адрес снаружи.
+     *
+     * Пусто - не спрашивать. Так по умолчанию, и это осознанно: прямой
+     * звонок раскрывает ваш адрес собеседнику, чего ретранслятор не делает.
+     * Выигрыш - меньше задержка и оператор ретранслятора не видит потока;
+     * цена - собеседник видит, откуда вы. Решать это за человека нельзя.
+     */
+    {
+        QSettings st;
+        const QString stun = st.value(QStringLiteral("call/stunServer")).toString().trimmed();
+        if (!stun.isEmpty()) args << QStringLiteral("--stun") << stun;
     }
 
     if (inputDevice >= 0) {
@@ -292,9 +392,22 @@ QString AudioCallManager::getCurrentKey() const {
 }
 
 void AudioCallManager::onProcessOutput() {
-    if (callProcess) {
-        QString output = QString::fromUtf8(callProcess->readAllStandardOutput());
-        emit this->output(output);
+    if (!callProcess) return;
+    const QString output = QString::fromUtf8(callProcess->readAllStandardOutput());
+    emit this->output(output);
+
+    /* Свой адрес снаружи. Строку печатает процесс звонка: комнаты и
+     * её ключа он не знает и приглашение отправить не может, поэтому
+     * адрес доносим до комнаты мы. */
+    for (const QString &line : output.split(QLatin1Char('\n'), Qt::SkipEmptyParts)) {
+        const QString t = line.trimmed();
+        if (!t.startsWith(QStringLiteral("[CANDIDATE] "))) continue;
+        const QStringList parts = t.mid(12).split(QLatin1Char(' '), Qt::SkipEmptyParts);
+        if (parts.size() != 2) continue;
+        bool ok = false;
+        const uint prt = parts[1].toUInt(&ok);
+        if (!ok || prt == 0 || prt > 65535) continue;
+        emit candidateDiscovered(parts[0], (quint16)prt);
     }
 }
 
@@ -318,9 +431,11 @@ QString AudioCallManager::findAudioCallApp() {
     QStringList possiblePaths = {
         QApplication::applicationDirPath() + "/audio_call",
         QApplication::applicationDirPath() + "/bin/audio_call",
-        QApplication::applicationDirPath() + "/../bin/audio_call",
-        "audio_call",
-        "./audio_call"
+        QApplication::applicationDirPath() + "/../bin/audio_call"
+        /* No bare name and no "./" fallback: those resolve through PATH or the
+         * current working directory, so launching the GUI from a directory an
+         * attacker can write to (a downloads folder, say) would run their
+         * binary with the user's privileges. */
     };
 
 #ifdef Q_OS_WIN

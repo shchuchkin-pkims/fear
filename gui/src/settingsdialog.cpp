@@ -7,6 +7,8 @@
 #include <QVBoxLayout>
 #include <QHBoxLayout>
 #include <QFormLayout>
+#include <QSlider>
+#include <QCheckBox>
 #include <QGroupBox>
 #include <QFile>
 #include <QFileInfo>
@@ -16,6 +18,7 @@
 #include <QFileDialog>
 #include <QMessageBox>
 #include <QProcess>
+#include <QCoreApplication>
 #include <sodium.h>
 
 #ifdef Q_OS_WIN
@@ -23,6 +26,27 @@
 #else
 #define FEAR_DIR (QDir::homePath() + "/.fear")
 #endif
+
+/*
+ * Программа звонка - от каталога приложения, тем же поиском, что у
+ * менеджеров звонков. Раньше здесь стоял "./bin/audio_call" от рабочего
+ * каталога: GUI, запущенный ярлыком или из другой папки, не находил своей
+ * программы и показывал пустые списки устройств, а запущенный из папки,
+ * куда пишет кто-то другой, выполнил бы чужой файл с правами пользователя.
+ */
+static QString findCallBinary(const QString &name) {
+    const QString appDir = QCoreApplication::applicationDirPath();
+#ifdef Q_OS_WIN
+    const QString exe = name + QStringLiteral(".exe");
+#else
+    const QString exe = name;
+#endif
+    for (const QString &p : { appDir + "/bin/" + exe, appDir + "/" + exe,
+                              appDir + "/../bin/" + exe }) {
+        if (QFileInfo(p).isFile()) return p;
+    }
+    return QString();
+}
 
 SettingsDialog::SettingsDialog(QSettings *settings, QWidget *parent)
     : QDialog(parent), settings(settings) {
@@ -74,6 +98,42 @@ void SettingsDialog::setupGeneralTab(QTabWidget *tabs) {
     cliLayout->addWidget(cliPathEdit);
     cliLayout->addWidget(browseBtn);
     form->addRow(cliGroup);
+
+    QGroupBox *tlsGroup = new QGroupBox("Connection to the relay");
+    QFormLayout *tlsForm = new QFormLayout(tlsGroup);
+
+    tlsCheck = new QCheckBox("Wrap the connection in TLS");
+    tlsForm->addRow(tlsCheck);
+
+    tlsPinEdit = new QLineEdit();
+    tlsPinEdit->setPlaceholderText("certificate SHA-256, optional");
+    tlsForm->addRow("Pin:", tlsPinEdit);
+
+    /* Что слой даёт и чего не даёт - обе половины, иначе человек решит, что
+     * купил больше, чем купил. */
+    QLabel *tlsNote = new QLabel(
+        "Hides the shape of the traffic from anyone watching the network - your "
+        "provider, the owner of the wifi. Without it they see frame sizes and "
+        "timing, which is enough to tell that this machine speaks F.E.A.R., "
+        "without reading a word.\n\n"
+        "It hides nothing from the relay itself: that sits at the far end of "
+        "the tunnel and sees what it always saw.\n\n"
+        "The pin is the server certificate's SHA-256. With it, certificate "
+        "authorities are not consulted at all - which suits a self-hosted relay "
+        "with a self-signed certificate, where trust is built by comparing "
+        "fingerprints anyway. Leave it empty to verify the usual way.\n\n"
+        "The relay must be started with --tls-cert and --tls-key, otherwise the "
+        "connection will simply fail.");
+    tlsNote->setWordWrap(true);
+    tlsNote->setStyleSheet("color: gray; font-size: 11px;");
+    tlsForm->addRow(tlsNote);
+
+    /* Поле отпечатка бессмысленно, пока TLS выключен. */
+    auto syncTls = [this]() { tlsPinEdit->setEnabled(tlsCheck->isChecked()); };
+    connect(tlsCheck, &QCheckBox::toggled, this, syncTls);
+    syncTls();
+
+    form->addRow(tlsGroup);
 
     QLabel *note = new QLabel("Path to the F.E.A.R. CLI executable used for chat, key generation, and identity.");
     note->setWordWrap(true);
@@ -130,13 +190,8 @@ void SettingsDialog::setupAudioTab(QTabWidget *tabs) {
     audioOutputCombo->addItem("System default");
 
     /* Try to get device list from audio_call binary */
-    QString audioCallPath;
-#ifdef Q_OS_WIN
-    audioCallPath = "./bin/audio_call.exe";
-#else
-    audioCallPath = "./bin/audio_call";
-#endif
-    if (QFileInfo(audioCallPath).isFile()) {
+    const QString audioCallPath = findCallBinary(QStringLiteral("audio_call"));
+    if (!audioCallPath.isEmpty()) {
         QProcess p;
         p.setProcessChannelMode(QProcess::ForwardedErrorChannel);
         p.start(audioCallPath, QStringList() << "listdevices");
@@ -165,6 +220,71 @@ void SettingsDialog::setupAudioTab(QTabWidget *tabs) {
     devForm->addRow("Output device:", audioOutputCombo);
     form->addRow(devGroup);
 
+    QGroupBox *micGroup = new QGroupBox("Microphone");
+    QFormLayout *micForm = new QFormLayout(micGroup);
+
+    micGainSlider = new QSlider(Qt::Horizontal);
+    micGainSlider->setRange(-24, 24);
+    micGainSlider->setTickPosition(QSlider::TicksBelow);
+    micGainSlider->setTickInterval(6);
+    micGainValue = new QLabel("0 dB");
+    micGainValue->setMinimumWidth(48);
+    connect(micGainSlider, &QSlider::valueChanged, this, [this](int v) {
+        micGainValue->setText(QString("%1%2 dB").arg(v > 0 ? "+" : "").arg(v));
+    });
+    QWidget *gainRow = new QWidget();
+    QHBoxLayout *gainLay = new QHBoxLayout(gainRow);
+    gainLay->setContentsMargins(0, 0, 0, 0);
+    gainLay->addWidget(micGainSlider, 1);
+    gainLay->addWidget(micGainValue, 0);
+    micForm->addRow("Sensitivity:", gainRow);
+
+    noiseSuppressCombo = new QComboBox();
+    noiseSuppressCombo->addItem("Off", "off");
+    noiseSuppressCombo->addItem("Low", "low");
+    noiseSuppressCombo->addItem("Medium", "medium");
+    noiseSuppressCombo->addItem("High - noisy room", "high");
+    micForm->addRow("Noise suppression:", noiseSuppressCombo);
+
+    /* Обещать надо ровно то, что программа делает. Здесь не спектральная
+     * чистка: шум из-под голоса не вычитается, и пока человек говорит, фон
+     * слышен таким, какой он есть. Уходит то, что слышно в паузах. */
+    QLabel *micNote = new QLabel(
+        "Suppression silences steady background - fans, hum, street noise - "
+        "in the gaps between words. It does not strip noise from under your "
+        "voice while you speak. \"High\" can clip quiet speech.");
+    micNote->setWordWrap(true);
+    micNote->setStyleSheet("color: gray; font-size: 11px;");
+    micForm->addRow(micNote);
+
+    form->addRow(micGroup);
+
+    QGroupBox *directGroup = new QGroupBox("Direct calls");
+    QFormLayout *directForm = new QFormLayout(directGroup);
+
+    stunServerEdit = new QLineEdit();
+    stunServerEdit->setPlaceholderText("empty - always use the relay");
+    directForm->addRow("STUN server:", stunServerEdit);
+
+    /* Здесь надо назвать цену, а не только выгоду. Прямой звонок короче по
+     * пути и не даёт оператору ретранслятора видеть поток - но открывает
+     * ваш адрес собеседнику, чего ретранслятор не делает. Решать это за
+     * человека нельзя, поэтому по умолчанию пусто. */
+    QLabel *directNote = new QLabel(
+        "With a STUN server (for example stun.l.google.com:19302) calls try to "
+        "go straight to the other person: shorter path, and the relay operator "
+        "sees no media.\n\n"
+        "The cost is real: a direct call shows your IP address to the person "
+        "you are calling, and the STUN server learns it too. Through the relay "
+        "neither of them does. Leave this empty if that matters more to you.\n\n"
+        "Behind a symmetric NAT the direct path will not open anyway and the "
+        "call falls back to the relay by itself.");
+    directNote->setWordWrap(true);
+    directNote->setStyleSheet("color: gray; font-size: 11px;");
+    directForm->addRow(directNote);
+
+    form->addRow(directGroup);
+
     QLabel *note = new QLabel("Device selection is applied when starting audio/video calls.");
     note->setWordWrap(true);
     note->setStyleSheet("color: gray; font-size: 11px;");
@@ -185,7 +305,41 @@ void SettingsDialog::setupVideoTab(QTabWidget *tabs) {
     videoQualityCombo->addItem("Medium (640x480, 25 fps)", "medium");
     videoQualityCombo->addItem("High (1280x720, 30 fps)", "high");
 
+    videoQualityCombo->addItem("Manual", "manual");
     qualForm->addRow("Quality preset:", videoQualityCombo);
+
+    manualVideoBox = new QWidget();
+    QFormLayout *manForm = new QFormLayout(manualVideoBox);
+    manForm->setContentsMargins(0, 0, 0, 0);
+
+    videoWidthSpin = new QSpinBox();
+    videoWidthSpin->setRange(160, 3840);
+    videoWidthSpin->setSingleStep(16);
+    videoHeightSpin = new QSpinBox();
+    videoHeightSpin->setRange(120, 2160);
+    videoHeightSpin->setSingleStep(16);
+    videoFpsSpin = new QSpinBox();
+    videoFpsSpin->setRange(5, 60);
+    videoBitrateSpin = new QSpinBox();
+    videoBitrateSpin->setRange(64, 8000);
+    videoBitrateSpin->setSingleStep(64);
+    videoBitrateSpin->setSuffix(" kbit/s");
+
+    manForm->addRow("Width:", videoWidthSpin);
+    manForm->addRow("Height:", videoHeightSpin);
+    manForm->addRow("Frame rate:", videoFpsSpin);
+    manForm->addRow("Bitrate:", videoBitrateSpin);
+    qualForm->addRow(manualVideoBox);
+
+    /* Ручные поля показываются только когда они действуют: видимое, но
+     * ничего не меняющее поле - худший вид настройки. */
+    auto syncManual = [this]() {
+        manualVideoBox->setVisible(
+            videoQualityCombo->currentData().toString() == "manual");
+    };
+    connect(videoQualityCombo, &QComboBox::currentTextChanged, this, syncManual);
+    syncManual();
+
     form->addRow(qualGroup);
 
     /* Default camera device */
@@ -196,13 +350,8 @@ void SettingsDialog::setupVideoTab(QTabWidget *tabs) {
     videoCameraCombo->addItem("Default", "");
 
     /* Enumerate cameras via video_call listdevices */
-    QString videoCallPath;
-#ifdef Q_OS_WIN
-    videoCallPath = "./bin/video_call.exe";
-#else
-    videoCallPath = "./bin/video_call";
-#endif
-    if (QFileInfo(videoCallPath).isFile()) {
+    const QString videoCallPath = findCallBinary(QStringLiteral("video_call"));
+    if (!videoCallPath.isEmpty()) {
         QProcess p;
         p.setProcessChannelMode(QProcess::ForwardedErrorChannel);
         p.start(videoCallPath, QStringList() << "listdevices");
@@ -356,6 +505,27 @@ void SettingsDialog::loadSettings() {
     /* Audio */
     QString audioIn = settings->value("audio/inputDevice", "System default").toString();
     QString audioOut = settings->value("audio/outputDevice", "System default").toString();
+    tlsCheck->setChecked(settings->value("relay/tls", false).toBool());
+    tlsPinEdit->setText(settings->value("relay/tlsPin", "").toString());
+    tlsPinEdit->setEnabled(tlsCheck->isChecked());
+    stunServerEdit->setText(settings->value("call/stunServer", "").toString());
+    micGainSlider->setValue(settings->value("audio/micGainDb", 0).toInt());
+    micGainValue->setText(QString("%1%2 dB")
+        .arg(micGainSlider->value() > 0 ? "+" : "").arg(micGainSlider->value()));
+    {
+        const QString ns = settings->value("audio/noiseSuppress", "medium").toString();
+        for (int i = 0; i < noiseSuppressCombo->count(); i++) {
+            if (noiseSuppressCombo->itemData(i).toString() == ns) {
+                noiseSuppressCombo->setCurrentIndex(i);
+                break;
+            }
+        }
+    }
+    videoWidthSpin->setValue(settings->value("video/width", 640).toInt());
+    videoHeightSpin->setValue(settings->value("video/height", 480).toInt());
+    videoFpsSpin->setValue(settings->value("video/fps", 25).toInt());
+    videoBitrateSpin->setValue(settings->value("video/bitrate", 800).toInt());
+
     int idx = audioInputCombo->findText(audioIn);
     if (idx >= 0) audioInputCombo->setCurrentIndex(idx);
     idx = audioOutputCombo->findText(audioOut);
@@ -403,6 +573,16 @@ void SettingsDialog::saveSettings() {
     emit chatFontChanged(newFont);
 
     /* Audio */
+    settings->setValue("relay/tls", tlsCheck->isChecked());
+    settings->setValue("relay/tlsPin", tlsPinEdit->text().trimmed());
+    settings->setValue("call/stunServer", stunServerEdit->text().trimmed());
+    settings->setValue("audio/micGainDb", micGainSlider->value());
+    settings->setValue("audio/noiseSuppress", noiseSuppressCombo->currentData().toString());
+    settings->setValue("video/width", videoWidthSpin->value());
+    settings->setValue("video/height", videoHeightSpin->value());
+    settings->setValue("video/fps", videoFpsSpin->value());
+    settings->setValue("video/bitrate", videoBitrateSpin->value());
+
     settings->setValue("audio/inputDevice", audioInputCombo->currentText());
     settings->setValue("audio/outputDevice", audioOutputCombo->currentText());
 

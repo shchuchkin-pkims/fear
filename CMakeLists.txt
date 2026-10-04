@@ -8,6 +8,19 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 # Общие флаги компиляции
 add_compile_options(-O2 -Wall -Wextra -pedantic)
 
+# Флаги защиты (hardening). Клиент и сервер разбирают недоверенный сетевой ввод,
+# поэтому stack-protector / FORTIFY_SOURCE / RELRO / PIE обязательны: они
+# превращают остаточные ошибки памяти из потенциального RCE в аварийный выход.
+if(NOT MSVC)
+    add_compile_options(-fstack-protector-strong -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=2)
+    if(NOT WIN32)
+        add_compile_options(-fPIE)
+        # add_link_options требует CMake 3.13, а минимум проекта - 3.12
+        set(CMAKE_EXE_LINKER_FLAGS
+            "${CMAKE_EXE_LINKER_FLAGS} -pie -Wl,-z,relro,-z,now -Wl,-z,noexecstack")
+    endif()
+endif()
+
 # Определение платформы
 if(WIN32)
     add_compile_definitions(_WIN32_WINNT=0x0600)
@@ -71,18 +84,77 @@ else()
     message(STATUS "Using system libraries on Linux")
 endif()
 
+# Опция «только консольный клиент»: пропускает audio_call, video_call,
+# key-exchange и updater с их зависимостями (opus, portaudio, ffmpeg, sdl3,
+# curl). Её берёт workflow юнит-тестов, которому звонки не нужны. Релизные
+# сборки CI до 0.6.0 тоже шли с ней - и выкладывали архивы без звонков и
+# без программы обновления; теперь они собирают всё (linux.yml, windows.yml).
+option(FEAR_GUI_ONLY "Skip audio_call/video_call/key-exchange/updater subprojects" OFF)
+
 # Включение субмодулей
+include(${CMAKE_CURRENT_LIST_DIR}/cmake/FearSecretStore.cmake)
+
+# ── TLS поверх TCP ──────────────────────────────────────────────────────────
+#
+# Слой внешний: содержимое разговоров и так зашифровано между собеседниками.
+# TLS закрывает наблюдателя на пути - без него провайдер или хозяин точки
+# доступа видит структуру кадров, длины полей и ритм обмена, и этого хватает,
+# чтобы узнать протокол, не прочитав ни слова.
+#
+# Собирается, только если нашёлся OpenSSL. Где не нашёлся (сборка под Windows
+# берёт зависимости готовыми из lib/, и OpenSSL там нет) - функции остаются,
+# но честно отказывают: молча соединиться открытым текстом там, где человек
+# попросил TLS, хуже, чем не соединиться вовсе.
+option(FEAR_TLS "Build with TLS support (needs OpenSSL)" ON)
+set(FEAR_HAVE_TLS OFF)
+if(FEAR_TLS)
+    find_package(OpenSSL QUIET)
+    if(OpenSSL_FOUND)
+        set(FEAR_HAVE_TLS ON)
+        message(STATUS "TLS: OpenSSL ${OPENSSL_VERSION}")
+    else()
+        message(STATUS "TLS: OpenSSL not found - building without it")
+    endif()
+endif()
+
 add_subdirectory(client-console)
-add_subdirectory(key-exchange)
-add_subdirectory(updater)
-add_subdirectory(audio_call)
-add_subdirectory(video_call)
+if(NOT FEAR_GUI_ONLY)
+    add_subdirectory(key-exchange)
+    add_subdirectory(updater)
+    add_subdirectory(audio_call)
+    add_subdirectory(video_call)
+endif()
+
+# Юнит-тесты (ctest). Отключаются -DFEAR_BUILD_TESTS=OFF.
+# Утилита администрирования ретранслятора. Работает на той машине, где живёт
+# сервер, а сервер живёт под Linux (Dockerfile, systemd), поэтому под Windows
+# она не подключается: тамошняя сборка собирает минимальный набор клиента, и
+# тащить в неё Qt6::Sql ради утилиты, которую там некому запускать, незачем.
+# Сам код платформенно-нейтрален - если понадобится, это одна строка.
+option(FEAR_BUILD_ADMIN "Build the relay administration utility (needs Qt6)" ON)
+if(FEAR_BUILD_ADMIN AND NOT WIN32)
+    add_subdirectory(admin)
+endif()
+
+option(FEAR_BUILD_TESTS "Build unit tests" ON)
+
+if(FEAR_BUILD_TESTS)
+    enable_testing()
+    add_subdirectory(tests)
+endif()
 
 # Создание пользовательских целей для удобства
-add_custom_target(build-all
-    DEPENDS fear key-exchange updater audio_call video_call
-    COMMENT "Building all executables: fear.exe, key-exchange.exe, updater.exe, audio_call.exe, video_call.exe"
-)
+if(NOT FEAR_GUI_ONLY)
+    add_custom_target(build-all
+        DEPENDS fear key-exchange updater audio_call video_call
+        COMMENT "Building all executables: fear.exe, key-exchange.exe, updater.exe, audio_call.exe, video_call.exe"
+    )
+else()
+    add_custom_target(build-all
+        DEPENDS fear
+        COMMENT "Building minimal set: fear.exe (FEAR_GUI_ONLY=ON)"
+    )
+endif()
 
 add_custom_target(clean-all
     COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR} --target clean
@@ -104,38 +176,51 @@ set_target_properties(fear PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${BIN_DIRECTORY}"
 )
 
-set_target_properties(key-exchange PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY "${BIN_DIRECTORY}"
-)
+if(NOT FEAR_GUI_ONLY)
+    set_target_properties(key-exchange PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${BIN_DIRECTORY}"
+    )
 
-set_target_properties(updater PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY "${BIN_DIRECTORY}"
-)
+    set_target_properties(updater PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${BIN_DIRECTORY}"
+    )
 
-set_target_properties(audio_call PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY "${BIN_DIRECTORY}"
-)
+    set_target_properties(audio_call PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${BIN_DIRECTORY}"
+    )
 
-set_target_properties(video_call PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY "${BIN_DIRECTORY}"
-)
+    set_target_properties(video_call PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${BIN_DIRECTORY}"
+    )
+endif()
 
-# Автоматическое копирование необходимых файлов при ЛЮБОЙ сборке
-add_custom_target(copy-runtime-files ALL
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${CMAKE_SOURCE_DIR}/updater/cacert.pem"
-        "${BIN_DIRECTORY}/cacert.pem"
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${CMAKE_SOURCE_DIR}/updater/libcurl-x64.dll"
-        "${BIN_DIRECTORY}/libcurl-x64.dll"
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${CMAKE_SOURCE_DIR}/updater/updater.conf"
-        "${BIN_DIRECTORY}/updater.conf"
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${CMAKE_SOURCE_DIR}/doc/manual.pdf"
-        "${DOC_DIRECTORY}/manual.pdf"
-    COMMENT "Copying runtime files to output directory"
-)
+# Автоматическое копирование вспомогательных файлов. Под FEAR_GUI_ONLY
+# вспомогательного апдейтера нет, и updater/* отсутствуют — пропускаем.
+if(NOT FEAR_GUI_ONLY)
+    add_custom_target(copy-runtime-files ALL
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_SOURCE_DIR}/updater/cacert.pem"
+            "${BIN_DIRECTORY}/cacert.pem"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_SOURCE_DIR}/updater/updater.conf"
+            "${BIN_DIRECTORY}/updater.conf"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_SOURCE_DIR}/doc/manual.pdf"
+            "${DOC_DIRECTORY}/manual.pdf"
+        COMMENT "Copying runtime files to output directory"
+    )
+
+    # libcurl ships as a DLL beside the updater on Windows only. Copying it
+    # unconditionally put a .dll in the middle of a Linux build output, which
+    # reads like a broken build to anyone who just cloned the repository.
+    if(WIN32)
+        add_custom_command(TARGET copy-runtime-files POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${CMAKE_SOURCE_DIR}/updater/libcurl-x64.dll"
+                "${BIN_DIRECTORY}/libcurl-x64.dll"
+        )
+    endif()
+endif()
 
 # Копирование DLL при сборке на Windows (только для динамически слинкованных библиотек)
 if(WIN32)

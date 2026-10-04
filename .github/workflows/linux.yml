@@ -1,0 +1,249 @@
+name: Build Linux release
+
+# Linux x86_64 build of the desktop client: the GUI, the console client and
+# everything the GUI starts - the call programs, the updater, key-exchange.
+# The archive is laid out the way the updater expects (fear_gui at the root,
+# programs in bin/) and the GUI looks for them there.
+#
+# Until 0.6.0 this workflow shipped only fear and fear_gui, and in a layout
+# the GUI did not look in: an archive from the releases page could not even
+# chat, and had no calls at all.
+#
+# Built on Ubuntu 22.04 so that the result runs on 22.04 and newer (glibc,
+# Qt 6.2). FFmpeg and SDL3 are linked statically - SDL3 is not packaged in
+# 22.04, and a system FFmpeg would tie video_call to one release's sonames.
+#
+# Triggers:
+#   - push to main or dev - builds and uploads the zip as a build artifact
+#     (kept for 90 days, link in the run page);
+#   - tag v* - additionally attaches the zip to the matching GitHub Release;
+#   - workflow_dispatch - "Run workflow" button in Actions.
+
+on:
+  push:
+    branches: [main, dev]
+    tags: ['v*']
+    paths:
+      - 'CMakeLists.txt'
+      - 'cmake/**'
+      - 'client-console/**'
+      - 'gui/**'
+      - 'identity/**'
+      - 'audio_call/**'
+      - 'video_call/**'
+      - 'updater/**'
+      - 'key-exchange/**'
+      - 'doc/manual.pdf'
+      - 'doc/how-it-works*.pdf'
+      - 'tests/call_quit.sh'
+      - '.github/scripts/linux-media-deps.sh'
+      - '.github/workflows/linux.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    name: Linux x86_64 (Qt6 / GCC)
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build pkg-config nasm git zip \
+            libsodium-dev libsqlite3-dev libqrencode-dev libzbar-dev \
+            libsecret-1-dev libssl-dev libcurl4-openssl-dev \
+            libopus-dev portaudio19-dev \
+            qt6-base-dev qt6-base-dev-tools \
+            libgl1-mesa-dev libegl1-mesa-dev libgles2-mesa-dev \
+            libxkbcommon-dev libwayland-dev wayland-protocols libdecor-0-dev \
+            libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxfixes-dev \
+            libxi-dev libxss-dev libxtst-dev
+
+      # libvpx, FFmpeg and SDL3 from source take about two minutes; the
+      # result only changes when the script (and the versions in it) do.
+      - name: Restore static media libraries
+        id: media-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: deps
+          key: linux-media-ubuntu22-${{ hashFiles('.github/scripts/linux-media-deps.sh') }}
+
+      - name: Build static media libraries
+        if: steps.media-cache.outputs.cache-hit != 'true'
+        run: bash .github/scripts/linux-media-deps.sh deps
+
+      # Saved right away rather than at the end of the job: a later step
+      # failing would otherwise throw away a build that did not change.
+      - name: Save static media libraries
+        if: steps.media-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: deps
+          key: ${{ steps.media-cache.outputs.cache-primary-key }}
+
+      - name: Configure root project
+        run: |
+          PKG_CONFIG_PATH="$PWD/deps/lib/pkgconfig" cmake -S . -B build \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DFEAR_STATIC_MEDIA=ON \
+            -DFEAR_BUILD_TESTS=OFF \
+            -DFEAR_BUILD_ADMIN=OFF
+
+      - name: Build console client, calls, updater, key-exchange
+        run: cmake --build build --target fear audio_call video_call updater key-exchange -j
+
+      - name: Configure GUI project
+        run: |
+          cmake -S gui/src -B build/gui \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLIBSODIUM_PATH=/nonexistent
+
+      - name: Build GUI client (fear_gui)
+        run: cmake --build build/gui --target fear_gui -j
+
+      - name: Stage release directory
+        run: |
+          set -e
+          R=release/fear
+          mkdir -p "$R/bin" "$R/doc"
+          cp build/fear_gui "$R/"
+          for p in fear audio_call video_call updater key-exchange; do
+            cp "build/bin/$p" "$R/bin/"
+          done
+          cp updater/updater.conf updater/cacert.pem "$R/bin/"
+          cp doc/manual.pdf doc/how-it-works.pdf doc/how-it-works.ru.pdf "$R/doc/"
+          # GPL требует отдавать текст лицензии вместе с программой.
+          cp LICENSE LICENSE.GPL-3.0 LICENSING.md "$R/"
+          strip --strip-unneeded "$R/fear_gui" "$R"/bin/fear "$R"/bin/audio_call \
+            "$R"/bin/video_call "$R"/bin/updater "$R"/bin/key-exchange
+          chmod 755 "$R/fear_gui" "$R"/bin/fear "$R"/bin/audio_call \
+            "$R"/bin/video_call "$R"/bin/updater "$R"/bin/key-exchange
+          chmod 644 "$R"/bin/updater.conf "$R"/bin/cacert.pem "$R"/doc/*.pdf \
+            "$R"/LICENSE "$R"/LICENSE.GPL-3.0 "$R"/LICENSING.md
+
+          # The packages behind the libraries the programs link directly
+          # (NEEDED), so README names them instead of guessing; apt brings
+          # the rest. Plugins Qt loads at run time - the platform plugins and
+          # the SQLite driver for the history - never show here and are
+          # named by hand below. dpkg knows a file by the path its package
+          # installed, /lib or /usr/lib, hence both.
+          owner() { dpkg -S "$1" 2>/dev/null || dpkg -S "/usr$1" 2>/dev/null || dpkg -S "${1#/usr}" 2>/dev/null; }
+          pkgs=$(for f in "$R/fear_gui" "$R"/bin/fear "$R"/bin/audio_call \
+                          "$R"/bin/video_call "$R"/bin/updater "$R"/bin/key-exchange; do
+                   deps=$(ldd "$f" 2>/dev/null || true)
+                   readelf -d "$f" | awk '/\(NEEDED\)/ {gsub(/[][]/, "", $5); print $5}' |
+                   while read -r so; do
+                     path=$(printf '%s\n' "$deps" | awk -v so="$so" '$1 == so && $3 ~ /^\// {print $3}')
+                     if [ -n "$path" ]; then owner "$path" | head -1 | cut -d: -f1 || true; fi
+                   done
+                 done | sort -u | { grep -vE '^(libc6|libgcc-s1|libstdc\+\+6)$' || true; } | xargs)
+          echo "Runtime packages: $pkgs"
+
+          {
+            echo "F.E.A.R. Messenger - Linux build"
+            echo "================================"
+            echo
+            echo "Run ./fear_gui to start the graphical client. The programs it"
+            echo "starts are in bin/: fear (console client and relay), audio_call,"
+            echo "video_call, updater, key-exchange. The manual is doc/manual.pdf;"
+            echo "how it works, in plain words: doc/how-it-works.pdf (also .ru.pdf)."
+            echo
+            echo "Keep the layout as it is: the GUI looks for its programs in bin/,"
+            echo "and the updater unpacks a new release over this directory."
+            echo
+            echo "Built on Ubuntu 22.04; runs on Ubuntu 22.04 and newer, Debian 12"
+            echo "and newer. Needed at run time (Ubuntu/Debian package names):"
+            echo
+            echo "  sudo apt install $pkgs qt6-qpa-plugins libqt6sql6-sqlite unzip"
+            echo
+            echo "FFmpeg and SDL3 are built into video_call; nothing to install for"
+            echo "them. On other distributions install the same libraries under"
+            echo "their names there, or build from source (see the project Wiki)."
+            echo
+            echo "See https://fear-project.ru and the project Wiki for documentation."
+            echo
+            echo "F.E.A.R. is free software: the clients are GPL-3.0-or-later"
+            echo "(LICENSE.GPL-3.0), the console client and server AGPL-3.0-or-later"
+            echo "(LICENSE). See LICENSING.md."
+          } > "$R/README.txt"
+          find "$R" -type f | sort
+
+      # What a person downloading the archive would hit first: a library
+      # that is not there, or a program that does not start.
+      - name: Check the staged programs
+        run: |
+          set -e
+          R=release/fear
+          for f in "$R/fear_gui" "$R"/bin/fear "$R"/bin/audio_call \
+                   "$R"/bin/video_call "$R"/bin/updater "$R"/bin/key-exchange; do
+            if ldd "$f" | grep -q "not found"; then
+              echo "::error::$f: missing libraries"; ldd "$f"; exit 1
+            fi
+          done
+          if ldd "$R/bin/video_call" | grep -qE 'libav|libsw|libSDL3|libvpx'; then
+            echo "::error::video_call links FFmpeg or SDL3 dynamically"
+            ldd "$R/bin/video_call"; exit 1
+          fi
+          "$R/bin/fear" --version
+          "$R/bin/video_call" listdevices
+          # A real call through a real relay, from the archive: it has to
+          # come up and stop cleanly when asked.
+          bash tests/call_quit.sh "$R/bin/fear" "$R/bin/video_call"
+
+      - name: Make zip
+        run: |
+          tag="${{ github.ref_name }}"
+          sha=$(echo "${{ github.sha }}" | cut -c1-7)
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            name="fear-linux-x86_64-${tag}.zip"
+          else
+            name="fear-linux-x86_64-${tag//\//_}-${sha}.zip"
+          fi
+          # Contents at the root of the archive, not under fear/: the updater
+          # unpacks it over the install directory as it is.
+          (cd release/fear && zip -r "../${name}" .)
+          echo "ZIP_NAME=${name}" >> "$GITHUB_ENV"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ZIP_NAME }}
+          path: release/${{ env.ZIP_NAME }}
+          if-no-files-found: error
+          retention-days: 90
+
+      # The updater refuses to install an archive without a valid Ed25519
+      # signature, so a release must ship <archive>.sig next to the archive.
+      # Generate the keypair with `fear-sign keygen` (doc/RELEASE_SIGNING.md),
+      # put the secret in the FEAR_SIGN_KEY repository secret and the public
+      # half in updater/updater.conf.
+      - name: Sign release archive (only on tag push)
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          FEAR_SIGN_KEY: ${{ secrets.FEAR_SIGN_KEY }}
+        run: |
+          set -e
+          if [ -z "${FEAR_SIGN_KEY}" ]; then
+            echo "::error::FEAR_SIGN_KEY secret is not set - refusing to publish an unsigned release."
+            exit 1
+          fi
+          gcc -O2 -o fear-sign updater/tools/fear-sign.c $(pkg-config --cflags --libs libsodium)
+          ./fear-sign sign "release/${ZIP_NAME}" > "release/${ZIP_NAME}.sig"
+          echo "Signature: $(cat "release/${ZIP_NAME}.sig")"
+
+      - name: Attach to GitHub Release (only on tag push)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release/${{ env.ZIP_NAME }}
+            release/${{ env.ZIP_NAME }}.sig

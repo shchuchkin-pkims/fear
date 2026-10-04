@@ -5,8 +5,8 @@
  * This server acts as a relay for encrypted messages between clients.
  * It NEVER has access to message plaintext - all messages are end-to-end
  * encrypted by clients using room keys. The server only sees metadata:
- * - Room names
- * - User names
+ * - Room labels (хеш названия, самого названия сервер не видит)
+ * - Session tags (случайная метка соединения, не имя человека)
  * - Message sizes
  *
  * Server responsibilities:
@@ -17,8 +17,14 @@
  * - Handle client disconnections
  */
 
+#if defined(__linux__)
+#  include <linux/sockios.h>   /* SIOCOUTQ: сколько байт ещё не ушло */
+#  include <sys/ioctl.h>
+#endif
+#include "tls.h"
 #include "server.h"
 #include "network.h"
+#include "server_db.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -41,12 +47,27 @@
  */
 typedef struct {
     sock_t fd;              /**< Socket descriptor for this client */
+    uint32_t ip;            /**< Source IPv4 address, for the per-IP connection cap */
     char room[MAX_ROOM];    /**< Room name (empty until first message) */
-    char name[MAX_NAME];    /**< User name (empty until first message) */
+    char name[MAX_NAME];    /**< Session tag (empty until first message) */
     struct sockaddr_in udp_addr; /**< UDP address for relay */
     int udp_registered;     /**< Whether UDP relay address is set */
     int is_media_relay;     /**< Whether this is a media relay connection (allows duplicate name) */
+    uint8_t blob_challenge[32]; /**< One-shot nonce for BLOB_GET authorization (M10) */
+    int blob_challenge_set; /**< Whether blob_challenge holds a fresh unconsumed nonce */
+    time_t last_seen;       /**< Wall-clock time of the last frame received from this client.
+                                  Updated on accept and on every successful read_frame. The
+                                  idle scan in the main loop closes connections with
+                                  now - last_seen > IDLE_TIMEOUT_SEC. */
 } client_t;
+
+/**
+ * How long a client may be silent before the server kicks it.
+ * Clients send MSG_TYPE_PING at most every PING_INTERVAL_SEC (60s on both
+ * Android and CLI), so 240s = four missed pings comfortably covers a brief
+ * packet loss while still releasing the slot quickly after a real crash.
+ */
+#define IDLE_TIMEOUT_SEC 240
 
 /**
  * @brief Read a complete protocol frame from client socket
@@ -65,14 +86,57 @@ typedef struct {
  * @note Caller must free(*out) after use
  * @note Returns -1 if frame is malformed or exceeds limits
  */
+/** Max simultaneous connections from one source address.
+ * Deliberately generous: several users commonly share one NAT address, and a
+ * single participant in a video call holds three connections (chat plus the
+ * audio and video TCP media relays). This only has to stop one source from
+ * eating all MAX_CLIENTS slots. */
+#define MAX_CONN_PER_IP 16
+
+/** Wall-clock budget for receiving one complete frame. */
+#define FRAME_READ_TIMEOUT_SEC 20
+
+/** Per-recv / per-send socket timeout, in seconds. */
+#define SOCKET_IO_TIMEOUT_SEC 10
+
+/**
+ * @brief Bound how long a single recv/send on this socket may block.
+ *
+ * The server is single-threaded and does blocking I/O once select() reports a
+ * socket readable, so without this one peer could freeze every other client
+ * indefinitely - by dribbling a frame a byte at a time, or by refusing to read
+ * and stalling a broadcast in send_all(). This caps the damage; a full
+ * non-blocking rewrite of the loop is the proper long-term fix.
+ */
+static void set_socket_timeouts(sock_t fd) {
+#ifdef _WIN32
+    DWORD tv = SOCKET_IO_TIMEOUT_SEC * 1000;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, (const char *)&tv, sizeof(tv));
+#else
+    struct timeval tv;
+    tv.tv_sec = SOCKET_IO_TIMEOUT_SEC;
+    tv.tv_usec = 0;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+#endif
+}
+
 static int read_frame(sock_t fd, uint8_t **out, size_t *outlen) {
+    /* Deadline for the whole frame. SO_RCVTIMEO alone is not enough: a client
+     * that sends one byte just before every timeout would keep the server
+     * blocked here forever. */
+    const time_t frame_deadline = time(NULL) + FRAME_READ_TIMEOUT_SEC;
+
     uint8_t hdr[2];
     if (recv_all(fd, hdr, 2) < 0) {
         return -1;
     }
 
     uint16_t room_len = rd_u16(hdr);
-    if (room_len > MAX_ROOM) {
+    /* >= : room_len == MAX_ROOM would later index clients[].room[MAX_ROOM],
+     * one past the end of a char[MAX_ROOM] buffer. */
+    if (room_len >= MAX_ROOM) {
         return -1;
     }
 
@@ -85,7 +149,9 @@ static int read_frame(sock_t fd, uint8_t **out, size_t *outlen) {
     // read room + name_len
     if (recv_all(fd, buf + 2, room_len + 2) < 0) { free(buf); return -1; }
     uint16_t name_len = rd_u16(buf + 2 + room_len);
-    if (name_len > MAX_NAME) { free(buf); return -1; }
+    /* >= : see room_len above - clients[].name is char[MAX_NAME]. */
+    if (name_len >= MAX_NAME) { free(buf); return -1; }
+    if (time(NULL) > frame_deadline) { free(buf); return -1; }
 
     // read name
     if (recv_all(fd, buf + 2 + room_len + 2, name_len) < 0) { free(buf); return -1; }
@@ -109,9 +175,10 @@ static int read_frame(sock_t fd, uint8_t **out, size_t *outlen) {
     if (recv_all(fd, clenbuf, 4) < 0) { free(buf); return -1; }
     uint32_t clen = rd_u32(clenbuf);
     if (clen > MAX_FRAME) { free(buf); return -1; }
+    if (time(NULL) > frame_deadline) { free(buf); return -1; }
 
     // read cipher
-    uint8_t *cipher = (uint8_t*)malloc(clen);
+    uint8_t *cipher = (uint8_t*)malloc(clen ? clen : 1);
     if (!cipher) { free(buf); return -1; }
     if (recv_all(fd, cipher, clen) < 0) { free(buf); free(cipher); return -1; }
 
@@ -150,8 +217,35 @@ static int read_frame(sock_t fd, uint8_t **out, size_t *outlen) {
  *
  * @note Automatically removes clients if send fails
  */
+/*
+ * Сколько байт ещё не ушло получателю.
+ *
+ * Нужно ровно для одного решения: не тащить ли мы за собой очередь. Где
+ * спросить нельзя (Windows, экзотика) - отвечаем 0, и поведение остаётся
+ * прежним: лучше не знать, чем угадывать.
+ */
+static long pending_bytes(sock_t fd) {
+#if defined(__linux__)
+    int n = 0;
+    if (ioctl((int)fd, SIOCOUTQ, &n) == 0) return (long)n;
+#else
+    (void)fd;
+#endif
+    return 0;
+}
+
+/*
+ * Сколько невыгруженного терпим у получателя, прежде чем ронять медиа.
+ *
+ * Это не про память, а про время. При 500 кбит/с четверть мегабайта - это
+ * четыре секунды видео, ждущего своей очереди; кадр такого возраста не
+ * нужен никому. Показания живого звонка: 662 КБ неотправленного и окно
+ * приёма, схлопнувшееся до 512 байт.
+ */
+#define MEDIA_BACKLOG_LIMIT (128 * 1024)
+
 static void broadcast(client_t *clients, int *nclients, const char *room,
-                     const uint8_t *frame, size_t flen, sock_t from) {
+                     const uint8_t *frame, size_t flen, sock_t from, int is_media) {
     /* Extract frame fields to validate structure */
     if (flen < 2) return;
     uint16_t room_len = rd_u16(frame);
@@ -161,6 +255,9 @@ static void broadcast(client_t *clients, int *nclients, const char *room,
 
     /* Frame is valid, broadcast to room participants */
     (void)room; /* Suppress unused parameter warning */
+    /* Метка сессии отправителя. Совпадение с меткой соединения проверено при
+     * приёме кадра (anti-spoofing), так что ей можно верить. */
+    const char *sender_tag = (const char *)(frame + 2 + room_len + 2);
 
     for (int i = 0; i < *nclients; i++) {
         if (clients[i].fd == from) {
@@ -177,9 +274,55 @@ static void broadcast(client_t *clients, int *nclients, const char *room,
             continue;
         }
 
+        /*
+         * Медиа - только звонкам, и не тому же участнику.
+         *
+         * У участника два соединения под одной меткой сессии: чат и звонок.
+         * Рассылка исключала только сокет отправителя, и медиа уходило во все
+         * прочие - в чат каждого участника, где его читают и выбрасывают, и в
+         * чат самого отправителя, то есть его же поток возвращался к нему
+         * обратно. На телефоне это лишняя полоса видео вниз по Wi-Fi: ничего
+         * не показывает, а эфир у выгрузки вверх отнимает - Wi-Fi
+         * полудуплексный. Замер на живом звонке: 211 МБ за сеанс в сокет чата
+         * телефона и 90 КБ его собственного видео в очереди на выгрузку.
+         */
+        if (is_media) {
+            if (!clients[i].is_media_relay) {
+                continue;
+            }
+            if (strlen(clients[i].name) == name_len &&
+                memcmp(clients[i].name, sender_tag, name_len) == 0) {
+                continue;
+            }
+        }
+
+        /*
+         * Медиа роняем, а не задерживаем.
+         *
+         * send_all блокирующий: пока он ждёт медленного получателя, сервер
+         * не читает ни у кого. Окна приёма схлопываются, очереди у всех
+         * отправителей растут, и задержка звонка идёт на секунды - при том
+         * что тормозит один участник. Классическая блокировка головы
+         * очереди, и на живом звонке она давала RTT в четыре секунды.
+         *
+         * Терять кадры мультимедиа допустимо - задерживать нет: устаревшее
+         * видео бесполезно, а место в очереди оно занимает. Переписку это
+         * не касается: она мелкая, и потеря там невосполнима.
+         */
+        if (is_media && pending_bytes(clients[i].fd) > MEDIA_BACKLOG_LIMIT) {
+            static long dropped = 0;
+            if (++dropped % 200 == 1) {
+                printf("[server] dropping media for a backed-up client "
+                       "(%ld frames so far)\n", dropped);
+                fflush(stdout);
+            }
+            continue;
+        }
+
         /* Send frame to client; remove if send fails */
         if (send_all(clients[i].fd, frame, flen) < 0) {
-            close_socket(clients[i].fd);
+            tls_close((int)clients[i].fd);
+                close_socket(clients[i].fd);
             clients[i] = clients[*nclients - 1];
             (*nclients)--;
             i--;
@@ -261,13 +404,629 @@ static void send_user_list(client_t *clients, int nclients, const char *room) {
 }
 
 
+/**
+ * Build and send a HANDLE_RESULT frame back to the requesting client.
+ *
+ * Frame mirrors the wire format used everywhere else (room/name/zero-nonce/
+ * type/clen/cipher); the cipher field carries the response payload directly
+ * since handle commands are public service messages.
+ *
+ * Payload layout: [status(1)][reason_len(1)][reason][optional pk(0 or 32)]
+ */
+static void send_result_frame(sock_t fd, const char *room, uint16_t room_len,
+                              uint8_t msg_type,
+                              uint8_t status, const char *reason,
+                              const uint8_t *pk_or_null) {
+    uint8_t  payload[256];
+    size_t   payload_len = 0;
+    payload[payload_len++] = status;
+
+    uint8_t reason_len = reason ? (uint8_t)strlen(reason) : 0;
+    if (reason_len > 200) reason_len = 200;
+    payload[payload_len++] = reason_len;
+    if (reason_len) {
+        memcpy(payload + payload_len, reason, reason_len);
+        payload_len += reason_len;
+    }
+    if (pk_or_null) {
+        memcpy(payload + payload_len, pk_or_null, 32);
+        payload_len += 32;
+    }
+
+    static const char *kSrvName = "server";
+    uint16_t name_len = (uint16_t)strlen(kSrvName);
+    uint8_t  nonce[CRYPTO_NPUBBYTES];
+    memset(nonce, 0, sizeof(nonce));
+
+    size_t frame_len = 2 + room_len + 2 + name_len + 2 + CRYPTO_NPUBBYTES + 1 + 4 + payload_len;
+    uint8_t *frame = (uint8_t *)malloc(frame_len);
+    if (!frame) return;
+
+    uint8_t *w = frame;
+    wr_u16(w, room_len);            w += 2;
+    memcpy(w, room, room_len);      w += room_len;
+    wr_u16(w, name_len);            w += 2;
+    memcpy(w, kSrvName, name_len);  w += name_len;
+    wr_u16(w, CRYPTO_NPUBBYTES);    w += 2;
+    memcpy(w, nonce, CRYPTO_NPUBBYTES); w += CRYPTO_NPUBBYTES;
+    *w++ = msg_type;
+    wr_u32(w, (uint32_t)payload_len); w += 4;
+    memcpy(w, payload, payload_len);
+
+    send_all(fd, frame, frame_len);
+    free(frame);
+}
+
+static void send_handle_result(sock_t fd, const char *room, uint16_t room_len,
+                               uint8_t status, const char *reason,
+                               const uint8_t *pk_or_null) {
+    send_result_frame(fd, room, room_len, (uint8_t)MSG_TYPE_HANDLE_RESULT,
+                      status, reason, pk_or_null);
+}
+
+/* BLOB_PUT / BLOB_GET replies must carry MSG_TYPE_BLOB_RESULT: the sp_*
+ * client helpers (and the Android BlobProtocol) match on that type. Until
+ * now error/PUT replies went out as HANDLE_RESULT, which clients reported
+ * as a bad reply. */
+static void send_blob_result(sock_t fd, const char *room, uint16_t room_len,
+                             uint8_t status, const char *reason) {
+    send_result_frame(fd, room, room_len, (uint8_t)MSG_TYPE_BLOB_RESULT,
+                      status, reason, NULL);
+}
+
+/**
+ * Inspect a freshly-read frame for handle-registry commands.
+ * If the frame's type is REGISTER_HANDLE / LOOKUP_HANDLE, process it
+ * locally (talks to server_db) and send a HANDLE_RESULT back.
+ *
+ * Returns 1 if the frame was a handle command (caller should NOT broadcast),
+ *         0 if it's a regular text/file/etc frame to be broadcast as usual.
+ */
+static int try_handle_command(client_t *cl, const uint8_t *frame, size_t flen) {
+    sock_t fd = cl->fd;
+    fear_frame_t fv;
+    if (fear_frame_parse(frame, flen, &fv) != 0) return 0;
+    uint16_t       room_len = fv.room_len;
+    uint8_t        type     = fv.type;
+    uint32_t       clen     = fv.payload_len;
+    const uint8_t *cipher   = fv.payload;
+    const char    *room     = fv.room;
+
+    if (type == MSG_TYPE_REGISTER_HANDLE) {
+        /* payload: [pk(32)][sig(64)][handle_len(1)][handle UTF-8] */
+        if (clen < 32 + 64 + 1) {
+            send_handle_result(fd, room, room_len, 2, "payload too short", NULL);
+            return 1;
+        }
+        const uint8_t *pk        = cipher;
+        const uint8_t *sig       = cipher + 32;
+        uint8_t        handle_len = cipher[32 + 64];
+        if (clen < (uint32_t)32 + 64 + 1 + handle_len) {
+            send_handle_result(fd, room, room_len, 2, "truncated handle", NULL);
+            return 1;
+        }
+        char handle[64];
+        if (handle_len >= sizeof(handle)) handle_len = sizeof(handle) - 1;
+        memcpy(handle, cipher + 32 + 64 + 1, handle_len);
+        handle[handle_len] = '\0';
+
+        /* Verify the Ed25519 sig over the handle bytes — proves the requester
+         * actually owns identity_pk. */
+        if (crypto_sign_verify_detached(sig, (const uint8_t *)handle,
+                                        handle_len, pk) != 0) {
+            send_handle_result(fd, room, room_len, 2, "bad signature", NULL);
+            return 1;
+        }
+
+        /* После проверки подписи, а не до неё: отказ по ключу без подписи
+         * позволил бы кому угодно выяснить, заблокирован ли ключ, просто
+         * назвав его. */
+        if (server_db_is_blocked(pk)) {
+            send_handle_result(fd, room, room_len, 2, "key is blocked", NULL);
+            printf("[server] blocked key tried to register handle '%s'\n", handle);
+            return 1;
+        }
+
+        handle_register_result_t rc = server_db_register_handle(handle, pk);
+        switch (rc) {
+            case HANDLE_REGISTER_OK:
+                send_handle_result(fd, room, room_len, 0, "ok", pk);
+                printf("[server] handle '%s' registered\n", handle);
+                break;
+            case HANDLE_REGISTER_CONFLICT:
+                send_handle_result(fd, room, room_len, 1, "handle taken", NULL);
+                break;
+            case HANDLE_REGISTER_INVALID:
+                send_handle_result(fd, room, room_len, 2, "invalid handle", NULL);
+                break;
+            default:
+                send_handle_result(fd, room, room_len, 3, "server error", NULL);
+                break;
+        }
+        return 1;
+    }
+
+    if (type == MSG_TYPE_LOOKUP_HANDLE) {
+        if (clen < 1) {
+            send_handle_result(fd, room, room_len, 2, "missing handle", NULL);
+            return 1;
+        }
+        uint8_t handle_len = cipher[0];
+        if (clen < (uint32_t)1 + handle_len) {
+            send_handle_result(fd, room, room_len, 2, "truncated handle", NULL);
+            return 1;
+        }
+        char handle[64];
+        if (handle_len >= sizeof(handle)) handle_len = sizeof(handle) - 1;
+        memcpy(handle, cipher + 1, handle_len);
+        handle[handle_len] = '\0';
+
+        uint8_t pk[32];
+        int rc = server_db_lookup_handle(handle, pk);
+        if (rc == 0)      send_handle_result(fd, room, room_len, 0, "ok", pk);
+        else if (rc == 1) send_handle_result(fd, room, room_len, 1, "not found", NULL);
+        else              send_handle_result(fd, room, room_len, 3, "server error", NULL);
+        return 1;
+    }
+
+    if (type == MSG_TYPE_LOOKUP_HANDLE_BY_PK) {
+        /* Reverse lookup — given identity_pk, return registered handle.
+         * Used by clients after identity import to detect a pre-existing
+         * registration. Payload: [pk(32)].
+         * Reply: HANDLE_RESULT with status=0 and payload
+         *        [status(1)][reason_len(1)][reason][handle_len(1)][handle]
+         * (the standard pk(32) suffix is replaced by handle_len + handle).
+         */
+        if (clen < 32) {
+            send_handle_result(fd, room, room_len, 2, "missing pk", NULL);
+            return 1;
+        }
+        char handle[64];
+        int rc = server_db_lookup_handle_by_pk(cipher, handle, sizeof(handle));
+        if (rc == 0) {
+            /* Build custom payload manually since send_handle_result writes
+             * pk(32) instead of handle_len+handle. */
+            uint8_t  payload[256];
+            size_t   payload_len = 0;
+            payload[payload_len++] = 0;          /* status = ok */
+            const char *reason     = "ok";
+            uint8_t reason_len     = (uint8_t)strlen(reason);
+            payload[payload_len++] = reason_len;
+            memcpy(payload + payload_len, reason, reason_len);
+            payload_len += reason_len;
+            uint8_t handle_len = (uint8_t)strlen(handle);
+            payload[payload_len++] = handle_len;
+            memcpy(payload + payload_len, handle, handle_len);
+            payload_len += handle_len;
+
+            static const char *kSrvName = "server";
+            uint16_t name_len = (uint16_t)strlen(kSrvName);
+            uint8_t  nonce[CRYPTO_NPUBBYTES];
+            memset(nonce, 0, sizeof(nonce));
+            size_t frame_len = 2 + room_len + 2 + name_len + 2
+                             + CRYPTO_NPUBBYTES + 1 + 4 + payload_len;
+            uint8_t *frame = (uint8_t *)malloc(frame_len);
+            if (frame) {
+                uint8_t *w = frame;
+                wr_u16(w, room_len);            w += 2;
+                memcpy(w, room, room_len);      w += room_len;
+                wr_u16(w, name_len);            w += 2;
+                memcpy(w, kSrvName, name_len);  w += name_len;
+                wr_u16(w, CRYPTO_NPUBBYTES);    w += 2;
+                memcpy(w, nonce, CRYPTO_NPUBBYTES); w += CRYPTO_NPUBBYTES;
+                *w++ = (uint8_t)MSG_TYPE_HANDLE_RESULT;
+                wr_u32(w, (uint32_t)payload_len); w += 4;
+                memcpy(w, payload, payload_len);
+                send_all(fd, frame, frame_len);
+                free(frame);
+            }
+        } else if (rc == 1) {
+            send_handle_result(fd, room, room_len, 1, "not found", NULL);
+        } else {
+            send_handle_result(fd, room, room_len, 3, "server error", NULL);
+        }
+        return 1;
+    }
+
+    if (type == MSG_TYPE_BLOB_PUT) {
+        /* payload: [pk(32)][sig(64)][type_len(1)][type][cipher_len(4)][cipher] */
+        if (clen < 32 + 64 + 1 + 4) {
+            send_blob_result(fd, room, room_len, 2, "blob put too short");
+            return 1;
+        }
+        const uint8_t *pk        = cipher;
+        const uint8_t *sig       = cipher + 32;
+        uint8_t        type_len  = cipher[32 + 64];
+        if (clen < (uint32_t)32 + 64 + 1 + type_len + 4) {
+            send_blob_result(fd, room, room_len, 2, "truncated type");
+            return 1;
+        }
+        const uint8_t *type_buf  = cipher + 32 + 64 + 1;
+        uint32_t       cipher_len = rd_u32(cipher + 32 + 64 + 1 + type_len);
+        /* Overflow-free bound check. The previous form evaluated the right-hand
+         * side in uint32_t, so a cipher_len near UINT32_MAX wrapped it to a tiny
+         * value, passed this check and then over-read ~4 GB in the memcpy below -
+         * a remote unauthenticated crash of the whole relay. clen >= hdr_len is
+         * guaranteed by the "truncated type" check above. */
+        uint32_t hdr_len = (uint32_t)32 + 64 + 1 + type_len + 4;
+        if (cipher_len > clen - hdr_len) {
+            send_blob_result(fd, room, room_len, 2, "truncated cipher");
+            return 1;
+        }
+        const uint8_t *cipher_data = cipher + 32 + 64 + 1 + type_len + 4;
+
+        /* Sig covers (type_bytes || cipher_bytes) — proves the requester
+         * owns identity_pk before we let them write a blob under it. */
+        size_t signed_len = (size_t)type_len + cipher_len;
+        uint8_t *signed_buf = (uint8_t *)malloc(signed_len);
+        if (!signed_buf) {
+            send_blob_result(fd, room, room_len, 3, "oom");
+            return 1;
+        }
+        memcpy(signed_buf, type_buf, type_len);
+        memcpy(signed_buf + type_len, cipher_data, cipher_len);
+        int sig_ok = crypto_sign_verify_detached(sig, signed_buf, signed_len, pk);
+        free(signed_buf);
+        if (sig_ok != 0) {
+            send_blob_result(fd, room, room_len, 2, "bad signature");
+            return 1;
+        }
+
+        if (server_db_is_blocked(pk)) {
+            send_blob_result(fd, room, room_len, 2, "key is blocked");
+            return 1;
+        }
+
+        /* server_db expects a NUL-terminated blob_type string. */
+        char type_str[64];
+        if (type_len >= sizeof(type_str)) type_len = sizeof(type_str) - 1;
+        memcpy(type_str, type_buf, type_len);
+        type_str[type_len] = '\0';
+
+        int put_rc = server_db_put_blob(pk, type_str, cipher_data, cipher_len);
+        if (put_rc == 0) {
+            send_blob_result(fd, room, room_len, 0, "ok");
+            printf("[server] blob '%s' stored (%u bytes)\n", type_str, cipher_len);
+        } else if (put_rc == -2) {
+            send_blob_result(fd, room, room_len, 2, "blob quota exceeded");
+            printf("[server] blob '%s' rejected: quota exceeded\n", type_str);
+        } else {
+            send_blob_result(fd, room, room_len, 3, "db error");
+        }
+        return 1;
+    }
+
+    if (type == MSG_TYPE_BLOB_GET_CHALLENGE) {
+        /* Hand out a one-shot nonce that the next BLOB_GET on this
+         * connection must sign (M10). Reply: [challenge(32)]. */
+        randombytes_buf(cl->blob_challenge, sizeof(cl->blob_challenge));
+        cl->blob_challenge_set = 1;
+
+        static const char *kSrvName = "server";
+        uint16_t name_len = (uint16_t)strlen(kSrvName);
+        uint8_t  nonce[CRYPTO_NPUBBYTES];
+        memset(nonce, 0, sizeof(nonce));
+        size_t frame_len = 2 + room_len + 2 + name_len + 2 + CRYPTO_NPUBBYTES + 1 + 4 + 32;
+        uint8_t *out = (uint8_t *)malloc(frame_len);
+        if (!out) return 1;
+        uint8_t *w = out;
+        wr_u16(w, room_len);                w += 2;
+        memcpy(w, room, room_len);          w += room_len;
+        wr_u16(w, name_len);                w += 2;
+        memcpy(w, kSrvName, name_len);      w += name_len;
+        wr_u16(w, CRYPTO_NPUBBYTES);        w += 2;
+        memcpy(w, nonce, CRYPTO_NPUBBYTES); w += CRYPTO_NPUBBYTES;
+        *w++ = (uint8_t)MSG_TYPE_BLOB_CHALLENGE_RESULT;
+        wr_u32(w, 32);                      w += 4;
+        memcpy(w, cl->blob_challenge, 32);
+        send_all(fd, out, frame_len);
+        free(out);
+        return 1;
+    }
+
+    if (type == MSG_TYPE_BLOB_GET) {
+        /* payload: [pk(32)][sig(64)][type_len(1)][type]
+         * sig = Ed25519(challenge || type) under pk's secret key. Without
+         * this only-owner check anyone could download any pk's (encrypted)
+         * blob and use the reply as a presence oracle (M10). */
+        if (clen < 32 + 64 + 1) {
+            send_blob_result(fd, room, room_len, 2, "blob get too short");
+            return 1;
+        }
+        const uint8_t *pk       = cipher;
+        const uint8_t *sig      = cipher + 32;
+        uint8_t        type_len = cipher[32 + 64];
+        if (clen < (uint32_t)32 + 64 + 1 + type_len) {
+            send_blob_result(fd, room, room_len, 2, "truncated type");
+            return 1;
+        }
+
+        if (!cl->blob_challenge_set) {
+            send_blob_result(fd, room, room_len, 2, "challenge required");
+            return 1;
+        }
+        /* Consume the nonce before verifying: pass or fail, it's one-shot. */
+        cl->blob_challenge_set = 0;
+
+        uint8_t signed_buf[32 + 255];
+        memcpy(signed_buf, cl->blob_challenge, 32);
+        memcpy(signed_buf + 32, cipher + 32 + 64 + 1, type_len);
+        if (crypto_sign_verify_detached(sig, signed_buf, (size_t)32 + type_len, pk) != 0) {
+            send_blob_result(fd, room, room_len, 2, "bad signature");
+            return 1;
+        }
+
+        char type_str[64];
+        if (type_len >= sizeof(type_str)) type_len = sizeof(type_str) - 1;
+        memcpy(type_str, cipher + 32 + 64 + 1, type_len);
+        type_str[type_len] = '\0';
+
+        if (server_db_is_blocked(pk)) {
+            send_blob_result(fd, room, room_len, 2, "key is blocked");
+            return 1;
+        }
+
+        uint8_t *blob = NULL; size_t blob_len = 0;
+        int rc = server_db_get_blob(pk, type_str, &blob, &blob_len);
+        if (rc != 0) {
+            send_blob_result(fd, room, room_len,
+                               rc == 1 ? 1 : 3,
+                               rc == 1 ? "not found" : "db error");
+            return 1;
+        }
+
+        /* Build a BLOB_RESULT frame with [status=0][reason_len=2 "ok"]"ok"
+         * [cipher_len(4)][cipher]. We can't reuse send_handle_result because
+         * it doesn't carry an arbitrary cipher payload. Inline below. */
+        uint8_t  reason_len = 2;
+        size_t   payload_len = 1 + 1 + reason_len + 4 + blob_len;
+        uint8_t *payload     = (uint8_t *)malloc(payload_len);
+        if (!payload) { free(blob); return 1; }
+        payload[0] = 0;
+        payload[1] = reason_len;
+        memcpy(payload + 2, "ok", reason_len);
+        wr_u32(payload + 2 + reason_len, (uint32_t)blob_len);
+        memcpy(payload + 2 + reason_len + 4, blob, blob_len);
+
+        static const char *kSrvName = "server";
+        uint16_t name_len = (uint16_t)strlen(kSrvName);
+        uint8_t  nonce[CRYPTO_NPUBBYTES];
+        memset(nonce, 0, sizeof(nonce));
+        size_t frame_len = 2 + room_len + 2 + name_len + 2 + CRYPTO_NPUBBYTES + 1 + 4 + payload_len;
+        uint8_t *frame = (uint8_t *)malloc(frame_len);
+        if (!frame) { free(blob); free(payload); return 1; }
+        uint8_t *w = frame;
+        wr_u16(w, room_len);                w += 2;
+        memcpy(w, room, room_len);          w += room_len;
+        wr_u16(w, name_len);                w += 2;
+        memcpy(w, kSrvName, name_len);      w += name_len;
+        wr_u16(w, CRYPTO_NPUBBYTES);        w += 2;
+        memcpy(w, nonce, CRYPTO_NPUBBYTES); w += CRYPTO_NPUBBYTES;
+        *w++ = (uint8_t)MSG_TYPE_BLOB_RESULT;
+        wr_u32(w, (uint32_t)payload_len);   w += 4;
+        memcpy(w, payload, payload_len);
+        send_all(fd, frame, frame_len);
+        free(frame);
+        free(payload);
+        free(blob);
+        return 1;
+    }
+
+    return 0;  /* not a handle / blob command */
+}
+
+/**
+ * Server-side handler for room-scoped service commands that need access
+ * to the client roster: ROOM_INFO_REQUEST and PING. Kept separate from
+ * try_handle_command because that one only sees the single client's fd
+ * and has no way to count peers in the room.
+ *
+ * Returns 1 if the frame was handled (caller must skip broadcast/registration),
+ *         0 otherwise.
+ */
+/**
+ * Кадр от сервера с произвольной нагрузкой.
+ *
+ * send_result_frame умеет только «статус и причина»; ящику нужно отдать
+ * список писем, поэтому кадр собирается здесь - той же формы, что и все
+ * служебные: нулевой nonce и имя отправителя «server».
+ */
+static void send_payload_frame(sock_t fd, const char *room, uint16_t room_len,
+                               uint8_t msg_type,
+                               const uint8_t *payload, size_t payload_len) {
+    static const char *kSrvName = "server";
+    uint16_t name_len = (uint16_t)strlen(kSrvName);
+    uint8_t  nonce[CRYPTO_NPUBBYTES];
+    memset(nonce, 0, sizeof nonce);
+
+    size_t frame_len = 2 + room_len + 2 + name_len + 2
+                     + CRYPTO_NPUBBYTES + 1 + 4 + payload_len;
+    uint8_t *frame = (uint8_t *)malloc(frame_len);
+    if (!frame) return;
+
+    uint8_t *w = frame;
+    wr_u16(w, room_len);               w += 2;
+    memcpy(w, room, room_len);         w += room_len;
+    wr_u16(w, name_len);               w += 2;
+    memcpy(w, kSrvName, name_len);     w += name_len;
+    wr_u16(w, CRYPTO_NPUBBYTES);       w += 2;
+    memcpy(w, nonce, CRYPTO_NPUBBYTES); w += CRYPTO_NPUBBYTES;
+    *w++ = msg_type;
+    wr_u32(w, (uint32_t)payload_len);  w += 4;
+    if (payload_len) memcpy(w, payload, payload_len);
+
+    send_all(fd, frame, frame_len);
+    free(frame);
+}
+
+/** Наибольшее число адресов в одном запросе. */
+#define INBOX_FETCH_MAX_ADDRS 128
+
+/**
+ * Ответ на команду ящика.
+ *
+ * Срок хранения едет в каждом ответе: так клиент узнаёт политику сервера, не
+ * спрашивая отдельно, и может честно сказать «не доставлено», когда хранение
+ * выключено, вместо того чтобы делать вид, что письмо ушло.
+ */
+static void send_inbox_result(sock_t fd, const char *room, uint16_t room_len,
+                              uint8_t status,
+                              const inbox_item_t *items, size_t nitems) {
+    size_t payload_len = 1 + 4 + 2;
+    /* Адрес едет с каждым письмом: запрос идёт пачкой по всем контактам, и
+     * без адреса получатель не поймёт, из какого ящика письмо, каким ключом
+     * его открывать и что потом удалять. */
+    for (size_t i = 0; i < nitems; i++)
+        payload_len += 8 + INBOX_ADDR_BYTES + 4 + items[i].len;
+
+    uint8_t *payload = (uint8_t *)malloc(payload_len);
+    if (!payload) return;
+
+    uint8_t *w = payload;
+    *w++ = status;
+    wr_u32(w, (uint32_t)server_db_inbox_ttl()); w += 4;
+    wr_u16(w, (uint16_t)nitems); w += 2;
+    for (size_t i = 0; i < nitems; i++) {
+        for (int b = 0; b < 8; b++) *w++ = (uint8_t)((items[i].id >> (8 * b)) & 0xFF);
+        memcpy(w, items[i].addr, INBOX_ADDR_BYTES); w += INBOX_ADDR_BYTES;
+        wr_u32(w, (uint32_t)items[i].len); w += 4;
+        memcpy(w, items[i].ciphertext, items[i].len);
+        w += items[i].len;
+    }
+
+    send_payload_frame(fd, room, room_len, (uint8_t)MSG_TYPE_INBOX_RESULT,
+                       payload, payload_len);
+    free(payload);
+}
+
+static int try_room_command(sock_t fd,
+                            const uint8_t *frame, size_t flen,
+                            const client_t *clients, int nclients) {
+    fear_frame_t fv;
+    if (fear_frame_parse(frame, flen, &fv) != 0) return 0;
+    uint16_t       room_len = fv.room_len;
+    uint8_t        type     = fv.type;
+    const char    *room     = fv.room;
+    uint32_t       clen     = fv.payload_len;
+    const uint8_t *cipher   = fv.payload;
+
+    /* --- Офлайн-ящик ---------------------------------------------------
+     *
+     * Все три команды идут мимо комнаты: письмо кладут и забирают, не входя
+     * никуда. Поэтому они здесь, среди служебных, а не в ретрансляции.
+     */
+    if (type == MSG_TYPE_INBOX_PUT) {
+        if (clen < INBOX_ADDR_BYTES + 1) {
+            send_inbox_result(fd, room, room_len, 2, NULL, 0);
+            return 1;
+        }
+        const uint8_t *addr   = cipher;
+        const uint8_t *body   = cipher + INBOX_ADDR_BYTES;
+        const size_t   bodylen = clen - INBOX_ADDR_BYTES;
+
+        inbox_put_result_t r = server_db_inbox_put(addr, body, bodylen);
+        uint8_t status = (r == INBOX_PUT_OK)       ? 0
+                       : (r == INBOX_PUT_DISABLED) ? 1
+                       : (r == INBOX_PUT_FULL)     ? 3
+                                                   : 2;
+        send_inbox_result(fd, room, room_len, status, NULL, 0);
+        return 1;
+    }
+
+    if (type == MSG_TYPE_INBOX_FETCH) {
+        if (clen < 2) { send_inbox_result(fd, room, room_len, 2, NULL, 0); return 1; }
+        uint16_t naddr = rd_u16(cipher);
+        if (naddr == 0 || (size_t)clen < 2 + (size_t)naddr * INBOX_ADDR_BYTES) {
+            send_inbox_result(fd, room, room_len, 2, NULL, 0);
+            return 1;
+        }
+        /* Спрашивать можно пачкой: пятьдесят контактов - это пятьдесят
+         * адресов, и по одному запросу на каждый было бы полсотни обменов
+         * каждые двадцать секунд. */
+        if (naddr > INBOX_FETCH_MAX_ADDRS) naddr = INBOX_FETCH_MAX_ADDRS;
+
+        inbox_item_t items[INBOX_FETCH_LIMIT];
+        size_t got = 0;
+        for (uint16_t i = 0; i < naddr && got < INBOX_FETCH_LIMIT; i++) {
+            const uint8_t *addr = cipher + 2 + (size_t)i * INBOX_ADDR_BYTES;
+            got += server_db_inbox_fetch(addr, items + got, INBOX_FETCH_LIMIT - got);
+        }
+        send_inbox_result(fd, room, room_len, 0, items, got);
+        for (size_t i = 0; i < got; i++) free(items[i].ciphertext);
+        return 1;
+    }
+
+    if (type == MSG_TYPE_INBOX_DELETE) {
+        if (clen < INBOX_ADDR_BYTES + 2) return 1;
+        const uint8_t *addr = cipher;
+        uint16_t n = rd_u16(cipher + INBOX_ADDR_BYTES);
+        if ((size_t)clen < INBOX_ADDR_BYTES + 2 + (size_t)n * 8) return 1;
+
+        int64_t ids[INBOX_FETCH_LIMIT];
+        if (n > INBOX_FETCH_LIMIT) n = INBOX_FETCH_LIMIT;
+        for (uint16_t i = 0; i < n; i++) {
+            const uint8_t *p8 = cipher + INBOX_ADDR_BYTES + 2 + (size_t)i * 8;
+            int64_t v = 0;
+            for (int b = 0; b < 8; b++) v |= ((int64_t)p8[b]) << (8 * b);
+            ids[i] = v;
+        }
+        server_db_inbox_delete(addr, ids, n);
+        return 1;
+    }
+
+    if (type == MSG_TYPE_PING) {
+        /* No reply needed — caller already bumped last_seen on read_frame. */
+        return 1;
+    }
+
+    if (type == MSG_TYPE_ROOM_INFO_REQUEST) {
+        /* Count non-media members already attached to the room. */
+        uint32_t count = 0;
+        for (int i = 0; i < nclients; i++) {
+            if (clients[i].is_media_relay) continue;
+            if (clients[i].room[0] == '\0') continue;
+            if (strncmp(clients[i].room, room, room_len) == 0
+                && clients[i].room[room_len] == '\0') {
+                count++;
+            }
+        }
+
+        /* Reply: zero-nonce service msg with payload [exists(1)][count(4 LE)]. */
+        static const char *kSrvName = "server";
+        uint16_t  srv_name_len = (uint16_t)strlen(kSrvName);
+        uint8_t   nonce[CRYPTO_NPUBBYTES];
+        memset(nonce, 0, sizeof(nonce));
+
+        uint8_t payload[1 + 4];
+        payload[0] = (count > 0) ? 1 : 0;
+        wr_u32(payload + 1, count);
+
+        size_t frame_len = 2 + room_len + 2 + srv_name_len + 2
+                         + CRYPTO_NPUBBYTES + 1 + 4 + sizeof(payload);
+        uint8_t *out = (uint8_t *)malloc(frame_len);
+        if (!out) return 1;
+        uint8_t *w = out;
+        wr_u16(w, room_len);                 w += 2;
+        memcpy(w, room, room_len);           w += room_len;
+        wr_u16(w, srv_name_len);             w += 2;
+        memcpy(w, kSrvName, srv_name_len);   w += srv_name_len;
+        wr_u16(w, CRYPTO_NPUBBYTES);         w += 2;
+        memcpy(w, nonce, CRYPTO_NPUBBYTES);  w += CRYPTO_NPUBBYTES;
+        *w++ = (uint8_t)MSG_TYPE_ROOM_INFO_RESULT;
+        wr_u32(w, (uint32_t)sizeof(payload)); w += 4;
+        memcpy(w, payload, sizeof(payload));
+        send_all(fd, out, frame_len);
+        free(out);
+        return 1;
+    }
+
+    return 0;
+}
+
 static void set_tcp_keepalive(sock_t fd) {
 #ifdef _WIN32
     DWORD yes = 1;
     setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, (const char *)&yes, sizeof(yes));
-    /* Send timeout: 5 seconds */
-    DWORD snd_timeout = 5000;
-    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, (const char *)&snd_timeout, sizeof(snd_timeout));
 #else
     int yes = 1;
     setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &yes, sizeof(yes));
@@ -277,9 +1036,6 @@ static void set_tcp_keepalive(sock_t fd) {
     setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
     setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
     setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt));
-    /* Send timeout: 5 seconds — prevents broadcast() from blocking forever on dead clients */
-    struct timeval snd_timeout = { .tv_sec = 5, .tv_usec = 0 };
-    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &snd_timeout, sizeof(snd_timeout));
 #endif
 }
 
@@ -326,7 +1082,9 @@ static void send_error_and_close(sock_t fd, const char *room, uint16_t room_len,
  * @note Runs indefinitely until interrupted (Ctrl+C)
  * @note Maximum MAX_CLIENTS (100) simultaneous connections
  */
-void run_server(uint16_t port) {
+void run_server(uint16_t port) { run_server_opts(port, INBOX_TTL_DEFAULT); }
+
+void run_server_opts(uint16_t port, int64_t inbox_ttl) {
 #ifdef _WIN32
     WSADATA wsa;
     WSAStartup(MAKEWORD(2, 2), &wsa);
@@ -337,8 +1095,37 @@ void run_server(uint16_t port) {
     // Set locale to UTF-8 for Linux/Android
     setlocale(LC_ALL, "");
 #endif
+    /* When stdout is redirected to a file or systemd journal it switches to
+     * block buffering by default — operational logs ([server] new connection,
+     * [server] idle kick, etc.) then sit in a 4KB buffer for hours. Force
+     * line buffering so each printf shows up immediately. */
+    setvbuf(stdout, NULL, _IOLBF, 0);
     sock_t listener = server_listen(port);
     printf("[server] listening on 0.0.0.0:%u (TCP)\n", port);
+
+    /* Phase B-2: open the handles + user_blobs DB. Failure here is non-fatal —
+     * the relay still works without persistent state, just no handle
+     * registration is possible. */
+    if (server_db_open(NULL) < 0) {
+        printf("[server] WARN: server-db unavailable, handle commands will be rejected\n");
+    }
+
+    /* Живые сессии - проекция памяти сервера, а не сохраняемое состояние:
+     * строки от упавшего прогона не описывают никого. */
+#ifdef _WIN32
+    server_db_sessions_reset((long)GetCurrentProcessId());
+#else
+    server_db_sessions_reset((long)getpid());
+#endif
+
+    server_db_inbox_set_ttl(inbox_ttl);
+    server_db_inbox_expire();
+    if (inbox_ttl > 0) {
+        printf("[server] offline inbox: keeping undelivered mail for %lld hours\n",
+               (long long)(inbox_ttl / 3600));
+    } else {
+        printf("[server] offline inbox: disabled - nothing is stored\n");
+    }
 
     /* Create UDP socket for relay, bound to same port */
     sock_t udp_sock = (sock_t)socket(AF_INET, SOCK_DGRAM, 0);
@@ -375,8 +1162,59 @@ void run_server(uint16_t port) {
             FD_SET(clients[i].fd, &rfds);
             if (clients[i].fd > maxfd) maxfd = clients[i].fd;
         }
-        int r = select((int)(maxfd + 1), &rfds, NULL, NULL, NULL);
+        /* Wake up regularly so the idle scan below runs even when nobody is
+         * sending traffic, and so the heartbeat the admin utility reads stays
+         * fresh. Ten seconds rather than a minute: six wake-ups a minute on
+         * an idle relay cost nothing, and a minute-old heartbeat cannot tell
+         * a stopped relay from a quiet one. */
+        struct timeval tv;
+        tv.tv_sec = SERVER_HEARTBEAT_SEC;
+        tv.tv_usec = 0;
+        int r = select((int)(maxfd + 1), &rfds, NULL, NULL, &tv);
         if (r < 0) { perror("select"); break; }
+
+        /* Idle scan: kick anyone we haven't heard from in IDLE_TIMEOUT_SEC
+         * seconds. Application-level heartbeat via MSG_TYPE_PING (sent every
+         * 60s by clients) keeps an active connection alive; if a client
+         * crashes, gets killed, or its NAT silently drops the flow we
+         * release the slot here without waiting for TCP keepalive. */
+        time_t now = time(NULL);
+        static time_t last_beat = 0;
+        if (now - last_beat >= SERVER_HEARTBEAT_SEC) {
+            last_beat = now;
+            server_db_heartbeat();
+        }
+        /* Просроченную почту выбрасываем раз в минуту, а не при каждом
+         * пробуждении: запросов к базе и так хватает. */
+        static time_t last_sweep = 0;
+        if (now - last_sweep >= 60) {
+            last_sweep = now;
+            server_db_inbox_expire();
+        }
+        for (int i = 0; i < nclients; i++) {
+            if (now - clients[i].last_seen <= IDLE_TIMEOUT_SEC) continue;
+            printf("[server] idle kick: %s@%s silent for %lds\n",
+                   clients[i].name[0] ? clients[i].name : "?",
+                   clients[i].room[0] ? clients[i].room : "?",
+                   (long)(now - clients[i].last_seen));
+            char dropped_room[MAX_ROOM];
+            if (clients[i].room[0] != '\0') {
+                strncpy(dropped_room, clients[i].room, MAX_ROOM - 1);
+                dropped_room[MAX_ROOM - 1] = '\0';
+            } else {
+                dropped_room[0] = '\0';
+            }
+            server_db_session_remove((int)clients[i].fd);
+            tls_close((int)clients[i].fd);
+                close_socket(clients[i].fd);
+            clients[i] = clients[nclients - 1];
+            nclients--;
+            i--;
+            if (dropped_room[0] != '\0') {
+                send_user_list(clients, nclients, dropped_room);
+            }
+        }
+        if (r == 0) continue;  /* select timeout, no fds ready */
 
         /* Handle UDP relay */
         if (FD_ISSET(udp_sock, &rfds)) {
@@ -471,16 +1309,60 @@ void run_server(uint16_t port) {
             socklen_t cl = sizeof(cli);
             sock_t c = accept(listener, (struct sockaddr*)&cli, &cl);
             if (c >= 0) {
-                if (nclients < MAX_CLIENTS) {
+                /* Per-IP cap: without it one source can occupy every MAX_CLIENTS
+                 * slot and lock all other users out of the server. */
+                int same_ip = 0;
+                for (int j = 0; j < nclients; j++) {
+                    if (clients[j].ip == (uint32_t)cli.sin_addr.s_addr) same_ip++;
+                }
+                if (same_ip >= MAX_CONN_PER_IP) {
+                    printf("[server] connection refused: %s already has %d connections\n",
+                           inet_ntoa(cli.sin_addr), same_ip);
+                    close_socket(c);
+                } else if (nclients < MAX_CLIENTS) {
                     set_tcp_keepalive(c);
+                    set_socket_timeouts(c);
+                    /*
+                     * Рукопожатие TLS - до всего остального.
+                     *
+                     * Не сложилось - соединение закрывается, а не
+                     * продолжается открытым текстом: клиент, попросивший
+                     * TLS, иначе счёл бы себя защищённым, ничего таковым не
+                     * будучи.
+                     */
+                    if (tls_enabled() && tls_server_wrap((int)c) != 0) {
+                        printf("[server] TLS handshake failed with %s: %s\n",
+                               inet_ntoa(cli.sin_addr), tls_last_error());
+                        close_socket(c);
+                        continue;
+                    }
                     clients[nclients].fd = c;
+                    clients[nclients].ip = (uint32_t)cli.sin_addr.s_addr;
                     clients[nclients].room[0] = '\0';
                     clients[nclients].name[0] = '\0';
                     clients[nclients].udp_registered = 0;
                     clients[nclients].is_media_relay = 0;
+                    clients[nclients].blob_challenge_set = 0;
+                    clients[nclients].last_seen = time(NULL);
                     nclients++;
                     printf("[server] new connection (%d total)\n", nclients);
                 } else {
+                    /* Full. The per-IP refusal above says so and this one did
+                     * not, so an operator whose users cannot connect found
+                     * nothing in the log to explain it.
+                     *
+                     * Rate limited because the condition that produces it is
+                     * exactly the condition under which it would repeat for
+                     * every retry of every client, and a log nobody can read
+                     * is no better than the silence it replaced. */
+                    static time_t last_full_log = 0;
+                    time_t now_full = time(NULL);
+                    if (now_full - last_full_log >= 10) {
+                        last_full_log = now_full;
+                        printf("[server] connection refused: server is full (%d/%d)\n",
+                               nclients, MAX_CLIENTS);
+                        fflush(stdout);
+                    }
                     close_socket(c);
                 }
             }
@@ -501,6 +1383,8 @@ void run_server(uint16_t port) {
                     dropped_room[0] = '\0';
                 }
 
+                server_db_session_remove((int)clients[i].fd);
+                tls_close((int)clients[i].fd);
                 close_socket(clients[i].fd);
                 clients[i] = clients[nclients - 1];
                 nclients--;
@@ -513,6 +1397,23 @@ void run_server(uint16_t port) {
 
                 continue;
             }
+            clients[i].last_seen = time(NULL);
+
+            /* Phase B-2: handle-registry commands are out-of-band — they
+             * don't belong to any chat room. Process and reply right away
+             * without registering this client into a room or broadcasting. */
+            if (try_handle_command(&clients[i], frame, flen)) {
+                free(frame);
+                continue;
+            }
+            /* Phase B-8: ROOM_INFO probe (AUTO connect) and PING (heartbeat)
+             * also bypass registration and broadcast. Must run AFTER
+             * last_seen update so the PING actually counts as activity. */
+            if (try_room_command(clients[i].fd, frame, flen, clients, nclients)) {
+                free(frame);
+                continue;
+            }
+
             uint16_t room_len = rd_u16(frame);
             const char *room = (const char*)(frame + 2);
             uint16_t name_len = rd_u16(frame + 2 + room_len);
@@ -528,7 +1429,21 @@ void run_server(uint16_t port) {
                 uint8_t msg_type = frame[2 + room_len + 2 + name_len + 2 + nonce_len_val];
                 int is_media = (msg_type == MSG_TYPE_MEDIA_RELAY);
 
-                // Проверяем уникальность имени в той же комнате (skip for media relay)
+                /*
+                 * Две живые метки не должны совпасть - и это больше не
+                 * удобство, а защита.
+                 *
+                 * Раньше здесь отклонялся повтор имени, чтобы в комнате не
+                 * было двух «alice». Теперь в поле метка, и повтор означает
+                 * другое: кто-то назвался чужой меткой. Метка случайна и до
+                 * первого кадра неизвестна, но сосед по комнате её видит -
+                 * и без этой проверки мог бы переподключиться под ней и
+                 * заговорить от чужого лица.
+                 *
+                 * Уникальность самих имён сервер больше не сторожит: он их
+                 * не видит. Тёзок в комнате разводят клиенты, показывая
+                 * отпечаток ключа рядом с повторяющимся именем.
+                 */
                 int name_exists = 0;
                 if (!is_media) {
                     for (int j = 0; j < nclients; j++) {
@@ -547,10 +1462,11 @@ void run_server(uint16_t port) {
                 }
 
                 if (name_exists) {
-                    printf("[server] client rejected: name '%.*s' already exists in room '%.*s'\n",
+                    printf("[server] client rejected: tag '%.*s' already in use in room '%.*s'\n",
                            (int)name_len, name, (int)room_len, room);
                     send_error_and_close(clients[i].fd, room, room_len,
-                                         "Name already taken in this room");
+                                         "Session tag already in use in this room");
+                    server_db_session_remove((int)clients[i].fd);
                     clients[i] = clients[nclients - 1];
                     nclients--;
                     i--;
@@ -567,18 +1483,66 @@ void run_server(uint16_t port) {
                     printf("[server] media relay registered: name='%s', room='%s'\n",
                            clients[i].name, clients[i].room);
                 } else {
+                    /* Живые сессии - проекция того, что и так лежит в
+                     * памяти сервера: только имя, комната и адрес, то есть
+                     * ровно то, по чему сервер и так маршрутизирует. */
+                    {
+                        struct sockaddr_in peer;
+                        socklen_t plen = sizeof peer;
+                        char addrbuf[32] = "";
+                        if (getpeername(clients[i].fd, (struct sockaddr *)&peer,
+                                        &plen) == 0) {
+                            snprintf(addrbuf, sizeof addrbuf, "%s",
+                                     inet_ntoa(peer.sin_addr));
+                        }
+                        server_db_session_add((int)clients[i].fd, clients[i].name,
+                                              clients[i].room, addrbuf,
+                                              clients[i].is_media_relay);
+                    }
                     printf("[server] client registered: name='%s', room='%s'\n",
                            clients[i].name, clients[i].room);
                     // Отправляем обновленный список участников всем в комнате
                     send_user_list(clients, nclients, clients[i].room);
                 }
             }
-            broadcast(clients, &nclients, clients[i].room, frame, flen, clients[i].fd);
+            /* Anti-spoofing: комната и метка сессии закреплены за этим
+             * соединением при регистрации, но кадр несёт собственные копии
+             * обеих. Без этой проверки участник мог бы слать кадры под чужой
+             * меткой - а получатели разворачивают метку в имя и показали бы
+             * чужое.
+             *
+             * Проверка та же, что и была, и держится на том же: сервер
+             * сравнивает кадр с тем, чем это соединение представилось.
+             * Изменилось только, что закрепляется - не имя, которого сервер
+             * больше не видит, а метка. Кому какая метка принадлежит,
+             * получатели узнают из подписанного анонса, и подделать это уже
+             * не в силах ни сосед по комнате, ни сам ретранслятор. */
+            if (strlen(clients[i].room) != room_len ||
+                memcmp(clients[i].room, room, room_len) != 0 ||
+                strlen(clients[i].name) != name_len ||
+                memcmp(clients[i].name, name, name_len) != 0) {
+                printf("[server] dropped frame with mismatched identity from '%s'\n",
+                       clients[i].name);   /* метка, не имя */
+                free(frame);
+                continue;
+            }
+
+            {
+                /* Тип кадра лежит за комнатой, именем и nonce. Он же решает,
+                 * можно ли этот кадр ронять. */
+                const uint16_t nl = rd_u16(frame + 2 + room_len);
+                const uint16_t npl = rd_u16(frame + 2 + room_len + 2 + nl);
+                const size_t at = 2 + (size_t)room_len + 2 + nl + 2 + npl;
+                const int media = (at < flen && frame[at] == MSG_TYPE_MEDIA_RELAY);
+                broadcast(clients, &nclients, clients[i].room, frame, flen,
+                          clients[i].fd, media);
+            }
             free(frame);
         }
     }
     close_socket(udp_sock);
     close_socket(listener);
+    server_db_close();
 #ifdef _WIN32
     WSACleanup();
 #endif

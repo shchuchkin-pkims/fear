@@ -1,0 +1,115 @@
+/* Стиль PDF-версий документации (doc/make-pdf.sh): руководство и «Как
+ * устроен F.E.A.R.». Печать A4, шрифты, которые есть и в Linux, и в Windows. */
+
+@page { size: A4; margin: 17mm 16mm 18mm 16mm; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  max-width: none;
+  background: #ffffff;
+}
+
+body {
+  font-family: "DejaVu Sans", "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+  font-size: 10.5pt;
+  line-height: 1.5;
+  color: #1e293b;
+}
+
+h1 {
+  font-size: 22pt;
+  color: #0f172a;
+  margin: 0 0 0.4em 0;
+  padding-bottom: 6px;
+  border-bottom: 2px solid #2563eb;
+}
+
+h2 {
+  font-size: 15pt;
+  color: #1e3a8a;
+  margin: 1.5em 0 0.5em 0;
+  padding-bottom: 3px;
+  border-bottom: 1px solid #cbd5e1;
+  page-break-after: avoid;
+}
+
+h3 {
+  font-size: 12pt;
+  color: #1e293b;
+  margin: 1.2em 0 0.4em 0;
+  page-break-after: avoid;
+}
+
+h4 { font-size: 11pt; margin: 1em 0 0.3em 0; page-break-after: avoid; }
+
+p, li { orphans: 3; widows: 3; }
+ul { padding-left: 1.4em; }
+ol { padding-left: 2.2em; }
+li { margin: 0.15em 0; }
+
+a { color: #2563eb; text-decoration: none; }
+
+img {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  margin: 0.8em auto 1em auto;
+  page-break-inside: avoid;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 0.8em 0 1em 0;
+  font-size: 9.5pt;
+}
+
+tr { page-break-inside: avoid; }
+
+th {
+  background: #eff6ff;
+  color: #1e3a8a;
+  text-align: left;
+  border: 1px solid #cbd5e1;
+  padding: 6px 8px;
+}
+
+td {
+  border: 1px solid #e2e8f0;
+  padding: 6px 8px;
+  vertical-align: top;
+}
+
+code {
+  font-family: "DejaVu Sans Mono", Consolas, "Courier New", monospace;
+  font-size: 9pt;
+  background: #f1f5f9;
+  padding: 1px 4px;
+  border-radius: 3px;
+}
+
+pre {
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 6px;
+  padding: 10px 12px;
+  white-space: pre-wrap;
+  font-size: 8.5pt;
+  line-height: 1.4;
+  page-break-inside: avoid;
+}
+
+pre code { background: none; padding: 0; font-size: inherit; }
+
+blockquote {
+  margin: 1em 0;
+  padding: 8px 12px;
+  border-left: 4px solid #d97706;
+  background: #fffbeb;
+  color: #78350f;
+}
+
+blockquote p { margin: 0.2em 0; }
+
+hr { border: none; border-top: 1px solid #e2e8f0; margin: 1.5em 0; }

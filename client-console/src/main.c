@@ -15,6 +15,7 @@
  * - Warning for insecure --key argument (visible in process list)
  */
 
+#include "tls.h"
 #include "common.h"
 #include "server.h"
 #include "client.h"
@@ -32,7 +33,7 @@
 #include <unistd.h>
 #endif
 
-#define PROGRAM_VERSION "0.4.3"
+#define PROGRAM_VERSION "0.6.0"
 
 /**
  * @brief Print command-line usage information
@@ -48,16 +49,18 @@ static void print_usage(const char *prog) {
         "  %s --version\n"
         "  %s genkey\n"
         "  %s gen-identity\n"
-        "  %s server [--port N]\n"
+        "  %s server [--port N] [--inbox off|30d|Nh] [--tls-cert FILE --tls-key FILE]\n"
         "  %s client --host HOST --port N --room ROOM [--key-file FILE] [--name NAME]\n"
-        "           [--identity-file FILE] [--no-sign] [--create] [--join]\n"
+        "           [--identity-file FILE] [--no-sign] [--create] [--join] [--auto]\n"
+        "           [--tls] [--tls-pin SHA256HEX]\n"
 
         "\nKey input methods (in order of priority):\n"
         "  1. --create           Auto-generate room key (first person in room)\n"
         "  2. --join             Request room key via ECDH exchange (join existing room)\n"
-        "  3. --key-file FILE    Read key from file (recommended for scripts)\n"
-        "  4. stdin              Read key from standard input (interactive or piped)\n"
-        "  5. --key BASE64       Direct key argument (DEPRECATED - insecure, visible in process list)\n"
+        "  3. --auto             Probe the server: empty room → CREATE, otherwise → JOIN\n"
+        "  4. --key-file FILE    Read key from file (recommended for scripts)\n"
+        "  5. stdin              Read key from standard input (interactive or piped)\n"
+        "  6. --key BASE64       Direct key argument (DEPRECATED - insecure, visible in process list)\n"
 
         "\nIdentity (optional Ed25519 signing):\n"
         "  gen-identity          Generate identity keypair (~/.fear/identity)\n"
@@ -65,8 +68,10 @@ static void print_usage(const char *prog) {
         "  --no-sign             Disable message signing even if identity exists\n"
 
         "\nNotes:\n"
-        "  * Generate a key once per conference with 'genkey'. Share it out-of-band.\n"
-        "  * The server sees only metadata (room/name), never plaintext.\n"
+        "  * --auto is the GUI's default. A key shared out-of-band (genkey) only\n"
+        "    founds the room: the room key rotates whenever someone joins or leaves.\n"
+        "  * The relay sees a hash of the room name and a fresh tag per connection,\n"
+        "    never names or plaintext. --tls also hides the frames on the wire.\n"
         "  * For NAT traversal, port-forward the server's TCP port or host it publicly.\n",
         prog, prog, prog, prog, prog);
 }
@@ -205,11 +210,57 @@ int main(int argc, char **argv) {
         return 0;
     }
     if (strcmp(argv[1], "server") == 0) {
+        int64_t inbox_ttl = INBOX_TTL_DEFAULT;
         uint16_t port = DEFAULT_PORT;
+        /* Сертификат и ключ для TLS. Без них сервер работает как раньше -
+         * открытым текстом; включать TLS молча нельзя, это меняет протокол
+         * для всех, кто уже подключается. */
+        const char *tls_cert = NULL, *tls_key = NULL;
         for (int i = 2; i < argc; i++) {
             if (strcmp(argv[i], "--port") == 0 && i + 1 < argc) { port = (uint16_t)atoi(argv[++i]); }
+            else if (strcmp(argv[i], "--tls-cert") == 0 && i + 1 < argc) tls_cert = argv[++i];
+            else if (strcmp(argv[i], "--tls-key") == 0 && i + 1 < argc) tls_key = argv[++i];
+            else if (strcmp(argv[i], "--inbox") == 0 && i + 1 < argc) {
+                /* off | Nh | Nd - «сколько держать недоставленное».
+                 * Выключатель здесь потому, что это решение оператора, а не
+                 * разработчика: чей сервер, того и политика хранения. */
+                const char *v = argv[++i];
+                if (strcmp(v, "off") == 0 || strcmp(v, "0") == 0) {
+                    inbox_ttl = 0;
+                } else {
+                    char *end = NULL;
+                    long n = strtol(v, &end, 10);
+                    if (n <= 0) {
+                        fprintf(stderr, "--inbox: expected off, Nh or Nd\n");
+                        return 1;
+                    }
+                    if (end && *end == 'h')      inbox_ttl = (int64_t)n * 3600;
+                    else if (end && *end == 'd') inbox_ttl = (int64_t)n * 86400;
+                    else if (end && *end == 0)   inbox_ttl = (int64_t)n * 86400;
+                    else { fprintf(stderr, "--inbox: expected off, Nh or Nd\n"); return 1; }
+                }
+            }
         }
-        run_server(port);
+        /* Оба ключа или ни одного: сертификат без ключа и ключ без
+         * сертификата - почти наверняка опечатка, и молча работать открытым
+         * текстом после неё нельзя. */
+        if ((tls_cert != NULL) != (tls_key != NULL)) {
+            fprintf(stderr, "--tls-cert and --tls-key go together\n");
+            return 1;
+        }
+        if (tls_cert) {
+            if (!tls_available()) {
+                fprintf(stderr, "this build has no TLS support\n");
+                return 1;
+            }
+            if (tls_server_init(tls_cert, tls_key) != 0) {
+                fprintf(stderr, "TLS: %s\n", tls_last_error());
+                return 1;
+            }
+            printf("[server] TLS enabled\n");
+        }
+
+        run_server_opts(port, inbox_ttl);
         return 0;
     }
     if (strcmp(argv[1], "client") == 0) {
@@ -217,8 +268,13 @@ int main(int argc, char **argv) {
         const char *keyfile = NULL;
         const char *identity_file = NULL;
         int no_sign = 0;
+        /* Внешний слой TLS. Выключен по умолчанию: включённый молча, он
+         * оборвал бы связь со всеми существующими серверами. */
+        int use_tls = 0;
+        const char *tls_pin = NULL;
         int create_mode = 0;
         int join_mode = 0;
+        int auto_mode = 0;
         uint16_t port = 0;
         int using_deprecated_key_arg = 0;
 
@@ -234,15 +290,40 @@ int main(int argc, char **argv) {
             }
             else if (strcmp(argv[i], "--name") == 0 && i + 1 < argc) name = argv[++i];
             else if (strcmp(argv[i], "--identity-file") == 0 && i + 1 < argc) identity_file = argv[++i];
+            else if (strcmp(argv[i], "--tls") == 0) use_tls = 1;
+            else if (strcmp(argv[i], "--tls-pin") == 0 && i + 1 < argc) {
+                /* Отпечаток подразумевает и сам TLS: просить сверку
+                 * сертификата, не устанавливая TLS, бессмысленно. */
+                use_tls = 1;
+                tls_pin = argv[++i];
+            }
             else if (strcmp(argv[i], "--no-sign") == 0) no_sign = 1;
             else if (strcmp(argv[i], "--create") == 0) create_mode = 1;
             else if (strcmp(argv[i], "--join") == 0) join_mode = 1;
+            else if (strcmp(argv[i], "--auto") == 0) auto_mode = 1;
         }
 
         if (!host || !port || !room) { print_usage(argv[0]); return 1; }
         if (!name) name = "anon";
         if (strlen(room) > MAX_ROOM - 1) { fprintf(stderr, "room too long (max %d)\n", MAX_ROOM - 1); return 1; }
         if (strlen(name) > MAX_NAME - 1) { fprintf(stderr, "name too long (max %d)\n", MAX_NAME - 1); return 1; }
+
+        /* AUTO: ask the server up front whether the room already has members.
+         * Empty → CREATE (fresh key); populated → JOIN (ECDH for the existing
+         * key). One short-lived TCP probe (~30-100 ms) instead of the old
+         * blind 5s JOIN→timeout→CREATE fallback. */
+        if (auto_mode) {
+            int members = probe_room_info(host, port, room, /*timeout_ms=*/3000);
+            if (members > 0) {
+                fprintf(stderr, "[auto] room '%s' has %d member(s) → JOIN\n",
+                        room, members);
+                join_mode = 1;
+            } else {
+                fprintf(stderr, "[auto] room '%s' empty (probe=%d) → CREATE\n",
+                        room, members);
+                create_mode = 1;
+            }
+        }
 
         uint8_t key[CRYPTO_KEYBYTES];
         memset(key, 0, sizeof(key));
@@ -309,6 +390,17 @@ int main(int argc, char **argv) {
             } else {
                 identity_default_path(id_path, sizeof(id_path));
             }
+            /* Create an identity on first run. The ECDH exchange now requires a
+             * signed key response, so a client without an identity could neither
+             * host a joinable room nor be trusted by joiners. Roadmap §10 wants
+             * the identity created automatically on first launch anyway. */
+            if (identity_load(id_path, id_pk, id_sk) != 0) {
+                if (identity_generate(id_path) == 0) {
+                    fprintf(stderr, "No identity found - generated a new one: %s\n", id_path);
+                } else {
+                    fprintf(stderr, "WARNING: could not create an identity at %s\n", id_path);
+                }
+            }
             if (identity_load(id_path, id_pk, id_sk) == 0) {
                 has_identity = 1;
                 char fp[IDENTITY_FINGERPRINT_LEN];
@@ -318,6 +410,7 @@ int main(int argc, char **argv) {
         }
 
         // Run client
+        client_set_tls(use_tls, tls_pin);
         run_client(host, port, room, name, key,
                    has_identity ? id_pk : NULL,
                    has_identity ? id_sk : NULL,

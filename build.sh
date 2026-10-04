@@ -60,6 +60,70 @@ check_dependency() {
     fi
 }
 
+# Verify every dependency the project actually links against.
+#
+# The old check only looked for cmake/gcc/g++, so a missing -dev package
+# printed "All dependencies found" and then blew up much later inside
+# CMake (that is how a missing libsqlite3-dev got through). This collects
+# everything that is missing and reports it in one pass.
+verify_dependencies() {
+    local missing_cmd=() missing_lib=() missing_other=()
+
+    local c
+    for c in cmake gcc g++ pkg-config git; do
+        command -v "$c" &> /dev/null || missing_cmd+=("$c")
+    done
+
+    # pkg-config module -> package that provides it on Ubuntu/Debian
+    local modules=(
+        "libsodium:libsodium-dev"
+        "sqlite3:libsqlite3-dev"
+        "libcurl:libcurl4-openssl-dev"
+        "opus:libopus-dev"
+        "portaudio-2.0:portaudio19-dev"
+        "libavcodec:libavcodec-dev"
+        "libavformat:libavformat-dev"
+        "libavutil:libavutil-dev"
+        "libswscale:libswscale-dev"
+        "libavdevice:libavdevice-dev"
+        "libqrencode:libqrencode-dev"
+        "zbar:libzbar-dev"
+        "sdl3:built from source by ./build.sh deps"
+    )
+    local entry mod pkg
+    for entry in "${modules[@]}"; do
+        mod="${entry%%:*}"
+        pkg="${entry#*:}"
+        pkg-config --exists "$mod" 2>/dev/null || missing_lib+=("$mod -> $pkg")
+    done
+
+    # Qt6 ships CMake config packages rather than pkg-config files.
+    if ! ls -d /usr/lib/*/cmake/Qt6Widgets &> /dev/null && ! command -v qmake6 &> /dev/null; then
+        missing_other+=("Qt6 (Widgets/Network/Sql/Concurrent) -> qt6-base-dev qt6-base-dev-tools")
+    fi
+
+    # Qt's SQLite driver is a separate package and is NOT pulled in by
+    # qt6-base-dev. Without it the GUI compiles fine and then fails at
+    # runtime, when it opens the local message history.
+    if ! ls /usr/lib/*/qt6/plugins/sqldrivers/libqsqlite.so &> /dev/null; then
+        missing_other+=("Qt6 SQLite driver -> libqt6sql6-sqlite")
+    fi
+
+    if [ ${#missing_cmd[@]} -eq 0 ] && [ ${#missing_lib[@]} -eq 0 ] && [ ${#missing_other[@]} -eq 0 ]; then
+        print_success "All dependencies found"
+        return 0
+    fi
+
+    print_error "Missing dependencies:"
+    local m
+    for m in "${missing_cmd[@]}";   do echo "    command: $m"; done
+    for m in "${missing_lib[@]}";   do echo "    library: $m"; done
+    for m in "${missing_other[@]}"; do echo "    other:   $m"; done
+    echo ""
+    print_info "Install them with: ./build.sh deps"
+    return 1
+}
+
 # Clean build artifacts
 clean_build() {
     print_header "Cleaning Build Artifacts"
@@ -155,18 +219,46 @@ case "${1:-build}" in
         print_info "Installing packages (requires sudo)..."
         sudo apt-get update
         sudo apt-get install -y \
-            build-essential cmake pkg-config \
-            libsodium-dev libcurl4-openssl-dev \
+            build-essential cmake pkg-config git \
+            libsodium-dev libcurl4-openssl-dev libsqlite3-dev \
             libopus-dev portaudio19-dev \
             libavcodec-dev libavformat-dev libavutil-dev libswscale-dev libavdevice-dev \
-            libvpx-dev qt6-base-dev
+            libvpx-dev \
+            qt6-base-dev qt6-base-dev-tools libqt6sql6-sqlite \
+            libqrencode-dev libzbar-dev
         # SDL3 is not yet in Ubuntu repos — check if installed
         if ! pkg-config --exists sdl3 2>/dev/null; then
             print_info "SDL3 not found in system packages, building from source..."
-            sudo apt-get install -y libwayland-dev libxkbcommon-dev wayland-protocols libpulse-dev libasound2-dev
+            # SDL refuses to configure unless it finds a window system. The
+            # Wayland set alone is not enough: if any Wayland piece is missing
+            # (or the machine has no compositor headers at all) SDL falls back
+            # to X11, and without the X11 headers below it aborts with
+            # "could not find X11 or Wayland development libraries".
+            sudo apt-get install -y \
+                libx11-dev libxext-dev libxrandr-dev libxcursor-dev \
+                libxi-dev libxfixes-dev libxss-dev \
+                libwayland-dev libwayland-bin wayland-protocols \
+                libxkbcommon-dev libdecor-0-dev \
+                libpulse-dev libasound2-dev
             SDL_TMP=$(mktemp -d)
             git clone --depth 1 https://github.com/libsdl-org/SDL.git -b release-3.2.x "${SDL_TMP}/SDL"
-            cmake -S "${SDL_TMP}/SDL" -B "${SDL_TMP}/SDL/build" -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr
+            # On a headless box (server, Pi without a desktop) there is no
+            # window system to find and the check above is not wanted:
+            #   FEAR_SDL_HEADLESS=1 ./build.sh deps
+            SDL_EXTRA_FLAGS=""
+            if [ -n "${FEAR_SDL_HEADLESS:-}" ]; then
+                print_info "FEAR_SDL_HEADLESS set — building SDL without X11/Wayland video"
+                SDL_EXTRA_FLAGS="-DSDL_UNIX_CONSOLE_BUILD=ON"
+            fi
+            if ! cmake -S "${SDL_TMP}/SDL" -B "${SDL_TMP}/SDL/build" \
+                    -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr \
+                    ${SDL_EXTRA_FLAGS}; then
+                print_error "SDL configuration failed."
+                print_info "On a desktop machine: check that the X11/Wayland -dev packages above installed."
+                print_info "On a headless machine: re-run with FEAR_SDL_HEADLESS=1 ./build.sh deps"
+                rm -rf "${SDL_TMP}"
+                exit 1
+            fi
             cmake --build "${SDL_TMP}/SDL/build" -j$(nproc)
             sudo cmake --install "${SDL_TMP}/SDL/build"
             rm -rf "${SDL_TMP}"
@@ -174,6 +266,10 @@ case "${1:-build}" in
         else
             print_success "SDL3 already installed"
         fi
+        # Prove it rather than assume it: the whole point of this target is
+        # that the next ./build.sh must not fail on a missing package.
+        print_info "Verifying..."
+        verify_dependencies || exit 1
         print_success "All dependencies installed"
         exit 0
         ;;
@@ -191,10 +287,7 @@ esac
 
 # Check dependencies
 print_info "Checking dependencies..."
-check_dependency cmake
-check_dependency gcc
-check_dependency g++
-print_success "All dependencies found"
+verify_dependencies || exit 1
 
 # Create output directory
 mkdir -p "${OUTPUT_DIR}/bin"

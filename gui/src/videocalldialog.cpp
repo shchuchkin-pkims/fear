@@ -33,6 +33,12 @@ VideoCallDialog::VideoCallDialog(VideoCallManager *videoManager, Backend *backen
         keyGroupBox->setVisible(false);
     }
 
+    // If a chat session is active — default to relay-through-server mode and
+    // auto-fill the server endpoint from backend.
+    if (backend && backend->isConnected) {
+        relayCheck->setChecked(true);
+    }
+
     refreshDevices();
 
     // Pre-select defaults from settings
@@ -53,7 +59,16 @@ VideoCallDialog::VideoCallDialog(VideoCallManager *videoManager, Backend *backen
     if (quality == "low") qIdx = 0;
     else if (quality == "medium") qIdx = 1;
     else if (quality == "high") qIdx = 2;
+    else if (quality == "manual") qIdx = 3;
     qualityCombo->setCurrentIndex(qIdx);
+
+    /* Ручные числа берём из настроек всегда, а не только когда выбран
+     * ручной режим: человек может переключиться на него прямо здесь, и
+     * поля должны показывать его собственные значения, а не заводские. */
+    widthSpin->setValue(settings.value("video/width", widthSpin->value()).toInt());
+    heightSpin->setValue(settings.value("video/height", heightSpin->value()).toInt());
+    fpsSpin->setValue(settings.value("video/fps", fpsSpin->value()).toInt());
+    bitrateSpin->setValue(settings.value("video/bitrate", bitrateSpin->value()).toInt());
 
     QString audioIn = settings.value("audio/inputDevice", "").toString();
     if (!audioIn.isEmpty() && audioIn != "System default") {
@@ -119,10 +134,26 @@ void VideoCallDialog::onStartCall() {
     int audioInput = inputDeviceCombo->currentData().toInt();
     int audioOutput = outputDeviceCombo->currentData().toInt();
 
+    /*
+     * Объявить звонок комнате - и только если мы его начинаем.
+     *
+     * Идентификатор звонка связывает все ключи мультимедиа, и без него
+     * процесс звонка отказывается стартовать: «--call-id is required».
+     * Здесь этого вызова не было вовсе, и видеозвонок с ПК не начинался
+     * никогда - хотя тот же код у голосового звонка был на месте.
+     *
+     * Условие важно: когда мы отвечаем на чужое приглашение,
+     * идентификатор уже проставлен из него, и рисовать новый нельзя -
+     * ключи разойдутся, и собеседник не услышит ничего.
+     */
+    if (backend && videoManager && videoManager->callId.isEmpty()) {
+        backend->sendCallInvite(remoteIp, remotePort, /*video=*/true);
+    }
+
     if (relayCheck->isChecked() && backend) {
         // Relay mode: route through server
         if (videoManager->startRelay(remoteIp, remotePort,
-                                      backend->currentRoom, backend->currentName, key,
+                                      backend->currentRoom, backend->currentTag, key,
                                       quality, adaptive, width, height, fps, bitrate,
                                       camera, audioInput, audioOutput, false, false)) {
             statusLabel->setText("Relay call started");
@@ -354,6 +385,14 @@ void VideoCallDialog::setupConnections() {
     connect(videoManager, &VideoCallManager::listeningStarted, this, &VideoCallDialog::onCallStarted);
     connect(videoManager, &VideoCallManager::callStopped, this, &VideoCallDialog::onCallStopped);
     connect(videoManager, &VideoCallManager::error, this, &VideoCallDialog::onError);
+    /* Адрес, который процесс звонка узнал у сервера STUN, надо донести до
+     * комнаты вторым приглашением: первое объявило звонок, но адреса тогда
+     * ещё не существовало - сокет для голоса не занял порт. Идентификатор
+     * тот же, иначе собеседник счёл бы это отдельным звонком. */
+    connect(videoManager, &VideoCallManager::candidateDiscovered, this,
+            [this](const QString &h, quint16 p) {
+        if (backend) backend->sendCallInvite(h, p, /*video=*/true, videoManager->callId);
+    });
     connect(videoManager, &VideoCallManager::output, this, &VideoCallDialog::onOutput);
 
     connect(genKeyButton, &QPushButton::clicked, this, &VideoCallDialog::onGenerateKey);
@@ -509,9 +548,8 @@ QString VideoCallDialog::findVideoCallApp() {
     QStringList possiblePaths = {
         QApplication::applicationDirPath() + "/video_call",
         QApplication::applicationDirPath() + "/bin/video_call",
-        QApplication::applicationDirPath() + "/../bin/video_call",
-        "video_call",
-        "./video_call"
+        QApplication::applicationDirPath() + "/../bin/video_call"
+        /* Без голого имени и "./": см. AudioCallManager::findAudioCallApp. */
     };
 
 #ifdef Q_OS_WIN

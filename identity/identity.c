@@ -6,6 +6,7 @@
  */
 
 #include "identity.h"
+#include "identity_at_rest.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -18,6 +19,8 @@
 #else
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <fcntl.h>
+#include <unistd.h>
 #define mkdir_p(p) mkdir(p, 0700)
 #endif
 
@@ -75,6 +78,176 @@ static int get_fear_dir(char *buf, size_t bufsize) {
 
 /* ===== Public API ===== */
 
+/**
+ * Say once that the key is on disk in the clear.
+ *
+ * Once, because this is a hardening step and not a new requirement: headless
+ * machines and containers have no keyring, and refusing to run there would
+ * be worse than the plaintext file we have had all along. Saying nothing
+ * would be worse still - the difference matters to whoever is backing that
+ * directory up.
+ */
+static void identity_warn_plaintext_once(void) {
+    static int said = 0;
+    if (said) return;
+    said = 1;
+    fprintf(stderr,
+            "[identity] no secret store available - the identity key is "
+            "stored unencrypted (file mode 0600 only)\n");
+}
+
+int identity_session_tag(char out[IDENTITY_SESSION_TAG_LEN]) {
+    if (!out) return -1;
+    uint8_t raw[16];
+    randombytes_buf(raw, sizeof raw);
+    return sodium_bin2base64(out, IDENTITY_SESSION_TAG_LEN,
+                             raw, sizeof raw,
+                             sodium_base64_VARIANT_URLSAFE_NO_PADDING)
+           ? 0 : -1;
+}
+
+size_t identity_announce_signed_bytes(const char *session_tag, const char *display_name,
+                                      uint8_t *out, size_t cap) {
+    if (!session_tag || !display_name || !out) return 0;
+    static const char ctx[] = "fear.announce.v2";
+    const size_t tag_len = strlen(session_tag);
+    const size_t name_len = strlen(display_name);
+    const size_t total = (sizeof ctx - 1) + tag_len + name_len;
+    if (total > cap) return 0;
+
+    uint8_t *w = out;
+    memcpy(w, ctx, sizeof ctx - 1); w += sizeof ctx - 1;
+    memcpy(w, session_tag, tag_len); w += tag_len;
+    memcpy(w, display_name, name_len);
+    return total;
+}
+
+int identity_wire_room(const char *room_name, char out[IDENTITY_WIRE_ROOM_LEN]) {
+    if (!room_name || !out) return -1;
+    const size_t len = strlen(room_name);
+
+    static const char ctx[] = "fear.room.v1";
+    crypto_generichash_state st;
+    if (crypto_generichash_init(&st, NULL, 0, 16) != 0) return -1;
+    crypto_generichash_update(&st, (const uint8_t *)ctx, sizeof(ctx) - 1);
+    crypto_generichash_update(&st, (const uint8_t *)room_name, len);
+    uint8_t digest[16];
+    if (crypto_generichash_final(&st, digest, sizeof digest) != 0) return -1;
+
+    out[0] = 'r';
+    out[1] = ':';
+    return sodium_bin2base64(out + 2, IDENTITY_WIRE_ROOM_LEN - 2,
+                             digest, sizeof digest,
+                             sodium_base64_VARIANT_URLSAFE_NO_PADDING)
+           ? 0 : -1;
+}
+
+int identity_pm_room_id_v2(const uint8_t k_pm[32],
+                           char out[IDENTITY_PM_ROOM_ID_LEN]) {
+    if (!k_pm || !out) return -1;
+
+    static const char ctx[] = "fear.pm.room.v2";
+    uint8_t digest[16];
+    if (crypto_generichash(digest, sizeof digest,
+                           (const uint8_t *)ctx, sizeof(ctx) - 1,
+                           k_pm, 32) != 0) {
+        return -1;
+    }
+
+    out[0] = 'p';
+    out[1] = 'm';
+    out[2] = ':';
+    return sodium_bin2base64(out + 3, IDENTITY_PM_ROOM_ID_LEN - 3,
+                             digest, sizeof digest,
+                             sodium_base64_VARIANT_URLSAFE_NO_PADDING)
+           ? 0 : -1;
+}
+
+/**
+ * Write an identity file.
+ *
+ * The public key is in the clear. It is public, and several call sites read
+ * it with identity_load_pk only to show a fingerprint - which has no
+ * business unlocking a keyring. The secret key goes through the platform
+ * store when there is one, and is written the way it always was when there
+ * is not.
+ */
+static int identity_write_file(const char *path, const uint8_t *pk,
+                               const uint8_t *sk) {
+    if (ensure_parent_dir(path) != 0) return -1;
+
+    char pk_b64[128], sk_b64[256];
+    if (sodium_bin2base64(pk_b64, sizeof(pk_b64), pk, IDENTITY_PK_BYTES,
+                          sodium_base64_VARIANT_URLSAFE_NO_PADDING) == NULL) {
+        return -1;
+    }
+
+    uint8_t *blob = NULL;
+    size_t blob_len = 0;
+    iar_mode_t mode = iar_protect(sk, IDENTITY_SK_BYTES, &blob, &blob_len);
+
+    char *enc = NULL;
+    if (mode != IAR_NONE && blob) {
+        size_t cap = blob_len * 4 / 3 + 8;
+        enc = (char *)malloc(cap);
+        if (!enc || sodium_bin2base64(enc, cap, blob, blob_len,
+                                      sodium_base64_VARIANT_URLSAFE_NO_PADDING) == NULL) {
+            free(enc);
+            enc = NULL;
+            mode = IAR_NONE;
+        }
+    }
+    if (blob) {
+        sodium_memzero(blob, blob_len);
+        free(blob);
+    }
+
+    if (mode == IAR_NONE) {
+        identity_warn_plaintext_once();
+        if (sodium_bin2base64(sk_b64, sizeof(sk_b64), sk, IDENTITY_SK_BYTES,
+                              sodium_base64_VARIANT_URLSAFE_NO_PADDING) == NULL) {
+            return -1;
+        }
+    }
+
+#ifndef _WIN32
+    /* Create the file with 0600 from the outset. fopen(path, "w") would create
+     * it with 0666 & ~umask - typically 0644 - leaving the Ed25519 secret key
+     * world-readable during the window between creation and the chmod below.
+     * Still true of the wrapped form: the wrapping is not an excuse to widen
+     * the permissions. */
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0) goto fail;
+    FILE *f = fdopen(fd, "w");
+    if (!f) { close(fd); goto fail; }
+#else
+    FILE *f = fopen(path, "w");
+    if (!f) goto fail;
+#endif
+
+    if (mode == IAR_NONE) {
+        fprintf(f, "PK:%s\nSK:%s\n", pk_b64, sk_b64);
+    } else {
+        fprintf(f, "PK:%s\nSKENC:%s:%s\n", pk_b64, iar_mode_name(mode), enc);
+    }
+    fclose(f);
+
+    /* The mode above only applies when the file is created, so still tighten
+     * permissions on a pre-existing (possibly world-readable) file. */
+#ifndef _WIN32
+    chmod(path, 0600);
+#endif
+
+    sodium_memzero(sk_b64, sizeof(sk_b64));
+    if (enc) { sodium_memzero(enc, strlen(enc)); free(enc); }
+    return 0;
+
+fail:
+    sodium_memzero(sk_b64, sizeof(sk_b64));
+    if (enc) { sodium_memzero(enc, strlen(enc)); free(enc); }
+    return -1;
+}
+
 int identity_generate(const char *path) {
     if (sodium_init() < 0) return -1;
 
@@ -82,43 +255,9 @@ int identity_generate(const char *path) {
     uint8_t sk[IDENTITY_SK_BYTES];
     crypto_sign_keypair(pk, sk);
 
-    if (ensure_parent_dir(path) != 0) {
-        sodium_memzero(sk, sizeof(sk));
-        return -1;
-    }
-
-    /* Encode to base64url no-padding */
-    char pk_b64[128], sk_b64[256];
-    if (sodium_bin2base64(pk_b64, sizeof(pk_b64), pk, IDENTITY_PK_BYTES,
-                          sodium_base64_VARIANT_URLSAFE_NO_PADDING) == NULL) {
-        sodium_memzero(sk, sizeof(sk));
-        return -1;
-    }
-    if (sodium_bin2base64(sk_b64, sizeof(sk_b64), sk, IDENTITY_SK_BYTES,
-                          sodium_base64_VARIANT_URLSAFE_NO_PADDING) == NULL) {
-        sodium_memzero(sk, sizeof(sk));
-        sodium_memzero(sk_b64, sizeof(sk_b64));
-        return -1;
-    }
-
-    FILE *f = fopen(path, "w");
-    if (!f) {
-        sodium_memzero(sk, sizeof(sk));
-        sodium_memzero(sk_b64, sizeof(sk_b64));
-        return -1;
-    }
-
-    fprintf(f, "PK:%s\nSK:%s\n", pk_b64, sk_b64);
-    fclose(f);
-
-    /* Set file permissions to 0600 on POSIX */
-#ifndef _WIN32
-    chmod(path, 0600);
-#endif
-
+    int rc = identity_write_file(path, pk, sk);
     sodium_memzero(sk, sizeof(sk));
-    sodium_memzero(sk_b64, sizeof(sk_b64));
-    return 0;
+    return rc;
 }
 
 int identity_load(const char *path, uint8_t *pk, uint8_t *sk) {
@@ -126,7 +265,7 @@ int identity_load(const char *path, uint8_t *pk, uint8_t *sk) {
     if (!f) return -1;
 
     char line[512];
-    int got_pk = 0, got_sk = 0;
+    int got_pk = 0, got_sk = 0, was_plaintext = 0;
 
     while (fgets(line, sizeof(line), f)) {
         /* Remove trailing whitespace */
@@ -147,6 +286,44 @@ int identity_load(const char *path, uint8_t *pk, uint8_t *sk) {
                 return -1;
             }
             got_pk = 1;
+        } else if (strncmp(line, "SKENC:", 6) == 0) {
+            /* SKENC:<mode>:<base64 blob> */
+            char *rest = line + 6;
+            char *colon = strchr(rest, ':');
+            if (!colon) { fclose(f); return -1; }
+            *colon = '\0';
+            iar_mode_t mode = iar_mode_from_name(rest);
+            const char *b64 = colon + 1;
+
+            size_t blob_cap = strlen(b64);
+            uint8_t *blob = (uint8_t *)malloc(blob_cap ? blob_cap : 1);
+            size_t blob_len = 0;
+            if (!blob ||
+                sodium_base642bin(blob, blob_cap, b64, strlen(b64), NULL,
+                                  &blob_len, NULL,
+                                  sodium_base64_VARIANT_URLSAFE_NO_PADDING) != 0) {
+                free(blob);
+                fclose(f);
+                return -1;
+            }
+
+            size_t got = 0;
+            int rc = iar_unprotect(mode, blob, blob_len, sk,
+                                   IDENTITY_SK_BYTES, &got);
+            sodium_memzero(blob, blob_len);
+            free(blob);
+            if (rc != 0 || got != IDENTITY_SK_BYTES) {
+                /* What is missing is the store, not the file. Saying which is
+                 * the difference between "unlock your keyring" and "your
+                 * identity is gone". */
+                fprintf(stderr,
+                        "[identity] the identity key is held by the %s store, "
+                        "which did not open it\n", iar_mode_name(mode));
+                sodium_memzero(sk, IDENTITY_SK_BYTES);
+                fclose(f);
+                return -1;
+            }
+            got_sk = 1;
         } else if (strncmp(line, "SK:", 3) == 0) {
             const char *b64 = line + 3;
             size_t bin_len = 0;
@@ -159,6 +336,7 @@ int identity_load(const char *path, uint8_t *pk, uint8_t *sk) {
                 return -1;
             }
             got_sk = 1;
+            was_plaintext = 1;
         }
     }
 
@@ -167,6 +345,14 @@ int identity_load(const char *path, uint8_t *pk, uint8_t *sk) {
     if (!got_pk || !got_sk) {
         sodium_memzero(sk, IDENTITY_SK_BYTES);
         return -1;
+    }
+
+    /* An identity written before there was a store, on a machine that has one
+     * now, gets rewritten under it. A failure here is not worth stopping for:
+     * the key we just read is good, and the file is no worse than it was a
+     * moment ago. */
+    if (was_plaintext && iar_available() != IAR_NONE) {
+        (void)identity_write_file(path, pk, sk);
     }
 
     return 0;
@@ -316,10 +502,100 @@ int identity_default_known_keys_path(char *buf, size_t bufsize) {
     return 0;
 }
 
+int identity_pm_room_id_v1(const uint8_t my_pk[IDENTITY_PK_BYTES],
+                        const uint8_t other_pk[IDENTITY_PK_BYTES],
+                        char out[IDENTITY_PM_ROOM_ID_LEN]) {
+    if (!my_pk || !other_pk || !out) return -1;
+
+    /* Лексикографический порядок — обе стороны попадают в один digest. */
+    int cmp = memcmp(my_pk, other_pk, IDENTITY_PK_BYTES);
+    const uint8_t *lo = (cmp <= 0) ? my_pk : other_pk;
+    const uint8_t *hi = (cmp <= 0) ? other_pk : my_pk;
+
+    uint8_t concat[IDENTITY_PK_BYTES * 2];
+    memcpy(concat,                         lo, IDENTITY_PK_BYTES);
+    memcpy(concat + IDENTITY_PK_BYTES,     hi, IDENTITY_PK_BYTES);
+
+    uint8_t digest[16];
+    if (crypto_generichash(digest, sizeof(digest),
+                            concat, sizeof(concat), NULL, 0) != 0) {
+        return -1;
+    }
+
+    /* Префикс "pm:" + 22 base64url-no-pad от 16 байт + NUL */
+    out[0] = 'p';
+    out[1] = 'm';
+    out[2] = ':';
+    if (sodium_bin2base64(out + 3, IDENTITY_PM_ROOM_ID_LEN - 3,
+                          digest, sizeof(digest),
+                          sodium_base64_VARIANT_URLSAFE_NO_PADDING) == NULL) {
+        return -1;
+    }
+    return 0;
+}
+
+int identity_pm_room_key(const uint8_t my_sk[IDENTITY_SK_BYTES],
+                         const uint8_t other_pk[IDENTITY_PK_BYTES],
+                         uint8_t out_key[32]) {
+    if (!my_sk || !other_pk || !out_key) return -1;
+
+    /* Конвертируем ed25519 → curve25519. */
+    uint8_t my_x_sk[crypto_scalarmult_curve25519_BYTES];   /* 32 */
+    uint8_t their_x_pk[crypto_scalarmult_curve25519_BYTES];
+    if (crypto_sign_ed25519_sk_to_curve25519(my_x_sk, my_sk) != 0) return -1;
+    if (crypto_sign_ed25519_pk_to_curve25519(their_x_pk, other_pk) != 0) {
+        sodium_memzero(my_x_sk, sizeof(my_x_sk));
+        return -1;
+    }
+
+    /* Plain X25519 — оба получают одинаковый shared secret. */
+    uint8_t shared[crypto_scalarmult_BYTES];               /* 32 */
+    int rc = crypto_scalarmult(shared, my_x_sk, their_x_pk);
+    sodium_memzero(my_x_sk, sizeof(my_x_sk));
+    if (rc != 0) return -1;
+
+    /* lo/hi pk — публичный «info» с фиксированным порядком, доменно
+     * разделено константой "fear.pm.v1.key". my_pk вытащим из my_sk
+     * (последние 32 байта 64-байтового ed25519 sk). */
+    const uint8_t *my_pk = my_sk + 32;
+    int cmp = memcmp(my_pk, other_pk, IDENTITY_PK_BYTES);
+    const uint8_t *lo = (cmp <= 0) ? my_pk : other_pk;
+    const uint8_t *hi = (cmp <= 0) ? other_pk : my_pk;
+
+    static const char ctx[] = "fear.pm.v1.key";
+    uint8_t info[sizeof(ctx) - 1 + IDENTITY_PK_BYTES * 2];
+    memcpy(info,                                       ctx,  sizeof(ctx) - 1);
+    memcpy(info + (sizeof(ctx) - 1),                    lo,  IDENTITY_PK_BYTES);
+    memcpy(info + (sizeof(ctx) - 1) + IDENTITY_PK_BYTES, hi, IDENTITY_PK_BYTES);
+
+    rc = crypto_generichash(out_key, 32,
+                            info, sizeof(info),
+                            shared, sizeof(shared));
+    sodium_memzero(shared, sizeof(shared));
+    return (rc == 0) ? 0 : -1;
+}
+
+int identity_inbox_addr(const uint8_t k_pm[32],
+                        const uint8_t recipient_pk[IDENTITY_PK_BYTES],
+                        uint8_t out[IDENTITY_INBOX_ADDR_BYTES]) {
+    if (!k_pm || !recipient_pk || !out) return -1;
+    static const char ctx[] = "fear.inbox.v2";
+    crypto_generichash_state st;
+    if (crypto_generichash_init(&st, k_pm, 32, IDENTITY_INBOX_ADDR_BYTES) != 0) return -1;
+    crypto_generichash_update(&st, (const uint8_t *)ctx, sizeof(ctx) - 1);
+    crypto_generichash_update(&st, recipient_pk, IDENTITY_PK_BYTES);
+    int rc = crypto_generichash_final(&st, out, IDENTITY_INBOX_ADDR_BYTES);
+    sodium_memzero(&st, sizeof st);
+    return rc == 0 ? 0 : -1;
+}
+
 char *identity_pk_fingerprint(const uint8_t pk[IDENTITY_PK_BYTES],
                               char out[IDENTITY_FINGERPRINT_LEN]) {
-    /* BLAKE2b hash of public key, take first 8 bytes */
-    uint8_t hash[32];
+    /* BLAKE2b с 8-байтовым выходом - не первые 8 байт BLAKE2b-256: длина
+     * выхода входит в параметры BLAKE2b, и это разные числа. Так считают
+     * Android, веб и GUI; ядро раньше брало префикс BLAKE2b-256, и отпечаток
+     * одного ключа на ПК и на телефоне не совпадал. Эталон - test_identity. */
+    uint8_t hash[8];
     crypto_generichash(hash, sizeof(hash), pk, IDENTITY_PK_BYTES, NULL, 0);
 
     /* Format as xx:xx:xx:xx:xx:xx:xx:xx */
@@ -330,66 +606,91 @@ char *identity_pk_fingerprint(const uint8_t pk[IDENTITY_PK_BYTES],
     return out;
 }
 
-/**
- * Helper: rewrite known_keys file.
- * Reads all entries, applies transform, writes back.
- * transform returns: 0 = keep as-is, 1 = modified (write new values), -1 = delete
- */
+/** One line of known_keys: name, base64url public key, verified flag. */
 typedef struct {
     char name[256];
     char pk_b64[256];
     int verified;
 } known_key_entry_t;
 
+#define KNOWN_KEYS_MAX 1024
+
+/*
+ * Прочитать known_keys целиком. Массив в куче: на стеке 1024 записи по
+ * полкилобайта - это полмегабайта на массив, а у потока на Windows весь стек
+ * мегабайт. Нет файла - пустой список, не ошибка. NULL - только нехватка
+ * памяти.
+ */
+static known_key_entry_t *load_known_keys(const char *db_path, int *count) {
+    *count = 0;
+    known_key_entry_t *entries = calloc(KNOWN_KEYS_MAX, sizeof *entries);
+    if (!entries) return NULL;
+
+    FILE *f = fopen(db_path, "r");
+    if (!f) return entries;
+    char line[1024];
+    while (fgets(line, sizeof(line), f) && *count < KNOWN_KEYS_MAX) {
+        size_t len = strlen(line);
+        while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r' ||
+                           line[len - 1] == ' ')) {
+            line[--len] = '\0';
+        }
+        if (len == 0) continue;
+
+        char *tab1 = strchr(line, '\t');
+        if (!tab1) continue;
+
+        known_key_entry_t *e = &entries[*count];
+        size_t name_len = (size_t)(tab1 - line);
+        if (name_len >= sizeof(e->name)) name_len = sizeof(e->name) - 1;
+        memcpy(e->name, line, name_len);
+        e->name[name_len] = '\0';
+
+        const char *rest = tab1 + 1;
+        char *tab2 = strchr(rest, '\t');
+        if (tab2) {
+            size_t pk_len = (size_t)(tab2 - rest);
+            if (pk_len >= sizeof(e->pk_b64)) pk_len = sizeof(e->pk_b64) - 1;
+            memcpy(e->pk_b64, rest, pk_len);
+            e->pk_b64[pk_len] = '\0';
+            e->verified = atoi(tab2 + 1);
+        } else {
+            strncpy(e->pk_b64, rest, sizeof(e->pk_b64) - 1);
+            e->pk_b64[sizeof(e->pk_b64) - 1] = '\0';
+            e->verified = 0;
+        }
+        (*count)++;
+    }
+    fclose(f);
+    return entries;
+}
+
+static int store_known_keys(const char *db_path, const known_key_entry_t *entries,
+                            int count) {
+    FILE *f = fopen(db_path, "w");
+    if (!f) return -1;
+    for (int i = 0; i < count; i++) {
+        fprintf(f, "%s\t%s\t%d\n", entries[i].name, entries[i].pk_b64, entries[i].verified);
+    }
+    fclose(f);
+    return 0;
+}
+
+/**
+ * Helper: rewrite known_keys file.
+ * Reads all entries, applies transform, writes back.
+ * transform returns: 0 = keep as-is, 1 = modified (write new values), -1 = delete
+ */
 static int rewrite_known_keys(const char *db_path,
                                int (*transform)(known_key_entry_t *entry, void *ctx),
                                void *ctx) {
-    /* Read all entries */
-    known_key_entry_t entries[1024];
     int count = 0;
+    known_key_entry_t *entries = load_known_keys(db_path, &count);
+    if (!entries) return -1;
+
+    /* Apply transform, compacting in place */
+    int kept = 0;
     int changed = 0;
-
-    FILE *f = fopen(db_path, "r");
-    if (f) {
-        char line[1024];
-        while (fgets(line, sizeof(line), f) && count < 1024) {
-            size_t len = strlen(line);
-            while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r' ||
-                               line[len - 1] == ' ')) {
-                line[--len] = '\0';
-            }
-            if (len == 0) continue;
-
-            char *tab1 = strchr(line, '\t');
-            if (!tab1) continue;
-
-            known_key_entry_t *e = &entries[count];
-            size_t name_len = (size_t)(tab1 - line);
-            if (name_len >= sizeof(e->name)) name_len = sizeof(e->name) - 1;
-            memcpy(e->name, line, name_len);
-            e->name[name_len] = '\0';
-
-            const char *rest = tab1 + 1;
-            char *tab2 = strchr(rest, '\t');
-            if (tab2) {
-                size_t pk_len = (size_t)(tab2 - rest);
-                if (pk_len >= sizeof(e->pk_b64)) pk_len = sizeof(e->pk_b64) - 1;
-                memcpy(e->pk_b64, rest, pk_len);
-                e->pk_b64[pk_len] = '\0';
-                e->verified = atoi(tab2 + 1);
-            } else {
-                strncpy(e->pk_b64, rest, sizeof(e->pk_b64) - 1);
-                e->pk_b64[sizeof(e->pk_b64) - 1] = '\0';
-                e->verified = 0;
-            }
-            count++;
-        }
-        fclose(f);
-    }
-
-    /* Apply transform */
-    int new_count = 0;
-    known_key_entry_t result[1024];
     for (int i = 0; i < count; i++) {
         int rc = transform(&entries[i], ctx);
         if (rc == -1) {
@@ -397,19 +698,77 @@ static int rewrite_known_keys(const char *db_path,
             continue;
         }
         if (rc == 1) changed = 1; /* modified */
-        result[new_count++] = entries[i];
+        if (kept != i) entries[kept] = entries[i];
+        kept++;
     }
 
-    if (!changed) return -1; /* nothing changed = name not found */
+    /* nothing changed = name not found */
+    int ret = changed ? store_known_keys(db_path, entries, kept) : -1;
+    free(entries);
+    return ret;
+}
 
-    /* Write back */
-    f = fopen(db_path, "w");
-    if (!f) return -1;
-    for (int i = 0; i < new_count; i++) {
-        fprintf(f, "%s\t%s\t%d\n", result[i].name, result[i].pk_b64, result[i].verified);
+/* Отпечаток по формуле до 0.6.0: первые 8 байт BLAKE2b-256. Только для
+ * identity_known_keys_upgrade. */
+static void legacy_pk_fingerprint(const uint8_t pk[IDENTITY_PK_BYTES],
+                                  char out[IDENTITY_FINGERPRINT_LEN]) {
+    uint8_t hash[32];
+    crypto_generichash(hash, sizeof(hash), pk, IDENTITY_PK_BYTES, NULL, 0);
+    for (int i = 0; i < 8; i++) {
+        snprintf(out + i * 3, 4, "%02x%s", hash[i], (i < 7) ? ":" : "");
     }
-    fclose(f);
-    return 0;
+    out[23] = '\0';
+}
+
+int identity_known_keys_upgrade(const char *db_path) {
+    if (!db_path) return -1;
+    int count = 0;
+    known_key_entry_t *e = load_known_keys(db_path, &count);
+    if (!e) return -1;
+
+    int renamed = 0;
+    for (int i = 0; i < count; i++) {
+        if (strlen(e[i].name) != IDENTITY_FINGERPRINT_LEN - 1) continue;
+        uint8_t pk[IDENTITY_PK_BYTES];
+        size_t pk_len = 0;
+        if (sodium_base642bin(pk, sizeof pk, e[i].pk_b64, strlen(e[i].pk_b64),
+                              NULL, &pk_len, NULL,
+                              sodium_base64_VARIANT_URLSAFE_NO_PADDING) != 0 ||
+            pk_len != sizeof pk) {
+            continue;
+        }
+        char old_fp[IDENTITY_FINGERPRINT_LEN];
+        legacy_pk_fingerprint(pk, old_fp);
+        if (strcmp(e[i].name, old_fp) != 0) continue;
+        identity_pk_fingerprint(pk, e[i].name);
+        renamed++;
+    }
+    if (renamed == 0) {
+        free(e);
+        return 0;
+    }
+
+    /* Звонок после обновления мог уже завести запись под новой меткой: та же
+     * метка и тот же ключ - одна запись, «проверен», если был хоть где-то. */
+    int kept = 0;
+    for (int i = 0; i < count; i++) {
+        int dup = -1;
+        for (int j = 0; j < kept; j++) {
+            if (strcmp(e[j].name, e[i].name) == 0 && strcmp(e[j].pk_b64, e[i].pk_b64) == 0) {
+                dup = j;
+                break;
+            }
+        }
+        if (dup >= 0) {
+            if (e[i].verified) e[dup].verified = 1;
+            continue;
+        }
+        if (kept != i) e[kept] = e[i];
+        kept++;
+    }
+    int rc = store_known_keys(db_path, e, kept) == 0 ? renamed : -1;
+    free(e);
+    return rc;
 }
 
 static int transform_mark_verified(known_key_entry_t *entry, void *ctx) {

@@ -16,21 +16,49 @@
  * - File integrity verified with CRC32 checksums
  */
 
+#include "tls.h"
 #include "client.h"
 #include "network.h"
 #include "identity.h"
+#include "key_schedule.h"
+#include "chat_frame.h"
+#include "room_keys.h"
+#include "rotation_bundle.h"
+#include "call_invite.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 #include <time.h>
 #include <locale.h>
 #include <sodium.h>
 #ifdef _WIN32
 #include <windows.h>
+#include <io.h>          /* _isatty, _fileno */
 #else
 #include <sys/select.h>
 #include <errno.h>
+#include <pthread.h>
+#include <unistd.h>      /* isatty */
 #endif
+
+/**
+ * Line ending for file-transfer progress output.
+ *
+ * '\r' keeps the classic single-line live progress in a terminal. When
+ * stdout is a pipe (the GUI wraps this CLI and reads line by line), every
+ * update must be a complete '\n'-terminated line or the reader never sees
+ * the progress at all and the transfer looks hung.
+ */
+static char progress_eol(void) {
+    static int tty = -1;
+#ifdef _WIN32
+    if (tty < 0) tty = _isatty(_fileno(stdout));
+#else
+    if (tty < 0) tty = isatty(fileno(stdout));
+#endif
+    return tty ? '\r' : '\n';
+}
 
 #ifdef _WIN32
 #include <direct.h>
@@ -40,11 +68,59 @@
 #include <libgen.h>
 #endif
 
+/* Create directory (no error if it already exists). Cross-platform. */
+static int mkdir_p_one(const char *dir) {
+#ifdef _WIN32
+    int rc = _mkdir(dir);
+#else
+    int rc = mkdir(dir, 0755);
+#endif
+    if (rc != 0 && errno != EEXIST) return -1;
+    return 0;
+}
+
+/* Ensure the parent directory of `path` exists, creating intermediate dirs as
+ * needed. Safe to call repeatedly. */
+static void ensure_parent_dir(const char *path) {
+    if (!path || !*path) return;
+    char buf[512];
+    strncpy(buf, path, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = '\0';
+
+    /* Find rightmost separator — that's the boundary between dir and filename. */
+    char *last = strrchr(buf, '/');
+#ifdef _WIN32
+    char *last_bs = strrchr(buf, '\\');
+    if (last_bs > last) last = last_bs;
+#endif
+    if (!last) return;       /* no directory component */
+    *last = '\0';
+    if (buf[0] == '\0') return;
+
+    /* Walk through path components, mkdir each one. */
+    for (char *p = buf + 1; *p; p++) {
+        if (*p == '/'
+#ifdef _WIN32
+            || *p == '\\'
+#endif
+            ) {
+            *p = '\0';
+            mkdir_p_one(buf);
+            *p = '/';
+        }
+    }
+    mkdir_p_one(buf);
+}
+
 /* Identity signing state (module-level) */
 static int g_has_identity = 0;
 static uint8_t g_identity_pk[IDENTITY_PK_BYTES];
 static uint8_t g_identity_sk[IDENTITY_SK_BYTES];
 static char g_known_keys_path[512];
+
+/* Defined below with the sealing helpers; the file's first sender is above
+ * it and needs the declaration. */
+static void chat_keyring(const uint8_t *k_room, cf_key_t *out);
 
 /* Forward declarations for signed message functions */
 static int send_signed_file_message(sock_t s, const char *room, const char *name,
@@ -56,9 +132,452 @@ static int send_signed_file_message(sock_t s, const char *room, const char *name
 
 /* Module-level room key pointer (set in run_client, used by KEY_REQUEST handler) */
 static const uint8_t *g_room_key = NULL;
+
+/*
+ * The generations of K_room we hold, and who is in the room.
+ *
+ * The roster exists because rotation has to address a bundle to every member
+ * by identity key, and until now nothing kept one: identities were checked
+ * against the TOFU store as they arrived and then forgotten. The store is on
+ * disk and keyed by name; what rotation needs is who is here *now*.
+ */
+/*
+ * Почтовые ящики, за которыми следим.
+ *
+ * Личная переписка - это комната, чей идентификатор и ключ выводятся из двух
+ * личных ключей. Пока обе стороны в этой комнате, всё идёт как обычно. Если
+ * собеседника там нет, письмо ложится в ящик по слепому адресу, а он забирает
+ * его, когда придёт.
+ *
+ * Беда в том, что «придёт» - это не только «откроет этот чат»: человек может
+ * сидеть в общей комнате и не знать, что ему написали. Поэтому клиент следит
+ * сразу за всеми ящиками, о которых ему сказали, - по одному на контакт, - и
+ * спрашивает их пачкой. Ключ пары приходит снаружи: консольный клиент не
+ * ведёт список контактов, его ведёт интерфейс.
+ */
+#define INBOX_MAX_WATCH 128
+#define INBOX_POLL_MS   20000
+
+typedef struct {
+    char    room[MAX_ROOM];                      /**< pm:… - куда класть сообщения */
+    uint8_t k_pm[KS_KEY_BYTES];                  /**< он же ключ комнаты */
+    uint8_t addr_in[IDENTITY_INBOX_ADDR_BYTES];  /**< ящик, куда пишут нам: его и спрашиваем */
+    uint8_t addr_out[IDENTITY_INBOX_ADDR_BYTES]; /**< ящик собеседника: туда пишем мы */
+} inbox_watch_t;
+
+/* Метка комнаты на проводе - её несут все кадры этого соединения. Ящик
+ * тоже: иначе идентификатор личной комнаты, который мы только что убрали
+ * из заголовка, вернулся бы туда через почту. */
+static const char *g_wire_room = NULL;
+
+static inbox_watch_t g_inbox[INBOX_MAX_WATCH];
+static int g_inbox_count = 0;
+static uint64_t g_inbox_next_poll = 0;
+
+/*
+ * Письма, которые уже показаны, - по номеру, который им дал ретранслятор.
+ * Удалить письмо мы просим только после показа, а запросов в полёте может
+ * быть несколько (GUI шлёт /inbox-add на каждый контакт подряд), и одно
+ * письмо приходило в каждом ответе: на живом тесте одно сообщение
+ * показалось трижды. Номера - одного сервера: процесс клиента живёт на
+ * одном соединении.
+ */
+#define INBOX_SEEN_MAX 256
+static int64_t g_inbox_seen[INBOX_SEEN_MAX];
+static int g_inbox_seen_n = 0;
+static int g_inbox_seen_pos = 0;
+
+static int inbox_seen(int64_t id) {
+    for (int i = 0; i < g_inbox_seen_n; i++) {
+        if (g_inbox_seen[i] == id) return 1;
+    }
+    return 0;
+}
+
+static void inbox_mark_seen(int64_t id) {
+    g_inbox_seen[g_inbox_seen_pos] = id;
+    g_inbox_seen_pos = (g_inbox_seen_pos + 1) % INBOX_SEEN_MAX;
+    if (g_inbox_seen_n < INBOX_SEEN_MAX) g_inbox_seen_n++;
+}
+
+/** Срок хранения, о котором сказал сервер: 0 - не хранит ничего. */
+static uint32_t g_inbox_ttl = 0;
+static int g_inbox_ttl_known = 0;
+
+static room_keys_t g_rk;
+static int g_rk_ready = 0;
+
+/*
+ * Rotation waits for the room to agree on who is in it.
+ *
+ * The server announces a membership change before the members involved have
+ * said who they are, so for a moment every client holds a different roster -
+ * and an election run on differing rosters elects everybody. That is not
+ * hypothetical: run three clients without this and two of them rotate at
+ * once, each sealing a bundle only it can open.
+ *
+ * So a membership change arms a rotation instead of performing one. The wait
+ * is what lets the identity announcements land, after which every roster is
+ * the same and the election has one answer. A member that never announces an
+ * identity would otherwise hold the room forever, so the wait has an end.
+ */
+#define ROT_SETTLE_MS   1500   /**< quiet time after the last roster change */
+#define ROT_DEADLINE_MS 6000   /**< stop waiting on a member that stays silent */
+
+static int      g_rot_pending  = 0;
+/* Диагностика выбора ротатора. Включается FEAR_ROT_DEBUG=1 и только ей. */
+static int      g_rot_debug    = 0;
+static uint64_t g_rot_settle_at = 0;
+static uint64_t g_rot_deadline  = 0;
+
+static uint64_t rot_now_ms(void) {
+#ifdef _WIN32
+    return (uint64_t)GetTickCount64();
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)(ts.tv_nsec / 1000000);
+#endif
+}
+
+#define ROSTER_MAX 64
+
+/*
+ * Кто в комнате, под какой меткой и с каким именем.
+ *
+ * Ключ здесь - метка сессии, а не имя: имя ретранслятор больше не видит, и
+ * список участников он присылает метками. Имя приходит отдельно, в анонсе
+ * личности, вместе с подписью, которая привязывает его к этой метке.
+ */
+typedef struct {
+    char    tag[IDENTITY_SESSION_TAG_LEN];  /**< метка на проводе */
+    char    display[MAX_NAME];              /**< имя из анонса, пусто пока не объявился */
+    uint8_t pk[IDENTITY_PK_BYTES];
+    int     has_identity;
+    int     present;
+    int     was_present;   /**< here before the change now being handled */
+} roster_entry_t;
+
+static roster_entry_t g_roster[ROSTER_MAX];
+static int g_roster_count = 0;
+static int g_saw_first_user_list = 0;
+
+/*
+ * Whether we have a "before" to compare against.
+ *
+ * The list that greets us on arrival is not a change we witnessed - we have
+ * no idea what the room looked like a moment earlier, so we cannot say who
+ * was already in it, and the members who were will not count us either. Until
+ * a change happens with us watching, we take no part in electing a rotator
+ * and we accept the one the room picked.
+ */
+static int g_have_before = 0;
+
+/** Freeze the present set as the "before" of the next membership change. */
+static void roster_snapshot_present(void) {
+    for (int i = 0; i < g_roster_count; i++) {
+        g_roster[i].was_present = g_roster[i].present;
+    }
+}
+
+/*
+ * Сообщить GUI, как зовут метку: «[ROSTER] <метка> <имя>».
+ *
+ * Звонок идёт отдельным процессом и знает участников только по метке из
+ * HELLO2: имени там нет, потому что HELLO2 не зашифрован и имя в нём прочёл
+ * бы ретранслятор. GUI пересылает эти строки процессу звонка, и под плиткой
+ * видео оказывается имя, а не метка. Управляющие символы - '?': имя не должно
+ * разорвать построчный протокол.
+ */
+static void roster_print_name(const char *tag, const char *display) {
+    char clean[MAX_NAME];
+    size_t n = 0;
+    for (const unsigned char *p = (const unsigned char *)display; *p && n + 1 < sizeof clean; p++) {
+        clean[n++] = (*p < 0x20 || *p == 0x7F) ? '?' : (char)*p;
+    }
+    clean[n] = '\0';
+    printf("[ROSTER] %s %s\n", tag, clean);
+    fflush(stdout);
+}
+
+/** Remember, or update, one member's identity key and announced name. */
+static void roster_note_identity(const char *tag, const uint8_t *pk, const char *display) {
+    if (!tag || !pk) return;
+    for (int i = 0; i < g_roster_count; i++) {
+        if (strcmp(g_roster[i].tag, tag) != 0) continue;
+        memcpy(g_roster[i].pk, pk, IDENTITY_PK_BYTES);
+        g_roster[i].has_identity = 1;
+        if (display && display[0] && strcmp(g_roster[i].display, display) != 0) {
+            snprintf(g_roster[i].display, MAX_NAME, "%s", display);
+            roster_print_name(tag, display);
+        }
+        return;
+    }
+    if (g_roster_count >= ROSTER_MAX) return;
+    snprintf(g_roster[g_roster_count].tag, IDENTITY_SESSION_TAG_LEN, "%s", tag);
+    snprintf(g_roster[g_roster_count].display, MAX_NAME, "%s", display ? display : "");
+    if (display && display[0]) roster_print_name(tag, display);
+    memcpy(g_roster[g_roster_count].pk, pk, IDENTITY_PK_BYTES);
+    g_roster[g_roster_count].has_identity = 1;
+    /*
+     * Присутствие - слово сервера, а не вывод из услышанного кадра.
+     *
+     * Вошедший объявляется сразу, и его анонс обгоняет список участников,
+     * который рассылает ретранслятор. Заведи мы запись присутствующей -
+     * пришедший следом список не изменил бы ничего: все метки уже на месте,
+     * `changed` остался бы нулём, и смена состава пропала бы молча. Вместе с
+     * ней не взвелась бы ротация, а избранный ротатор - тот, кто проиграл эту
+     * гонку, - промолчал бы. Вошедший остаётся на нулевом поколении: он не
+     * читает комнату, а комната не читает его, едва истечёт льготная минута
+     * прошлого поколения.
+     *
+     * Поэтому здесь только личность. Присутствие выставит roster_set_present,
+     * когда сервер скажет, и ровно тогда это будет считаться изменением.
+     */
+    g_roster[g_roster_count].present = 0;
+    g_roster[g_roster_count].was_present = 0;
+    g_roster_count++;
+}
+
+/**
+ * Имя, под которым показывать эту метку.
+ *
+ * NULL значит «этот участник ещё не объявился». Придумывать за него имя
+ * нельзя: приписать сообщение не тому - хуже, чем показать, что отправитель
+ * пока неизвестен.
+ */
+static const char *roster_display(const char *tag) {
+    if (!tag) return NULL;
+    for (int i = 0; i < g_roster_count; i++) {
+        if (strcmp(g_roster[i].tag, tag) != 0) continue;
+        return g_roster[i].display[0] ? g_roster[i].display : NULL;
+    }
+    return NULL;
+}
+
+/**
+ * Сколько присутствующих участников зовутся так же.
+ *
+ * Уникальность имён в комнате раньше держал ретранслятор - он их видел.
+ * Теперь не видит, и двое могут объявиться одним именем. Совпадение не
+ * запрещаем (люди действительно бывают тёзками), но показываем: имя,
+ * встречающееся дважды, идёт вместе с отпечатком ключа.
+ */
+static int roster_display_collisions(const char *display) {
+    if (!display || !display[0]) return 0;
+    int n = 0;
+    for (int i = 0; i < g_roster_count; i++) {
+        if (g_roster[i].present && strcmp(g_roster[i].display, display) == 0) n++;
+    }
+    return n;
+}
+
+/** Mark who the server says is here. Returns 1 if the set changed. */
+static int roster_set_present(char tags[][IDENTITY_SESSION_TAG_LEN], int count) {
+    int changed = 0;
+
+    for (int i = 0; i < g_roster_count; i++) {
+        int here = 0;
+        for (int j = 0; j < count; j++) {
+            if (strcmp(g_roster[i].tag, tags[j]) == 0) { here = 1; break; }
+        }
+        if (g_roster[i].present != here) {
+            g_roster[i].present = here;
+            changed = 1;
+            /*
+             * Ушёл - забываем, кем он был.
+             *
+             * Метка освобождается вместе с соединением, и следующее
+             * подключение может её занять: ретранслятор сторожит только то,
+             * чтобы две живые метки не совпали. Сохрани мы привязку, кадры
+             * нового владельца показались бы под именем прежнего - причём
+             * без единой подделанной подписи, просто по устаревшей записи.
+             * Вернувшийся обязан объявиться заново.
+             */
+            if (!here) {
+                g_roster[i].display[0] = 0;
+                g_roster[i].has_identity = 0;
+            }
+        }
+    }
+
+    for (int j = 0; j < count; j++) {
+        int known = 0;
+        for (int i = 0; i < g_roster_count; i++) {
+            if (strcmp(g_roster[i].tag, tags[j]) == 0) { known = 1; break; }
+        }
+        if (known || g_roster_count >= ROSTER_MAX) continue;
+        snprintf(g_roster[g_roster_count].tag, IDENTITY_SESSION_TAG_LEN, "%s", tags[j]);
+        g_roster[g_roster_count].display[0] = 0;
+        g_roster[g_roster_count].has_identity = 0;
+        g_roster[g_roster_count].present = 1;
+        g_roster_count++;
+        changed = 1;
+    }
+    return changed;
+}
+
+/** Сколько участников сейчас в комнате по версии ретранслятора. */
+static int roster_present_count(void) {
+    int n = 0;
+    for (int i = 0; i < g_roster_count; i++) if (g_roster[i].present) n++;
+    return n;
+}
+
+/** Место участника в реестре по метке, или -1. */
+static int roster_find(const char *tag) {
+    if (!tag) return -1;
+    for (int i = 0; i < g_roster_count; i++) {
+        if (strcmp(g_roster[i].tag, tag) == 0) return i;
+    }
+    return -1;
+}
+
+/** Сколько знаков метки показывать, когда показать больше нечего. */
+#define TAG_STUB_CHARS 8
+
+/**
+ * Как подписать отправителя кадра.
+ *
+ * Метка - не имя, и превратить одно в другое мы вправе только после анонса,
+ * подпись которого сошлась. Пока участник не объявился, показываем огрызок
+ * метки с вопросительным знаком: «пришло, от кого - пока неизвестно» честнее
+ * правдоподобного имени, взятого непонятно откуда.
+ *
+ * Тёзки в одной комнате возможны: уникальность имён держал ретранслятор, а он
+ * их больше не видит. Поэтому имя, встречающееся в комнате дважды, идёт
+ * вместе с отпечатком ключа - различать собеседников по нему всё равно
+ * надёжнее, чем по имени.
+ */
+static const char *sender_label(const char *tag, char *buf, size_t cap) {
+    int i = roster_find(tag);
+    const char *d = (i >= 0 && g_roster[i].display[0]) ? g_roster[i].display : NULL;
+    if (!d) {
+        snprintf(buf, cap, "?%.*s", TAG_STUB_CHARS, tag ? tag : "");
+        return buf;
+    }
+    if (roster_display_collisions(d) > 1 && g_roster[i].has_identity) {
+        char fp[IDENTITY_FINGERPRINT_LEN];
+        identity_pk_fingerprint(g_roster[i].pk, fp);
+        snprintf(buf, cap, "%s [%s]", d, fp);
+        return buf;
+    }
+    snprintf(buf, cap, "%s", d);
+    return buf;
+}
+
+/**
+ * Напечатать список участников так, как его читают люди и графический клиент.
+ *
+ * Печатается из реестра, а не прямо из кадра: в кадре метки, а имена
+ * приезжают отдельными анонсами и позже. Поэтому строка выводится и когда
+ * пришёл новый список, и когда очередной анонс превратил метку в имя -
+ * иначе тот, кто объявился после списка, так и остался бы огрызком метки.
+ */
+static void roster_print_users(void) {
+    int shown = 0;
+    printf("[USERS] Room participants (%d):", roster_present_count());
+    for (int i = 0; i < g_roster_count; i++) {
+        if (!g_roster[i].present) continue;
+        char label[MAX_NAME + IDENTITY_FINGERPRINT_LEN + 8];
+        sender_label(g_roster[i].tag, label, sizeof label);
+        printf("%s %s", shown ? "," : "", label);
+        shown++;
+    }
+    printf("\n");
+    fflush(stdout);
+}
+
+/** True once every member the server lists has told us who they are. */
+static int roster_identities_complete(void) {
+    for (int i = 0; i < g_roster_count; i++) {
+        if (g_roster[i].present && !g_roster[i].has_identity) return 0;
+    }
+    return 1;
+}
+
+/**
+ * The members eligible to rotate: here before the change, and still here.
+ *
+ * A member that has just arrived must not be elected, and the reason is
+ * arithmetic rather than principle. It holds generation zero and has no way
+ * to know the room is on generation four, so the "next" generation it would
+ * draw is one the room has already used - and everyone else discards it as a
+ * replay while the newcomer installs it and stops being able to read
+ * anything. A member that was already here knows what generation this is.
+ *
+ * Every continuing member computes the same set from the same sequence of
+ * user lists, so the election still has exactly one answer.
+ */
+static size_t roster_continuing(rk_member_t *out, size_t cap) {
+    size_t n = 0;
+    for (int i = 0; i < g_roster_count && n < cap; i++) {
+        if (!g_roster[i].present || !g_roster[i].was_present) continue;
+        memcpy(out[n].pk, g_roster[i].pk, IDENTITY_PK_BYTES);
+        out[n].has_identity = g_roster[i].has_identity;
+        n++;
+    }
+    return n;
+}
+
+
 static sock_t g_sock = -1;
 static const char *g_room = NULL;
 static const char *g_name = NULL;
+
+/*
+ * Наше отображаемое имя - то, которое видят люди, а не ретранслятор.
+ *
+ * На проводе вместо него едет метка сессии (g_name), поэтому настоящее имя
+ * нужно держать отдельно: его кладут в анонс личности и им же подписываются
+ * собственные реплики в своём же окне.
+ */
+static const char *g_display_name = NULL;
+
+/*
+ * Сколько анонсов личности не открылось.
+ *
+ * Анонс запечатан ключом-родоначальником комнаты, и открыть его должен уметь
+ * каждый, кто в этой комнате. Не открылся - значит у нас с отправителем
+ * разные ключи: мы формально в одной комнате, а на деле в двух разных, и это
+ * состояние ничем себя не выдаёт. Собеседники просто не появляются, имена
+ * остаются огрызками меток, сообщения не приходят - три разные на вид
+ * поломки с одной причиной.
+ *
+ * Поэтому говорим прямо и один раз.
+ */
+static int g_announce_failed = 0;
+static int g_keysplit_warned = 0;
+
+/*
+ * Просить ли TLS и с каким отпечатком.
+ *
+ * Отпечаток вместо удостоверяющего центра - более уместная проверка для
+ * своего ретранслятора: доверие здесь и так строится на сверке отпечатков,
+ * а не на списке чужих центров.
+ */
+
+
+/**
+ * Попросить TLS для следующего соединения.
+ *
+ * @param pin_hex отпечаток сертификата (SHA-256, hex) или NULL. С
+ *        отпечатком удостоверяющие центры не спрашиваются вовсе - для
+ *        своего ретранслятора с самоподписанным сертификатом это не
+ *        послабление, а более уместная проверка.
+ */
+void client_set_tls(int want, const char *pin_hex) {
+    /* Хранит настройку сам модуль TLS: спрашивает о ней dial_tcp, а он ниже
+     * клиента и о клиенте ничего не знает. */
+    tls_want(want, pin_hex);
+}
+
+/* Phase B-8: heartbeat. The CLI runs an extra thread that sends a
+ * MSG_TYPE_PING zero-nonce service frame every PING_INTERVAL_SEC. The
+ * server bumps last_seen on every recv and kicks anyone silent for
+ * IDLE_TIMEOUT_SEC (240s on the server), so 60s gives ~4 missed pings
+ * of slack before a real network problem turns into a kick. */
+#define PING_INTERVAL_SEC 60
 
 /**
  * @brief Send a zero-nonce service frame (unencrypted payload)
@@ -91,6 +610,26 @@ static int send_service_frame(sock_t s, const char *room, const char *name,
     free(frame);
     return rc;
 }
+
+/*
+ * Список участников, пришедший, пока мы ждали ключ комнаты.
+ *
+ * Ретранслятор рассылает его в ту же секунду, как зарегистрировал нас, - а
+ * регистрирует нас KEY_REQUEST, то есть задолго до ответа с ключом. Ожидание
+ * ключа читает кадры само и раньше выбрасывало всё, что не ответ. Вместе с
+ * прочим пропадал и этот список - единственная весть о нашем собственном
+ * приходе.
+ *
+ * Без него первым учтённым списком становилась СЛЕДУЮЩАЯ смена состава, и мы
+ * принимали чужой вход за свой: а в свой приход участник в выборах не
+ * участвует. Если избранным ротатором для этого входа были мы, не ротировал
+ * никто - и вошедший оставался на нулевом поколении, глухим к комнате.
+ *
+ * Хранится последний: если за время ожидания состав менялся ещё раз, наш
+ * приход - это комната, какой она стала к его концу.
+ */
+static uint8_t *g_join_userlist = NULL;
+static size_t   g_join_userlist_len = 0;
 
 /**
  * @brief Perform ECDH key exchange as a joiner
@@ -177,6 +716,18 @@ static int ecdh_join_room(sock_t s, const char *room, const char *name, uint8_t 
             if (nonce[i] != 0) { is_zero_nonce = 0; break; }
         }
 
+        /* Свой приход: сохранить, а не выбросить. См. g_join_userlist. */
+        if (type_buf[0] == MSG_TYPE_USER_LIST && is_zero_nonce &&
+            strcmp(room_in, room) == 0) {
+            uint8_t *copy = (uint8_t *)malloc(clen ? clen : 1);
+            if (copy) {
+                memcpy(copy, payload, clen);
+                free(g_join_userlist);
+                g_join_userlist = copy;
+                g_join_userlist_len = clen;
+            }
+        }
+
         if (type_buf[0] == MSG_TYPE_KEY_RESPONSE && is_zero_nonce &&
             strcmp(room_in, room) == 0) {
             /* Parse: [name_len(2)][name][eph_pk(32)][nonce(24)][cipher(48)]
@@ -198,17 +749,33 @@ static int ecdh_join_room(sock_t s, const char *room, const char *name, uint8_t 
                     const uint8_t *box_cipher = p; p += (32 + crypto_box_MACBYTES);
                     size_t box_cipher_len = 32 + crypto_box_MACBYTES;
 
-                    /* Check for identity signature (anti-MITM) */
+                    /* Identity signature (anti-MITM) - MANDATORY.
+                     * The responder must prove ownership of an Ed25519 identity
+                     * over its ephemeral X25519 key. Without this, a hostile relay
+                     * - or any room member that answers KEY_REQUEST first - can
+                     * hand us a room key it already knows and transparently MITM
+                     * the whole conversation. This check previously "failed open":
+                     * a missing or invalid signature only printed a warning and
+                     * the key was accepted anyway. Anything short of a verified
+                     * signature now aborts the join. */
                     size_t consumed = 2 + target_len + base_len;
                     size_t remaining = clen - consumed;
                     int sig_verified = 0;
 
-                    if (remaining >= IDENTITY_PK_BYTES + IDENTITY_SIG_BYTES) {
+                    if (remaining < IDENTITY_PK_BYTES + IDENTITY_SIG_BYTES) {
+                        fprintf(stderr,
+                                "[join] REJECTED: '%s' sent an unsigned key response.\n"
+                                "[join] The room owner needs an identity key (do not use --no-sign).\n",
+                                sender);
+                    } else {
                         const uint8_t *id_pk = p;
                         const uint8_t *sig = p + IDENTITY_PK_BYTES;
                         if (identity_verify(responder_pk, crypto_box_PUBLICKEYBYTES,
-                                            sig, id_pk) == 0) {
-                            sig_verified = 1;
+                                            sig, id_pk) != 0) {
+                            fprintf(stderr,
+                                    "[join] REJECTED: signature verification FAILED for '%s'"
+                                    " - possible MITM attack.\n", sender);
+                        } else {
                             /* TOFU check the responder's identity */
                             tofu_result_t tofu = identity_tofu_check(
                                 g_known_keys_path, sender, id_pk);
@@ -217,24 +784,51 @@ static int ecdh_join_room(sock_t s, const char *room, const char *name, uint8_t 
                             if (tofu == TOFU_KEY_MATCH || tofu == TOFU_KEY_MATCH_VERIFIED) {
                                 printf("[join] Key exchange verified: %s [%s]\n",
                                        sender, fp_buf);
+                                sig_verified = 1;
                             } else if (tofu == TOFU_NEW_KEY) {
                                 printf("[join] New identity for '%s': %s (trusted on first use)\n",
                                        sender, fp_buf);
-                            } else if (tofu == TOFU_KEY_CONFLICT) {
-                                printf("\n*** WARNING: Identity key for '%s' has CHANGED! ***\n", sender);
-                                printf("*** This could indicate a MITM attack! ***\n");
-                                printf("*** Fingerprint: %s ***\n\n", fp_buf);
+                                sig_verified = 1;
                             }
-                        } else {
-                            fprintf(stderr, "[join] WARNING: Signature verification FAILED for '%s'!\n", sender);
+                            /* Into the roster, not just the TOFU store.
+                             *
+                             * This loop reads frames looking for a key
+                             * response and drops everything else, so the
+                             * announcement this member made when we arrived
+                             * is gone. Without recording them here the first
+                             * thing we do in the room is refuse their
+                             * rotation, having no idea who else is in it. */
+                            /* Имени тут ещё нет: ключ приехал в ответе на обмен, а не в анонсе.
+                             * Придёт анонсом - тогда и подпишем. */
+                            if (sig_verified) roster_note_identity(sender, id_pk, NULL); else if (tofu == TOFU_KEY_CONFLICT) {
+                                /* Blocking: a changed identity key is exactly what an
+                                 * active MITM looks like, so we must not proceed. */
+                                fprintf(stderr,
+                                    "\n*** REJECTED: identity key for '%s' has CHANGED! ***\n"
+                                    "*** This could indicate a MITM attack. Fingerprint: %s ***\n"
+                                    "*** Verify out of band, then remove the stale entry from\n"
+                                    "*** %s if the change is expected. ***\n\n",
+                                    sender, fp_buf, g_known_keys_path);
+                            } else {
+                                fprintf(stderr,
+                                        "[join] REJECTED: could not check identity of '%s'.\n",
+                                        sender);
+                            }
                         }
+                    }
+
+                    if (!sig_verified) {
+                        fprintf(stderr, "[join] Aborting key exchange - room key not accepted.\n");
+                        fflush(stderr);
+                        free(room_in); free(sender); free(payload);
+                        break;
                     }
 
                     if (crypto_box_open_easy(key_out, box_cipher, box_cipher_len,
                                               box_nonce, responder_pk, my_sk) == 0) {
                         char *b64_key = b64_encode(key_out, 32);
-                        printf("[join] Room key received from '%s'%s\n", sender,
-                               sig_verified ? " (identity verified)" : " (unsigned)");
+                        printf("[join] Room key received from '%s' (identity verified)\n",
+                               sender);
                         if (b64_key) {
                             printf("[join] Room key: %s\n", b64_key);
                             free(b64_key);
@@ -310,7 +904,18 @@ static void handle_key_request(sock_t s, const char *room, const char *myname,
     if (g_has_identity) {
         memcpy(w, g_identity_pk, IDENTITY_PK_BYTES); w += IDENTITY_PK_BYTES;
         /* Sign the ephemeral public key with our Ed25519 identity key */
-        identity_sign(my_pk, crypto_box_PUBLICKEYBYTES, g_identity_sk, w);
+        if (identity_sign(my_pk, crypto_box_PUBLICKEYBYTES, g_identity_sk, w) != 0) {
+            fprintf(stderr, "[key-exchange] Failed to sign ephemeral key - aborting.\n");
+            sodium_memzero(my_sk, sizeof my_sk);
+            free(payload);
+            return;
+        }
+    } else {
+        /* Joiners now reject unsigned responses (anti-MITM), so warn loudly
+         * instead of silently producing a room nobody can join. */
+        fprintf(stderr,
+                "[key-exchange] WARNING: no identity key available - this response is\n"
+                "[key-exchange] unsigned and joining clients will REJECT it.\n");
     }
 
     send_service_frame(s, room, myname, MSG_TYPE_KEY_RESPONSE, payload, payload_len);
@@ -318,7 +923,7 @@ static void handle_key_request(sock_t s, const char *room, const char *myname,
     sodium_memzero(my_sk, sizeof my_sk);
     free(payload);
     printf("[key-exchange] Sent room key to '%s'%s\n", joiner_name,
-           g_has_identity ? " (signed)" : "");
+           g_has_identity ? " (signed)" : " (UNSIGNED - will be rejected)");
     fflush(stdout);
 }
 
@@ -381,29 +986,23 @@ int send_file_message(sock_t s, const char *room, const char *name,
         wr_u32(payload, crc);
     }
 
-    // Associated Data = только room + name
-    size_t ad_len = room_len + name_len + 2 + 2;
-    uint8_t *ad = (uint8_t*)malloc(ad_len);
-    if (!ad) { free(payload); return -1; }
-    uint8_t *aw = ad;
-    wr_u16(aw, room_len); aw += 2; memcpy(aw, room, room_len); aw += room_len;
-    wr_u16(aw, name_len); aw += 2; memcpy(aw, name, name_len);
-
     // Шифруем
-    size_t cmax = payload_len + CRYPTO_ABYTES;
+    size_t cmax = payload_len + CF_OVERHEAD_BYTES;
     uint8_t *cipher = (uint8_t*)malloc(cmax);
-    if (!cipher) { free(ad); free(payload); return -1; }
+    if (!cipher) { free(payload); return -1; }
     
-    unsigned long long clen = 0;
-    if (aes_gcm_encrypt(payload, payload_len, ad, ad_len, nonce, key, cipher, &clen) != 0) {
-        free(ad); free(cipher); free(payload);
+    size_t clen = 0;
+    cf_key_t ck;
+    chat_keyring(key, &ck);
+    if (cf_seal(&ck, room, name, payload, payload_len, nonce, cipher, cmax, &clen) != CF_OK) {
+        free(cipher); free(payload);
         return -1;
     }
 
     // Формируем финальный frame
     size_t flen = 2 + room_len + 2 + name_len + 2 + CRYPTO_NPUBBYTES + 1 + 4 + (size_t)clen;
     uint8_t *frame = (uint8_t*)malloc(flen);
-    if (!frame) { free(ad); free(cipher); free(payload); return -1; }
+    if (!frame) { free(cipher); free(payload); return -1; }
 
     uint8_t *w = frame;
     wr_u16(w, room_len); w += 2; memcpy(w, room, room_len); w += room_len;
@@ -415,7 +1014,6 @@ int send_file_message(sock_t s, const char *room, const char *name,
 
     int rc = send_all(s, frame, flen);
 
-    free(ad);
     free(cipher);
     free(payload);
     free(frame);
@@ -519,8 +1117,8 @@ void handle_file_transfer(const char *filename, const uint8_t key[32],
         }
 
         offset += chunk_size;
-        printf("Progress: %zu/%zu bytes (%.1f%%)\r", offset, file_size,
-               (float)offset/file_size*100);
+        printf("Progress: %zu/%zu bytes (%.1f%%)%c", offset, file_size,
+               (float)offset/file_size*100, progress_eol());
         fflush(stdout);
     }
 
@@ -542,6 +1140,7 @@ void handle_file_transfer(const char *filename, const uint8_t key[32],
 void receive_file(const char *temp_path, size_t total_size,
                  const uint8_t *data, size_t data_len) {
     if (current_transfer.fp == NULL) {
+        ensure_parent_dir(temp_path);   /* mkdir -p Downloads */
         current_transfer.fp = fopen(temp_path, "wb");
         if (!current_transfer.fp) {
             printf("Cannot create temp file: %s\n", temp_path);
@@ -565,9 +1164,10 @@ void receive_file(const char *temp_path, size_t total_size,
             }
         }
 
-        printf("Progress: %zu/%zu bytes (%.1f%%)\r",
+        printf("Progress: %zu/%zu bytes (%.1f%%)%c",
                current_transfer.received, current_transfer.total_size,
-               (float)current_transfer.received/current_transfer.total_size*100);
+               (float)current_transfer.received/current_transfer.total_size*100,
+               progress_eol());
         fflush(stdout);
 
         if (current_transfer.received >= current_transfer.total_size) {
@@ -622,6 +1222,7 @@ static void handle_accept_command(const char *arg) {
 
     if (current_transfer.completed) {
         /* File already fully received - move from temp */
+        ensure_parent_dir(final_path);   /* user-picked path may target a fresh dir */
         if (rename(current_transfer.temp_filename, final_path) == 0) {
             printf("File saved: %s\n", final_path);
         } else {
@@ -678,6 +1279,26 @@ static void handle_reject_command(void) {
 }
 
 
+/**
+ * @brief Replace C0 control bytes (and DEL) in a display string, in place.
+ *
+ * Everything this CLI prints is parsed line by line by the Qt GUI, which trusts
+ * the leading markers ([V]/[T]/[?]/[!], [TOFU], [FILE_OFFER]) as a control
+ * channel. A peer that embeds a raw newline in its display name, message body
+ * or file name could therefore forge an entire line and fake a "verified"
+ * badge or impersonate another participant. Neutralising control bytes keeps
+ * one message on exactly one line, defuses terminal escape sequences, and also
+ * stops newlines from being written into the line-based known_keys store.
+ * UTF-8 (>= 0x80) is preserved untouched.
+ */
+static void sanitize_display_inplace(char *s, size_t len) {
+    if (!s) return;
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (c < 0x20 || c == 0x7F) s[i] = '?';
+    }
+}
+
 void handle_file_message(const uint8_t *plain, size_t plen, message_type_t type,
                         const char *room_in, const char *sender_name,
                         const uint8_t *key, const char *my_name) {
@@ -697,10 +1318,20 @@ void handle_file_message(const uint8_t *plain, size_t plen, message_type_t type,
     switch (type) {
         case MSG_TYPE_FILE_START: {
             const uint8_t *p = plain;
+            /* Bounds-check every field against plen before reading it. fn_len is
+             * attacker-controlled (up to 65535) and used to be memcpy'd straight
+             * into this 1024-byte stack buffer by any room participant, which
+             * smashed the stack. The trailing check also covers the file_size
+             * and crc reads below. */
+            if (plen < 2) return;
             uint16_t fn_len = rd_u16(p); p += 2;
+            if (fn_len >= MAX_FILENAME) return;
+            if (plen < (size_t)2 + fn_len + 4 + 4) return;
             char orig_filename[MAX_FILENAME];
             memcpy(orig_filename, p, fn_len); p += fn_len;
             orig_filename[fn_len] = '\0';
+            /* Printed in the [FILE_OFFER] line the GUI parses - see above. */
+            sanitize_display_inplace(orig_filename, fn_len);
 
             const char *basename = strrchr(orig_filename, '\\');
             if (!basename) basename = strrchr(orig_filename, '/');
@@ -721,6 +1352,9 @@ void handle_file_message(const uint8_t *plain, size_t plen, message_type_t type,
             char temp_path[MAX_FILENAME];
             snprintf(temp_path, sizeof(temp_path), "Downloads/.fear_temp_%s", basename);
 
+            char who[MAX_NAME + IDENTITY_FINGERPRINT_LEN + 8];
+            sender_label(sender_name, who, sizeof who);
+
             /* Print offer for user (console) and GUI parsing */
             char size_str[64];
             if (file_size >= 1048576) {
@@ -731,7 +1365,7 @@ void handle_file_message(const uint8_t *plain, size_t plen, message_type_t type,
                 snprintf(size_str, sizeof(size_str), "%zu B", file_size);
             }
             printf("[FILE_OFFER] %s wants to send \"%s\" (%s). Type /accept [path] or /reject\n",
-                   sender_name, basename, size_str);
+                   who, basename, size_str);
             fflush(stdout);
 
             receive_file(temp_path, file_size, NULL, 0);
@@ -769,50 +1403,665 @@ void handle_file_message(const uint8_t *plain, size_t plen, message_type_t type,
     }
 }
 
-int send_ciphertext(sock_t s, const char *room, const char *name, const uint8_t *key,
-                   const uint8_t *plaintext, size_t plen) {
+/* Defined below; declared here because the invite helper needs it. */
+int send_ciphertext_typed(sock_t s, const char *room, const char *name,
+                          const uint8_t *key, const uint8_t *plaintext,
+                          size_t plen, uint8_t msg_type);
+
+/**
+ * Announce a call to the room.
+ *
+ * The initiator draws the call_id here. Every media key is bound to it, so
+ * it has to be fresh per call: a value derived from the room key would be
+ * the same for every call in that room and a recording of one would replay
+ * into the next. It is printed on stdout because the caller - a person or
+ * the GUI - has to hand it to the media binary as --call-id.
+ *
+ * `arg` is "[host] [port] [video]", all optional. Without a host the invite
+ * carries no direct hint and the call goes through the relay, which is also
+ * the group case.
+ */
+static void handle_invite_command(const char *arg, sock_t s,
+                                  const char *room, const char *name,
+                                  const uint8_t *key) {
+    ci_invite_t inv;
+    memset(&inv, 0, sizeof inv);
+    inv.flags = CI_FLAG_AUDIO;
+
+    char host[CI_MAX_HOST + 1] = {0};
+    unsigned port = 0;
+    char extra[16] = {0};
+    int have_id = 0;
+
+    /* An explicit id may come first. The GUI needs it: it has to hand the
+     * same value to the media process, and waiting for this command to
+     * report one back would be a race against the call starting. */
+    if (arg && *arg) {
+        char maybe_id[64] = {0};
+        if (sscanf(arg, "%63s", maybe_id) == 1 &&
+            mk_call_id_parse(maybe_id, inv.call_id) == 0) {
+            have_id = 1;
+            arg += strlen(maybe_id);
+            while (*arg == ' ') arg++;
+        }
+    }
+
+    if (arg && *arg) {
+        int n = sscanf(arg, "%255s %u %15s", host, &port, extra);
+        if (n >= 1 && strcmp(host, "video") == 0) {
+            inv.flags |= CI_FLAG_VIDEO;
+            host[0] = '\0';
+        }
+        if (strcmp(extra, "video") == 0) inv.flags |= CI_FLAG_VIDEO;
+        if (port > 65535) {
+            printf("[invite] port out of range\n");
+            fflush(stdout);
+            return;
+        }
+    }
+    inv.port = (uint16_t)port;
+    snprintf(inv.host, sizeof inv.host, "%s", host);
+
+    if (!have_id) randombytes_buf(inv.call_id, sizeof inv.call_id);
+
+    uint8_t payload[CI_MAX_BYTES];
+    size_t plen = 0;
+    ci_status_t st = ci_build(&inv, payload, sizeof payload, &plen);
+    if (st != CI_OK) {
+        printf("[invite] cannot build invite: %s\n", ci_strerror(st));
+        fflush(stdout);
+        return;
+    }
+
+    if (send_ciphertext_typed(s, room, name, key, payload, plen,
+                              (uint8_t)MSG_TYPE_CALL_INVITE) < 0) {
+        printf("[invite] send failed\n");
+        fflush(stdout);
+        return;
+    }
+
+    char hex[2 * MK_CALLID_BYTES + 1];
+    for (size_t i = 0; i < MK_CALLID_BYTES; i++)
+        snprintf(hex + 2 * i, 3, "%02x", inv.call_id[i]);
+    printf("[CALL_INVITE_SENT] %s %s %u %s\n", hex,
+           inv.host[0] ? inv.host : "-", inv.port,
+           (inv.flags & CI_FLAG_VIDEO) ? "video" : "audio");
+    fflush(stdout);
+}
+
+/**
+ * The room key as a generation. There is one for now and its version is zero;
+ * rotation is what will make this a real lookup, and everything that reads a
+ * frame already takes a set rather than a key so that day changes callers
+ * here and nothing below them.
+ */
+/**
+ * Draw a new K_room and hand it to everyone present.
+ *
+ * The bundle is sealed under the generation being replaced, not the new one:
+ * nobody has the new key yet, and a message nobody can open is not a way to
+ * distribute it. Installing ours therefore happens after the bundle is on
+ * the wire, so that we are still able to seal it.
+ *
+ * A member present without an identity gets no entry - there is no key to
+ * address one to. They keep reading under the old generation until it
+ * expires, and then they are out of the room, which is what having no
+ * identity in a room that rotates means.
+ */
+static void rotation_rotate_now(sock_t s, const char *room, const char *myname,
+                                const uint8_t *active_key) {
+    if (!g_has_identity || !g_rk_ready) return;
+
+    uint8_t recipients[ROSTER_MAX][32];
+    size_t nrec = 0;
+    for (int i = 0; i < g_roster_count && nrec < ROSTER_MAX; i++) {
+        if (!g_roster[i].present || !g_roster[i].has_identity) continue;
+        memcpy(recipients[nrec++], g_roster[i].pk, 32);
+    }
+    if (nrec == 0) return;
+
+    uint8_t k_new[ROTATION_KEY_BYTES];
+    randombytes_buf(k_new, sizeof k_new);
+
+    uint16_t next = (uint16_t)(g_rk.current_version + 1);
+    /* The version is what tells a rotation from a replay, so wrapping it
+     * would make an old bundle look current. Sixty-five thousand membership
+     * changes in one room is somebody else's problem, and refusing is the
+     * honest answer to it. */
+    if (next < g_rk.current_version) {
+        fprintf(stderr, "[rotation] generation counter exhausted; not rotating\n");
+        sodium_memzero(k_new, sizeof k_new);
+        return;
+    }
+
+    uint8_t bundle[RB_HEADER_BYTES + ROSTER_MAX * ROTATION_ENTRY_BYTES];
+    size_t blen = 0;
+    rb_status_t rs = rb_build(room, next, k_new, g_identity_sk, g_identity_pk,
+                              (const uint8_t (*)[32])recipients, nrec,
+                              bundle, sizeof bundle, &blen);
+    if (rs != RB_OK) {
+        fprintf(stderr, "[rotation] could not build a bundle: %s\n", rb_strerror(rs));
+        sodium_memzero(k_new, sizeof k_new);
+        return;
+    }
+
+    /* Broadcast, not sealed under K_room. Every entry is already sealed to
+     * one member's identity key, so there is nothing here the server could
+     * read - and a member who has just joined has no current K_room to open
+     * an envelope with, which is exactly the member a rotation has to
+     * reach. */
+    (void)active_key;
+    if (send_service_frame(s, room, myname, (uint8_t)MSG_TYPE_ROTATION,
+                           bundle, blen) < 0) {
+        fprintf(stderr, "[rotation] could not send the bundle\n");
+        sodium_memzero(k_new, sizeof k_new);
+        return;
+    }
+
+    rk_install(&g_rk, next, k_new, (uint64_t)time(NULL));
+    sodium_memzero(k_new, sizeof k_new);
+    printf("[rotation] room key is now generation %u, sealed for %zu member(s)\n",
+           (unsigned)next, nrec);
+    fflush(stdout);
+}
+
+/**
+ * Rotate if a membership change is waiting and the room has settled.
+ *
+ * Called from the receive loop, so it costs nothing when nothing is pending.
+ */
+static void rotation_tick(sock_t s, const char *room, const char *myname,
+                          const uint8_t *active_key) {
+    const int dbg = g_rot_debug;
+
+    if (!g_rot_pending || !g_has_identity || !g_rk_ready) {
+        if (dbg && g_rot_pending) {
+            printf("[rot-dbg] pending but idle: has_identity=%d rk_ready=%d\n",
+                   g_has_identity, g_rk_ready);
+            fflush(stdout);
+        }
+        return;
+    }
+
+    uint64_t now = rot_now_ms();
+    if (now < g_rot_settle_at) return;
+    if (!roster_identities_complete() && now < g_rot_deadline) {
+        if (dbg) {
+            printf("[rot-dbg] waiting: roster incomplete, %llu ms of deadline left\n",
+                   (unsigned long long)(g_rot_deadline - now));
+            fflush(stdout);
+        }
+        return;
+    }
+
+    g_rot_pending = 0;
+
+    rk_member_t members[ROSTER_MAX];
+    size_t nmem = roster_continuing(members, ROSTER_MAX);
+
+    if (dbg) {
+        char mine[24];
+        identity_pk_fingerprint(g_identity_pk, mine);
+        printf("[rot-dbg] electing over %zu continuing member(s), complete=%d, me=%s\n",
+               nmem, roster_identities_complete(), mine);
+        for (size_t i = 0; i < nmem; i++) {
+            char fp[24];
+            identity_pk_fingerprint(members[i].pk, fp);
+            printf("[rot-dbg]   member %zu: has_identity=%d pk=%s %s%s\n",
+                   i, members[i].has_identity, fp,
+                   members[i].has_identity &&
+                   memcmp(members[i].pk, g_identity_pk, IDENTITY_PK_BYTES) == 0
+                       ? "(me)" : "",
+                   members[i].has_identity &&
+                   memcmp(members[i].pk, g_identity_pk, IDENTITY_PK_BYTES) < 0
+                       ? "(lower than me)" : "");
+        }
+        printf("[rot-dbg] full roster (%d entries):\n", g_roster_count);
+        for (int i = 0; i < g_roster_count; i++) {
+            char fp[24];
+            identity_pk_fingerprint(g_roster[i].pk, fp);
+            printf("[rot-dbg]   tag=%s present=%d was_present=%d has_identity=%d pk=%s\n",
+                   g_roster[i].tag, g_roster[i].present, g_roster[i].was_present,
+                   g_roster[i].has_identity, fp);
+        }
+        fflush(stdout);
+    }
+
+    /* Every member reaches this same answer from the same roster, so exactly
+     * one of them goes on. */
+    if (rk_is_rotator(members, nmem, g_identity_pk)) {
+        rotation_rotate_now(s, room, myname, active_key);
+    } else if (dbg) {
+        printf("[rot-dbg] verdict: not me, standing by\n");
+        fflush(stdout);
+    }
+}
+
+/** Ящик, за которым следим, по его комнате. NULL если такого нет. */
+static inbox_watch_t *inbox_find_room(const char *room) {
+    for (int i = 0; i < g_inbox_count; i++) {
+        if (strcmp(g_inbox[i].room, room) == 0) return &g_inbox[i];
+    }
+    return NULL;
+}
+
+/** …и по адресу, чтобы понять, каким ключом открывать пришедшее письмо.
+ *  Только наш входящий: письма, которые мы сами положили собеседнику, не наши. */
+static inbox_watch_t *inbox_find_addr(const uint8_t *addr) {
+    for (int i = 0; i < g_inbox_count; i++) {
+        if (memcmp(g_inbox[i].addr_in, addr, IDENTITY_INBOX_ADDR_BYTES) == 0) {
+            return &g_inbox[i];
+        }
+    }
+    return NULL;
+}
+
+/**
+ * Взять ящики пары под наблюдение. Повторный вызов обновляет ключ.
+ *
+ * Ящиков два, по одному на направление (identity_inbox_addr): свой - с
+ * нашим открытым ключом, его и спрашиваем; ящик собеседника - с его, туда
+ * пишем. Поэтому без собственной личности ящиком не воспользоваться.
+ */
+static int inbox_watch(const char *room, const uint8_t k_pm[KS_KEY_BYTES],
+                       const uint8_t their_pk[IDENTITY_PK_BYTES]) {
+    if (!g_has_identity) return -1;
+    uint8_t in[IDENTITY_INBOX_ADDR_BYTES], out[IDENTITY_INBOX_ADDR_BYTES];
+    if (identity_inbox_addr(k_pm, g_identity_pk, in) != 0 ||
+        identity_inbox_addr(k_pm, their_pk, out) != 0) {
+        return -1;
+    }
+    inbox_watch_t *w = inbox_find_room(room);
+    if (!w) {
+        if (g_inbox_count >= INBOX_MAX_WATCH) return -1;
+        w = &g_inbox[g_inbox_count++];
+        snprintf(w->room, sizeof w->room, "%s", room);
+    }
+    memcpy(w->k_pm, k_pm, KS_KEY_BYTES);
+    memcpy(w->addr_in, in, sizeof in);
+    memcpy(w->addr_out, out, sizeof out);
+    /* Спросить вскоре, а не через двадцать секунд: человек только что открыл
+     * приложение и ждёт свою почту. «Вскоре», а не «сразу»: GUI регистрирует
+     * ящики пачкой, и пачка должна дать один запрос, а не по запросу на
+     * контакт. */
+    const uint64_t soon = rot_now_ms() + 300;
+    if (g_inbox_next_poll == 0 || g_inbox_next_poll > soon) g_inbox_next_poll = soon;
+    return 0;
+}
+
+/**
+ * Положить сообщение в ящик собеседника.
+ *
+ * Печатью занимается тот же cf_seal, что и для обычных сообщений, но имя
+ * отправителя в связанных данных фиксировано, а настоящее едет внутри: иначе
+ * получателю пришлось бы знать имя заранее, чтобы открыть письмо, а серверу
+ * это имя пришлось бы показать.
+ */
+static int inbox_send(sock_t s, const inbox_watch_t *w, const char *myname,
+                      const uint8_t *text, size_t tlen) {
+    const size_t namelen = strlen(myname);
+    if (namelen > 255) return -1;
+
+    size_t plen = 1 + namelen + tlen;
+    uint8_t *plain = (uint8_t *)malloc(plen);
+    if (!plain) return -1;
+    plain[0] = (uint8_t)namelen;
+    memcpy(plain + 1, myname, namelen);
+    memcpy(plain + 1 + namelen, text, tlen);
+
+    uint8_t nonce[CRYPTO_NPUBBYTES];
+    randombytes_buf(nonce, sizeof nonce);
+
+    cf_key_t ck;
+    ck.version = 0;
+    memcpy(ck.key, w->k_pm, KS_KEY_BYTES);
+
+    size_t cmax = plen + CF_OVERHEAD_BYTES;
+    uint8_t *cipher = (uint8_t *)malloc(cmax);
+    if (!cipher) { free(plain); return -1; }
+
+    size_t clen = 0;
+    cf_status_t st = cf_seal(&ck, w->room, "inbox", plain, plen, nonce,
+                             cipher, cmax, &clen);
+    sodium_memzero(plain, plen);
+    free(plain);
+    if (st != CF_OK) { free(cipher); return -1; }
+
+    /* [addr(32)][nonce(12)][sealed] - nonce едет с письмом, потому что
+     * открывать его будут не сейчас и не на этом соединении. */
+    size_t blen = IDENTITY_INBOX_ADDR_BYTES + CRYPTO_NPUBBYTES + clen;
+    uint8_t *body = (uint8_t *)malloc(blen);
+    if (!body) { free(cipher); return -1; }
+    memcpy(body, w->addr_out, IDENTITY_INBOX_ADDR_BYTES);
+    memcpy(body + IDENTITY_INBOX_ADDR_BYTES, nonce, CRYPTO_NPUBBYTES);
+    memcpy(body + IDENTITY_INBOX_ADDR_BYTES + CRYPTO_NPUBBYTES, cipher, clen);
+    free(cipher);
+
+    int rc = send_service_frame(s, g_wire_room ? g_wire_room : w->room, myname,
+                                (uint8_t)MSG_TYPE_INBOX_PUT, body, blen);
+    free(body);
+    return rc;
+}
+
+/** Спросить все ящики разом. */
+static void inbox_poll(sock_t s, const char *room, const char *myname) {
+    if (g_inbox_count == 0) return;
+
+    size_t blen = 2 + (size_t)g_inbox_count * IDENTITY_INBOX_ADDR_BYTES;
+    uint8_t *body = (uint8_t *)malloc(blen);
+    if (!body) return;
+    wr_u16(body, (uint16_t)g_inbox_count);
+    for (int i = 0; i < g_inbox_count; i++) {
+        memcpy(body + 2 + (size_t)i * IDENTITY_INBOX_ADDR_BYTES,
+               g_inbox[i].addr_in, IDENTITY_INBOX_ADDR_BYTES);
+    }
+    send_service_frame(s, room, myname, (uint8_t)MSG_TYPE_INBOX_FETCH, body, blen);
+    free(body);
+}
+
+/** Подтвердить, что письма получены, - только после того, как они показаны. */
+static void inbox_ack(sock_t s, const char *myname, const inbox_watch_t *w,
+                      const int64_t *ids, size_t n) {
+    if (n == 0) return;
+    size_t blen = IDENTITY_INBOX_ADDR_BYTES + 2 + n * 8;
+    uint8_t *body = (uint8_t *)malloc(blen);
+    if (!body) return;
+    memcpy(body, w->addr_in, IDENTITY_INBOX_ADDR_BYTES);
+    wr_u16(body + IDENTITY_INBOX_ADDR_BYTES, (uint16_t)n);
+    uint8_t *p = body + IDENTITY_INBOX_ADDR_BYTES + 2;
+    for (size_t i = 0; i < n; i++) {
+        for (int b = 0; b < 8; b++) *p++ = (uint8_t)((ids[i] >> (8 * b)) & 0xFF);
+    }
+    send_service_frame(s, g_wire_room ? g_wire_room : w->room, myname,
+                       (uint8_t)MSG_TYPE_INBOX_DELETE, body, blen);
+    free(body);
+}
+
+/** Разобрать ответ сервера: письма и объявленный срок хранения. */
+static void inbox_handle_result(sock_t s, const char *myname,
+                                const uint8_t *p, size_t len) {
+    if (len < 1 + 4 + 2) return;
+    const uint8_t status = p[0];
+    g_inbox_ttl = rd_u32(p + 1);
+    g_inbox_ttl_known = 1;
+
+    if (status != 0) {
+        /* Единственный статус, о котором стоит сказать вслух: сервер не
+         * хранит ничего, и сообщение никуда не легло. Молчать тут нельзя -
+         * отправитель будет думать, что доставил. */
+        if (status == 1) {
+            printf("[inbox] this relay stores nothing - the message was not "
+                   "delivered because the recipient is offline\n");
+        } else if (status == 3) {
+            printf("[inbox] the recipient's mailbox is full\n");
+        }
+        fflush(stdout);
+        return;
+    }
+
+    uint16_t count = rd_u16(p + 5);
+    const uint8_t *q = p + 7;
+    const uint8_t *end = p + len;
+
+    for (uint16_t i = 0; i < count; i++) {
+        if ((size_t)(end - q) < 8 + IDENTITY_INBOX_ADDR_BYTES + 4) return;
+        int64_t id = 0;
+        for (int b = 0; b < 8; b++) id |= ((int64_t)q[b]) << (8 * b);
+        q += 8;
+        const uint8_t *addr = q; q += IDENTITY_INBOX_ADDR_BYTES;
+        uint32_t clen = rd_u32(q); q += 4;
+        if ((size_t)(end - q) < clen) return;
+        const uint8_t *cipher = q; q += clen;
+
+        inbox_watch_t *w = inbox_find_addr(addr);
+        if (!w) continue;                       /* не наш ящик */
+        if (clen < CRYPTO_NPUBBYTES) continue;
+        if (inbox_seen(id)) {                   /* уже показано - пришло вторым ответом */
+            inbox_ack(s, myname, w, &id, 1);
+            continue;
+        }
+
+        const uint8_t *nonce = cipher;
+        const uint8_t *sealed = cipher + CRYPTO_NPUBBYTES;
+        const size_t   slen = clen - CRYPTO_NPUBBYTES;
+
+        uint8_t *plain = (uint8_t *)malloc(slen);
+        if (!plain) continue;
+
+        cf_key_t ck;
+        ck.version = 0;
+        memcpy(ck.key, w->k_pm, KS_KEY_BYTES);
+        size_t plen = 0;   /* size_t, как в cf_open: GCC 14+ иначе не соберёт */
+        cf_status_t st = cf_open(&ck, 1, w->room, "inbox", sealed, slen, nonce,
+                                 plain, slen, &plen);
+        if (st != CF_OK || plen < 1) { free(plain); continue; }
+
+        const size_t namelen = plain[0];
+        if (namelen + 1 > plen) { free(plain); continue; }
+        char sender[MAX_NAME];
+        size_t n = namelen < sizeof sender - 1 ? namelen : sizeof sender - 1;
+        memcpy(sender, plain + 1, n);
+        sender[n] = '\0';
+        sanitize_display_inplace(sender, n);
+
+        const uint8_t *text = plain + 1 + namelen;
+        const size_t tlen = plen - 1 - namelen;
+
+        /* Комната печатается вместе с сообщением: письмо пришло не в ту
+         * комнату, в которой мы сидим, и интерфейсу нужно знать, куда его
+         * положить. */
+        printf("[INBOX] %s %s: %.*s\n", w->room, sender, (int)tlen, (const char *)text);
+        fflush(stdout);
+        inbox_mark_seen(id);
+
+        sodium_memzero(plain, slen);
+        free(plain);
+
+        inbox_ack(s, myname, w, &id, 1);
+    }
+}
+
+/**
+ * /inbox-add <комната> <ключ-пары-base64url> <открытый-ключ-собеседника-base64url>
+ *
+ * Список контактов ведёт интерфейс, а не консольный клиент, поэтому ключи
+ * приходят снаружи. Ключ пары - он же ключ личной комнаты, так что
+ * интерфейс уже умеет его выводить; открытый ключ собеседника нужен, чтобы
+ * найти его ящик (см. inbox_watch).
+ */
+static void handle_inbox_add(const char *arg) {
+    if (!arg) return;
+    char room[MAX_ROOM];
+    char keyb64[128];
+    char pkb64[128];
+    /* Ширина полей написана числом, а буферы под неё проверены здесь же:
+     * иначе изменение MAX_ROOM однажды сделало бы запись мимо буфера. */
+    _Static_assert(MAX_ROOM > 200, "room buffer smaller than the scan width");
+    if (sscanf(arg, "%200s %127s %127s", room, keyb64, pkb64) != 3) {
+        printf("[inbox] usage: /inbox-add <room> <key-base64url> <peer-pk-base64url>\n");
+        fflush(stdout);
+        return;
+    }
+    uint8_t key[KS_KEY_BYTES];
+    uint8_t their_pk[IDENTITY_PK_BYTES];
+    size_t klen = 0, pklen = 0;
+    if (sodium_base642bin(key, sizeof key, keyb64, strlen(keyb64), NULL, &klen,
+                          NULL, sodium_base64_VARIANT_URLSAFE_NO_PADDING) != 0 ||
+        klen != KS_KEY_BYTES ||
+        sodium_base642bin(their_pk, sizeof their_pk, pkb64, strlen(pkb64), NULL, &pklen,
+                          NULL, sodium_base64_VARIANT_URLSAFE_NO_PADDING) != 0 ||
+        pklen != IDENTITY_PK_BYTES) {
+        printf("[inbox] bad key\n");
+        sodium_memzero(key, sizeof key);
+        fflush(stdout);
+        return;
+    }
+    if (inbox_watch(room, key, their_pk) != 0) {
+        printf(g_has_identity ? "[inbox] cannot watch more mailboxes\n"
+                              : "[inbox] no identity - cannot use a mailbox\n");
+    } else {
+        printf("[inbox] watching %s\n", room);
+    }
+    sodium_memzero(key, sizeof key);
+    fflush(stdout);
+}
+
+/** Пора ли снова спросить почту. */
+static void inbox_tick(sock_t s, const char *room, const char *myname) {
+    if (g_inbox_count == 0) return;
+    const uint64_t now = rot_now_ms();
+    if (now < g_inbox_next_poll) return;
+    g_inbox_next_poll = now + INBOX_POLL_MS;
+    inbox_poll(s, room, myname);
+}
+
+/**
+ * Некому доставить прямо сейчас?
+ *
+ * Это личная комната, и собеседника в ней нет. Тогда сообщение идёт в его
+ * ящик, а не в пустоту: сервер рассылает только тем, кто в комнате, и не
+ * хранит ничего сам.
+ */
+static int inbox_should_use(const char *room) {
+    if (strncmp(room, "pm:", 3) != 0) return 0;
+    if (!inbox_find_room(room)) return 0;
+    for (int i = 0; i < g_roster_count; i++) {
+        if (g_roster[i].present && strcmp(g_roster[i].tag, g_name ? g_name : "") != 0) {
+            return 0;                    /* кто-то тут есть - доставим живьём */
+        }
+    }
+    return 1;
+}
+
+/** Take in a rotation somebody else sent. */
+static void rotation_handle_bundle(const char *room, const char *sender,
+                                   const uint8_t *payload, size_t plen) {
+    if (!g_has_identity || !g_rk_ready) return;
+
+    rb_view_t view;
+    rb_status_t rs = rb_parse(payload, plen, &view);
+    if (rs != RB_OK) {
+        fprintf(stderr, "[rotation] ignoring a bundle from %s: %s\n",
+                sender, rb_strerror(rs));
+        return;
+    }
+
+    /* Whoever sealed it has to be the member this room expects to rotate.
+     * Without this check any member could rotate at any time, which is a
+     * denial of service dressed as a key update - and with two members
+     * rotating at once the room would split. rb_open_for authenticates the
+     * sender; this decides whether that sender had the right. */
+    /* An election needs a roster, and a member who has just arrived may not
+     * have one yet - the announcements that build it can have been made
+     * before it was listening. Refusing then would lock it out of the room it
+     * has just joined, so the check is made only when we actually know who is
+     * in the room. Until then the entry being sealed to our identity key and
+     * authenticated as coming from its sender is what we have, and the only
+     * thing going unchecked is whether that sender was the member the room
+     * elected - which is not something we are in any position to check. */
+    rk_member_t members[ROSTER_MAX];
+    size_t nmem = roster_continuing(members, ROSTER_MAX);
+    if (g_have_before && roster_identities_complete() &&
+        !rk_is_rotator(members, nmem, view.sender_pk)) {
+        fprintf(stderr, "[rotation] ignoring a bundle from %s: not this room's rotator\n",
+                sender);
+        return;
+    }
+
+    /* Only ever forward. An older generation arriving late is a replay. */
+    if (view.key_version <= g_rk.current_version) return;
+
+    uint8_t k_new[ROTATION_KEY_BYTES];
+    rs = rb_open_for(&view, room, g_identity_sk, g_identity_pk, k_new);
+    if (rs != RB_OK) {
+        fprintf(stderr, "[rotation] could not open our entry from %s: %s\n",
+                sender, rb_strerror(rs));
+        return;
+    }
+
+    rk_install(&g_rk, view.key_version, k_new, (uint64_t)time(NULL));
+    sodium_memzero(k_new, sizeof k_new);
+    printf("[rotation] room key is now generation %u, from %s\n",
+           (unsigned)view.key_version, sender);
+    fflush(stdout);
+}
+
+static void chat_keyring(const uint8_t *k_room, cf_key_t *out) {
+    /* Before the first rotation - and in the GUI's short-lived helper
+     * processes, which never see one - the room key is generation zero and
+     * the store is empty. */
+    if (g_rk_ready) {
+        const cf_key_t *cur = rk_current(&g_rk);
+        if (cur) { *out = *cur; return; }
+    }
+    out->version = 0;
+    memcpy(out->key, k_room, KS_KEY_BYTES);
+}
+
+/**
+ * Every generation still readable, current first.
+ *
+ * A rotation does not stop what was already in flight under the generation
+ * it replaces, so the receive path asks for the set rather than the key.
+ */
+static size_t chat_keyring_all(const uint8_t *k_room, cf_key_t *out, size_t cap) {
+    if (g_rk_ready) {
+        rk_expire(&g_rk, (uint64_t)time(NULL));
+        size_t n = rk_ring(&g_rk, out, cap);
+        if (n > 0) return n;
+    }
+    if (cap == 0) return 0;
+    chat_keyring(k_room, &out[0]);
+    return 1;
+}
+
+int send_ciphertext_typed(sock_t s, const char *room, const char *name, const uint8_t *key,
+                   const uint8_t *plaintext, size_t plen, uint8_t msg_type) {
     uint16_t room_len = (uint16_t)strlen(room);
     uint16_t name_len = (uint16_t)strlen(name);
     uint8_t nonce[CRYPTO_NPUBBYTES];
     randombytes_buf(nonce, sizeof nonce);
 
-    size_t ad_len = room_len + name_len + 2 + 2;
-    uint8_t *ad = (uint8_t*)malloc(ad_len);
-    if (!ad) return -1;
-    uint8_t *w = ad;
-    wr_u16(w, room_len); w += 2; memcpy(w, room, room_len); w += room_len;
-    wr_u16(w, name_len); w += 2; memcpy(w, name, name_len);
 
-    size_t cmax = plen + CRYPTO_ABYTES;
+    /* Room for the epoch header the seal puts in front of the ciphertext. */
+    size_t cmax = plen + CF_OVERHEAD_BYTES;
     uint8_t *cipher = (uint8_t*)malloc(cmax);
-    if (!cipher) { free(ad); return -1; }
-    
-    unsigned long long clen = 0;
-    if (aes_gcm_encrypt(plaintext, plen, ad, ad_len, nonce, key, cipher, &clen) != 0) {
-        free(ad); free(cipher);
+    if (!cipher) return -1;
+
+    size_t clen = 0;
+    cf_key_t ck;
+    chat_keyring(key, &ck);
+    if (cf_seal(&ck, room, name, plaintext, plen, nonce, cipher, cmax, &clen) != CF_OK) {
+        free(cipher);
         return -1;
     }
 
     size_t flen = 2 + room_len + 2 + name_len + 2 + CRYPTO_NPUBBYTES + 1 + 4 + (size_t)clen;
     uint8_t *frame = (uint8_t*)malloc(flen);
-    if (!frame) { free(ad); free(cipher); return -1; }
-    w = frame;
+    if (!frame) { free(cipher); return -1; }
+    uint8_t *w = frame;
     wr_u16(w, room_len); w += 2; memcpy(w, room, room_len); w += room_len;
     wr_u16(w, name_len); w += 2; memcpy(w, name, name_len); w += name_len;
     wr_u16(w, (uint16_t)CRYPTO_NPUBBYTES); w += 2;
     memcpy(w, nonce, CRYPTO_NPUBBYTES); w += CRYPTO_NPUBBYTES;
 
-    *w++ = (uint8_t)MSG_TYPE_TEXT;
+    *w++ = msg_type;
 
     wr_u32(w, (uint32_t)clen); w += 4;
     memcpy(w, cipher, clen);
 
     int rc = send_all(s, frame, flen);
 
-    free(ad);
     free(cipher);
     free(frame);
     return rc;
+}
+
+/** Ordinary chat text. Kept so the call sites that predate typed sends do
+ *  not have to name a type they never vary. */
+int send_ciphertext(sock_t s, const char *room, const char *name, const uint8_t *key,
+                    const uint8_t *plaintext, size_t plen) {
+    return send_ciphertext_typed(s, room, name, key, plaintext, plen, (uint8_t)MSG_TYPE_TEXT);
 }
 
 /**
@@ -848,27 +2097,22 @@ static int send_signed_ciphertext(sock_t s, const char *room, const char *name,
     uint8_t nonce[CRYPTO_NPUBBYTES];
     randombytes_buf(nonce, sizeof nonce);
 
-    size_t ad_len = room_len + name_len + 2 + 2;
-    uint8_t *ad = (uint8_t*)malloc(ad_len);
-    if (!ad) { free(signed_plain); return -1; }
-    uint8_t *w = ad;
-    wr_u16(w, room_len); w += 2; memcpy(w, room, room_len); w += room_len;
-    wr_u16(w, name_len); w += 2; memcpy(w, name, name_len);
-
-    size_t cmax = signed_plen + CRYPTO_ABYTES;
+    size_t cmax = signed_plen + CF_OVERHEAD_BYTES;
     uint8_t *cipher = (uint8_t*)malloc(cmax);
-    if (!cipher) { free(ad); free(signed_plain); return -1; }
+    if (!cipher) { free(signed_plain); return -1; }
 
-    unsigned long long clen = 0;
-    if (aes_gcm_encrypt(signed_plain, signed_plen, ad, ad_len, nonce, key, cipher, &clen) != 0) {
-        free(ad); free(cipher); free(signed_plain);
+    size_t clen = 0;
+    cf_key_t ck;
+    chat_keyring(key, &ck);
+    if (cf_seal(&ck, room, name, signed_plain, signed_plen, nonce, cipher, cmax, &clen) != CF_OK) {
+        free(cipher); free(signed_plain);
         return -1;
     }
 
     size_t flen = 2 + room_len + 2 + name_len + 2 + CRYPTO_NPUBBYTES + 1 + 4 + (size_t)clen;
     uint8_t *frame = (uint8_t*)malloc(flen);
-    if (!frame) { free(ad); free(cipher); free(signed_plain); return -1; }
-    w = frame;
+    if (!frame) { free(cipher); free(signed_plain); return -1; }
+    uint8_t *w = frame;
     wr_u16(w, room_len); w += 2; memcpy(w, room, room_len); w += room_len;
     wr_u16(w, name_len); w += 2; memcpy(w, name, name_len); w += name_len;
     wr_u16(w, (uint16_t)CRYPTO_NPUBBYTES); w += 2;
@@ -879,7 +2123,6 @@ static int send_signed_ciphertext(sock_t s, const char *room, const char *name,
 
     int rc = send_all(s, frame, flen);
 
-    free(ad);
     free(cipher);
     free(frame);
     free(signed_plain);
@@ -887,47 +2130,75 @@ static int send_signed_ciphertext(sock_t s, const char *room, const char *name,
 }
 
 /**
- * Send identity announcement on room join.
- * Plaintext layout: [pk(32)][sig_over_name(64)]
+ * Say who we are, inside the room encryption.
+ *
+ * Раскладка: [pk(32)][sig(64)][name_len(2)][name].
+ *
+ * Это единственное место, где отображаемое имя вообще уезжает с машины, и
+ * уезжает оно уже запечатанным. Подпись покрывает не одно имя, а метку
+ * сессии вместе с ним: иначе чужой анонс можно было бы взять целиком и
+ * повторить под своей меткой, получив вместе с ним и имя.
+ *
+ * Имя берётся из g_display_name, а не из аргумента, намеренно. Метка и имя
+ * здесь оба const char *, и передай вызывающий одно вместо другого - код
+ * собрался бы, а комната увидела бы нас под меткой. Своё имя у процесса
+ * ровно одно, спрашивать его у места вызова незачем.
  */
 static int send_identity_announce(sock_t s, const char *room, const char *name,
                                   const uint8_t *key,
                                   const uint8_t id_sk[IDENTITY_SK_BYTES],
                                   const uint8_t id_pk[IDENTITY_PK_BYTES]) {
-    uint8_t plain[IDENTITY_PK_BYTES + IDENTITY_SIG_BYTES];
+    const char *display = g_display_name ? g_display_name : "";
+    const size_t dlen = strlen(display);
+    if (dlen >= MAX_NAME) return -1;
+
+    uint8_t signed_bytes[64 + IDENTITY_SESSION_TAG_LEN + MAX_NAME];
+    size_t slen = identity_announce_signed_bytes(name, display,
+                                                 signed_bytes, sizeof signed_bytes);
+    if (slen == 0) return -1;
+
+    uint8_t plain[IDENTITY_PK_BYTES + IDENTITY_SIG_BYTES + 2 + MAX_NAME];
     memcpy(plain, id_pk, IDENTITY_PK_BYTES);
-    if (identity_sign((const uint8_t*)name, strlen(name), id_sk,
+    if (identity_sign(signed_bytes, slen, id_sk,
                       plain + IDENTITY_PK_BYTES) != 0) {
         return -1;
     }
+    wr_u16(plain + IDENTITY_PK_BYTES + IDENTITY_SIG_BYTES, (uint16_t)dlen);
+    memcpy(plain + IDENTITY_PK_BYTES + IDENTITY_SIG_BYTES + 2, display, dlen);
 
     uint16_t room_len = (uint16_t)strlen(room);
     uint16_t name_len = (uint16_t)strlen(name);
     uint8_t nonce[CRYPTO_NPUBBYTES];
     randombytes_buf(nonce, sizeof nonce);
 
-    size_t ad_len = room_len + name_len + 2 + 2;
-    uint8_t *ad = (uint8_t*)malloc(ad_len);
-    if (!ad) return -1;
-    uint8_t *w = ad;
-    wr_u16(w, room_len); w += 2; memcpy(w, room, room_len); w += room_len;
-    wr_u16(w, name_len); w += 2; memcpy(w, name, name_len);
-
-    size_t plen = sizeof(plain);
-    size_t cmax = plen + CRYPTO_ABYTES;
+    size_t plen = IDENTITY_PK_BYTES + IDENTITY_SIG_BYTES + 2 + dlen;
+    size_t cmax = plen + CF_OVERHEAD_BYTES;
     uint8_t *cipher = (uint8_t*)malloc(cmax);
-    if (!cipher) { free(ad); return -1; }
+    if (!cipher) { return -1; }
 
-    unsigned long long clen = 0;
-    if (aes_gcm_encrypt(plain, plen, ad, ad_len, nonce, key, cipher, &clen) != 0) {
-        free(ad); free(cipher);
+    size_t clen = 0;
+    /* The founding key, not whatever generation is current.
+     *
+     * A member who has just joined holds nothing else, and cannot be handed
+     * the current key until the room knows who they are - which is what this
+     * message is for. Sealing it under the current generation would make
+     * joining a room that has ever rotated impossible.
+     *
+     * It costs nothing to secrecy: the contents are a public key and a
+     * signature over a name. Sealing it at all is so that the server does
+     * not get a list of who is in the room. */
+    cf_key_t ck;
+    ck.version = 0;
+    memcpy(ck.key, key, KS_KEY_BYTES);
+    if (cf_seal(&ck, room, name, plain, plen, nonce, cipher, cmax, &clen) != CF_OK) {
+        free(cipher);
         return -1;
     }
 
     size_t flen = 2 + room_len + 2 + name_len + 2 + CRYPTO_NPUBBYTES + 1 + 4 + (size_t)clen;
     uint8_t *frame = (uint8_t*)malloc(flen);
-    if (!frame) { free(ad); free(cipher); return -1; }
-    w = frame;
+    if (!frame) { free(cipher); return -1; }
+    uint8_t *w = frame;
     wr_u16(w, room_len); w += 2; memcpy(w, room, room_len); w += room_len;
     wr_u16(w, name_len); w += 2; memcpy(w, name, name_len); w += name_len;
     wr_u16(w, (uint16_t)CRYPTO_NPUBBYTES); w += 2;
@@ -938,7 +2209,6 @@ static int send_identity_announce(sock_t s, const char *room, const char *name,
 
     int rc = send_all(s, frame, flen);
 
-    free(ad);
     free(cipher);
     free(frame);
     return rc;
@@ -1005,27 +2275,22 @@ static int send_signed_file_message(sock_t s, const char *room, const char *name
     uint8_t nonce[CRYPTO_NPUBBYTES];
     randombytes_buf(nonce, sizeof nonce);
 
-    size_t ad_len = room_len + name_len + 2 + 2;
-    uint8_t *ad = (uint8_t*)malloc(ad_len);
-    if (!ad) { free(signed_plain); return -1; }
-    uint8_t *w = ad;
-    wr_u16(w, room_len); w += 2; memcpy(w, room, room_len); w += room_len;
-    wr_u16(w, name_len); w += 2; memcpy(w, name, name_len);
-
-    size_t cmax = signed_plen + CRYPTO_ABYTES;
+    size_t cmax = signed_plen + CF_OVERHEAD_BYTES;
     uint8_t *cipher = (uint8_t*)malloc(cmax);
-    if (!cipher) { free(ad); free(signed_plain); return -1; }
+    if (!cipher) { free(signed_plain); return -1; }
 
-    unsigned long long clen = 0;
-    if (aes_gcm_encrypt(signed_plain, signed_plen, ad, ad_len, nonce, key, cipher, &clen) != 0) {
-        free(ad); free(cipher); free(signed_plain);
+    size_t clen = 0;
+    cf_key_t ck;
+    chat_keyring(key, &ck);
+    if (cf_seal(&ck, room, name, signed_plain, signed_plen, nonce, cipher, cmax, &clen) != CF_OK) {
+        free(cipher); free(signed_plain);
         return -1;
     }
 
     size_t flen = 2 + room_len + 2 + name_len + 2 + CRYPTO_NPUBBYTES + 1 + 4 + (size_t)clen;
     uint8_t *frame = (uint8_t*)malloc(flen);
-    if (!frame) { free(ad); free(cipher); free(signed_plain); return -1; }
-    w = frame;
+    if (!frame) { free(cipher); free(signed_plain); return -1; }
+    uint8_t *w = frame;
     wr_u16(w, room_len); w += 2; memcpy(w, room, room_len); w += room_len;
     wr_u16(w, name_len); w += 2; memcpy(w, name, name_len); w += name_len;
     wr_u16(w, (uint16_t)CRYPTO_NPUBBYTES); w += 2;
@@ -1036,11 +2301,109 @@ static int send_signed_file_message(sock_t s, const char *room, const char *name
 
     int rc = send_all(s, frame, flen);
 
-    free(ad);
     free(cipher);
     free(frame);
     free(signed_plain);
     return rc;
+}
+
+/**
+ * Пустое ли сообщение.
+ *
+ * Сборки постарше регистрировались на сервере кадром с одним пробелом, а не
+ * нулевой длины, поэтому проверки на длину не хватало: в чате от них
+ * оставалась пустая строка. Намеренно пустых сообщений никто не пишет -
+ * поле ввода их не отправляет.
+ */
+static int message_is_blank(const uint8_t *p, size_t len) {
+    for (size_t i = 0; i < len; i++) {
+        if (!isspace((unsigned char)p[i])) return 0;
+    }
+    return 1;
+}
+
+/**
+ * Разобрать список участников от ретранслятора и учесть его в реестре.
+ *
+ * Один путь на два входа: основной цикл приёма и восстановление после
+ * ECDH-входа, когда список пришёл раньше ключа комнаты (см.
+ * g_join_userlist). Расходиться им нельзя - первый учтённый список и есть
+ * «наш приход», от которого считаются все следующие смены состава.
+ */
+static void handle_user_list(sock_t s, const char *room, const uint8_t *key,
+                             const char *myname,
+                             const uint8_t *plain, size_t plen) {
+    // Обрабатываем список участников
+    if (plen >= 2) {
+        uint16_t count = rd_u16(plain);
+        const uint8_t *p = plain + 2;
+        size_t remaining = plen - 2;
+
+        /* В списке метки, а не имена: ретранслятор имён не видит.
+         * Разворачивать их в имена будем из реестра, ниже, когда он
+         * уже учтёт этот самый список. */
+        static char tags[ROSTER_MAX][IDENTITY_SESSION_TAG_LEN];
+        int ntags = 0;
+
+        for (uint16_t i = 0; i < count && remaining >= 2; i++) {
+            uint16_t utag_len = rd_u16(p);
+            p += 2;
+            remaining -= 2;
+
+            if (utag_len > remaining) break;
+
+            if (ntags < ROSTER_MAX && utag_len < IDENTITY_SESSION_TAG_LEN) {
+                memcpy(tags[ntags], p, utag_len);
+                tags[ntags][utag_len] = 0;
+                ntags++;
+            }
+
+            p += utag_len;
+            remaining -= utag_len;
+        }
+
+        /* A membership change is the whole trigger: somebody joined, so
+         * they must not read what came before, or somebody left, so they
+         * must not read what comes after. Only the member the room agrees
+         * on rotates, and every member reaches that answer from this same
+         * list, so there is nothing to coordinate. */
+        /* Taken before the new list is applied, and not again while a
+         * rotation is already pending - a burst of arrivals is one
+         * change, from the room as it stood before any of them. */
+        if (g_saw_first_user_list && !g_rot_pending) {
+            roster_snapshot_present();
+            g_have_before = 1;
+        }
+
+        int changed = roster_set_present(tags, ntags);
+        roster_print_users();
+
+        if (!g_saw_first_user_list) {
+            /* Our own arrival. Somebody who was already here rotates for
+             * it; we take this list as our starting point and leave the
+             * "before" set empty, because we did not see one. Marking
+             * ourselves as having been here would put us in an election
+             * the members who really were here are running without us -
+             * and two members rotating at once splits the room. */
+            g_saw_first_user_list = 1;
+        } else if (changed && g_has_identity && g_rk_ready) {
+            /* Say who we are again. A member that just joined has never
+             * heard our announcement - it was sent before they arrived -
+             * and rotation has to address a bundle to them by identity
+             * key. This is the same thing the call beacon does, for the
+             * same reason. */
+            send_identity_announce(s, room, myname, key,
+                                   g_identity_sk, g_identity_pk);
+
+            uint64_t now = rot_now_ms();
+            g_rot_settle_at = now + ROT_SETTLE_MS;
+            /* The deadline is set once per pending rotation, not on every
+             * change: a room somebody keeps joining and leaving would
+             * otherwise never reach it. */
+            if (!g_rot_pending) g_rot_deadline = now + ROT_DEADLINE_MS;
+            g_rot_pending = 1;
+        }
+    }
 }
 
 int recv_and_decrypt(sock_t s, const char *room, const uint8_t *key, const char *myname) {
@@ -1083,13 +2446,6 @@ int recv_and_decrypt(sock_t s, const char *room, const uint8_t *key, const char 
     if (!cipher) { free(room_in); free(name); return -1; }
     if (recv_all(s, cipher, clen) < 0) { free(room_in); free(name); free(cipher); return -1; }
 
-    size_t ad_len = room_len + name_len + 2 + 2;
-    uint8_t *ad = (uint8_t*)malloc(ad_len);
-    if (!ad) { free(room_in); free(name); free(cipher); return -1; }
-    uint8_t *w = ad;
-    wr_u16(w, room_len); w += 2; memcpy(w, room_in, room_len); w += room_len;
-    wr_u16(w, name_len); w += 2; memcpy(w, name, name_len);
-
     int same_room = (strcmp(room, room_in) == 0);
 
     // Проверяем, является ли это служебным сообщением (nonce заполнен нулями)
@@ -1102,12 +2458,24 @@ int recv_and_decrypt(sock_t s, const char *room, const uint8_t *key, const char 
     }
 
     uint8_t *plain = (uint8_t*)malloc(clen);
-    if (!plain) { free(room_in); free(name); free(cipher); free(ad); return -1; }
+    if (!plain) { free(room_in); free(name); free(cipher); return -1; }
 
     unsigned long long plen = 0;
     int ok = -1;
 
-    if (is_service_message && same_room && msg_type == MSG_TYPE_USER_LIST) {
+    if (is_service_message && msg_type == MSG_TYPE_INBOX_RESULT) {
+        /* Не проверяем комнату: ответ приходит на то соединение, которое
+         * спрашивало, а письма в нём - для других комнат, в этом весь смысл. */
+        inbox_handle_result(s, myname, cipher, clen);
+        free(room_in); free(name); free(cipher); free(plain);
+        return 0;
+    }
+
+    if (is_service_message && same_room && msg_type == MSG_TYPE_ROTATION) {
+        rotation_handle_bundle(room_in, name, cipher, clen);
+        free(room_in); free(name); free(cipher); free(plain);
+        return 0;
+    } else if (is_service_message && same_room && msg_type == MSG_TYPE_USER_LIST) {
         // Служебное сообщение USER_LIST - не шифруется, просто копируем
         memcpy(plain, cipher, clen);
         plen = clen;
@@ -1118,30 +2486,105 @@ int recv_and_decrypt(sock_t s, const char *room, const uint8_t *key, const char 
             strcmp(name, myname) != 0) {
             handle_key_request(s, room, myname, g_room_key, name, cipher);
         }
-        free(room_in); free(name); free(cipher); free(ad); free(plain);
+        free(room_in); free(name); free(cipher); free(plain);
         return 0;
     } else if (is_service_message && same_room && msg_type == MSG_TYPE_KEY_RESPONSE) {
         /* KEY_RESPONSE — ignore in normal recv loop (handled by ecdh_join_room) */
-        free(room_in); free(name); free(cipher); free(ad); free(plain);
+        free(room_in); free(name); free(cipher); free(plain);
         return 0;
     } else if (same_room && !is_service_message) {
         // Обычное зашифрованное сообщение
-        ok = aes_gcm_decrypt(cipher, clen, ad, ad_len, nonce, key, plain, &plen);
+        /* Sealed: [key_version(2)][epoch(4)][AEAD]. chat_open reads the
+         * header, refuses an epoch too far from ours before deriving
+         * anything, and binds those six bytes into the additional data so a
+         * relay cannot move the message to another epoch. */
+        size_t opened = 0;
+        cf_key_t ring[CF_MAX_KEYS];
+        size_t nring;
+        if (msg_type == MSG_TYPE_IDENTITY_ANNOUNCE) {
+            /* Sealed under the founding key - see send_identity_announce.
+             * Only this type: letting chat fall back to it would leave every
+             * message readable to anyone who ever held the room key, which is
+             * the thing rotation exists to prevent. */
+            ring[0].version = 0;
+            memcpy(ring[0].key, key, KS_KEY_BYTES);
+            nring = 1;
+        } else {
+            nring = chat_keyring_all(key, ring, CF_MAX_KEYS);
+        }
+        cf_status_t st = cf_open(ring, nring, room_in, name, cipher, clen, nonce,
+                                 plain, clen, &opened);
+        ok = (st == CF_OK) ? 0 : -1;
+        plen = (unsigned long long)opened;
     }
 
     if (!same_room || ok != 0 || strcmp(name, myname) == 0) {
-        free(room_in); free(name); free(cipher); free(ad); free(plain);
+        /* Не открылся именно анонс - самый говорящий признак того, что
+         * ключи разошлись: он и заведён так, чтобы открываться у всех. */
+        if (same_room && ok != 0 && msg_type == MSG_TYPE_IDENTITY_ANNOUNCE &&
+            strcmp(name, myname) != 0) {
+            g_announce_failed++;
+            if (!g_keysplit_warned && g_announce_failed >= 2) {
+                g_keysplit_warned = 1;
+                printf("[WARNING] Cannot read who else is here: %d identity "
+                       "announcements did not open. You are in this room with a "
+                       "different room key, so you will see no messages and no "
+                       "names. Everyone should leave and rejoin, or pick a room "
+                       "name nobody is using yet.\n", g_announce_failed);
+                fflush(stdout);
+            }
+        }
+        free(room_in); free(name); free(cipher); free(plain);
+        return 0;
+    }
+
+    /* The sender name is attacker-controlled and is echoed into stdout, into the
+     * known_keys store and into GUI labels. Neutralise control bytes now that the
+     * AEAD check (which authenticates the raw name) is already done. */
+    sanitize_display_inplace(name, strlen(name));
+
+    if (msg_type == MSG_TYPE_CALL_INVITE) {
+        /* Already authenticated: this arrived inside the room AEAD, so only
+         * a room member could have produced it and the relay cannot forge
+         * one. What is still untrusted is the content, which ci_parse
+         * checks - in particular the host, which would otherwise reach a
+         * connect call straight from another party. */
+        ci_invite_t inv;
+        char who[MAX_NAME + IDENTITY_FINGERPRINT_LEN + 8];
+        sender_label(name, who, sizeof who);
+        ci_status_t st = ci_parse(plain, (size_t)plen, &inv);
+        if (st != CI_OK) {
+            printf("[invite] dropped an invite from %s: %s\n", who, ci_strerror(st));
+        } else {
+            char hex[2 * MK_CALLID_BYTES + 1];
+            for (size_t i = 0; i < MK_CALLID_BYTES; i++)
+                snprintf(hex + 2 * i, 3, "%02x", inv.call_id[i]);
+            printf("[CALL_INVITE] %s %s %s %u %s\n", who, hex,
+                   inv.host[0] ? inv.host : "-", inv.port,
+                   (inv.flags & CI_FLAG_VIDEO) ? "video" : "audio");
+        }
+        fflush(stdout);
+        /* Same exit as every other branch. The bare return here leaked all
+         * five buffers on every invitation, and invitations repeat every few
+         * seconds for as long as somebody is waiting to be answered - and it
+         * did not compile at all on a toolchain where a valueless return from
+         * an int function is an error rather than a warning, which is what
+         * had the Windows build red. */
+        free(room_in); free(name); free(cipher); free(plain);
         return 0;
     }
 
     if (msg_type == MSG_TYPE_TEXT) {
         // Пропускаем пустые сообщения (регистрационные)
-        if (plen > 0) {
+        if (!message_is_blank(plain, (size_t)plen)) {
             time_t now = time(NULL);
             struct tm *tm = localtime(&now);
             char tbuf[32];
             strftime(tbuf, sizeof tbuf, "%H:%M:%S", tm);
-            printf("[%s] [?] %s: %.*s\n", tbuf, name, (int)plen, (char*)plain);
+            sanitize_display_inplace((char*)plain, (size_t)plen);
+            char who[MAX_NAME + IDENTITY_FINGERPRINT_LEN + 8];
+            sender_label(name, who, sizeof who);
+            printf("[%s] [?] %s: %.*s\n", tbuf, who, (int)plen, (char*)plain);
             fflush(stdout);
         }
     } else if (msg_type == MSG_TYPE_SIGNED_TEXT) {
@@ -1153,26 +2596,45 @@ int recv_and_decrypt(sock_t s, const char *room, const uint8_t *key, const char 
             size_t actual_len = (size_t)plen - IDENTITY_PK_BYTES - IDENTITY_SIG_BYTES;
 
             int sig_ok = identity_verify(actual_msg, actual_len, sig, peer_pk);
-            tofu_result_t tofu = identity_tofu_check(g_known_keys_path, name, peer_pk);
+            /* Хранилище TOFU ведётся по имени, а имя приезжает анонсом.
+             * Пока отправитель не объявился, сверять нечего с чем: записать
+             * ключ под меткой значило бы засорить хранилище мусором, который
+             * назавтра ничего не значит. */
+            const char *announced = roster_display(name);
+            tofu_result_t tofu = announced
+                ? identity_tofu_check(g_known_keys_path, announced, peer_pk)
+                : TOFU_NEW_KEY;
+
+            char who[MAX_NAME + IDENTITY_FINGERPRINT_LEN + 8];
+            sender_label(name, who, sizeof who);
 
             const char *prefix = "[!]";
-            if (sig_ok == 0) {
+            if (sig_ok == 0 && announced) {
                 if (tofu == TOFU_KEY_MATCH_VERIFIED) {
                     prefix = "[V]";  /* Verified (manually confirmed) */
                 } else if (tofu != TOFU_KEY_CONFLICT) {
                     prefix = "[T]";  /* TOFU trusted (not manually verified) */
                 }
+            } else if (sig_ok == 0) {
+                /* Подпись сошлась, но чья - мы ещё не знаем: анонс не пришёл.
+                 * Метка ключа тут была бы обещанием, которого мы не давали. */
+                prefix = "[?]";
             }
 
-            if (tofu == TOFU_NEW_KEY && sig_ok == 0) {
+            if (message_is_blank(actual_msg, actual_len)) {
+                free(room_in); free(name); free(cipher); free(plain);
+                return 1;
+            }
+
+            if (announced && tofu == TOFU_NEW_KEY && sig_ok == 0) {
                 char fp[IDENTITY_FINGERPRINT_LEN];
                 identity_pk_fingerprint(peer_pk, fp);
-                printf("[TOFU] New identity for \"%s\": %s\n", name, fp);
+                printf("[TOFU] New identity for \"%s\": %s\n", announced, fp);
                 fflush(stdout);
-            } else if (tofu == TOFU_KEY_CONFLICT) {
+            } else if (announced && tofu == TOFU_KEY_CONFLICT) {
                 char fp[IDENTITY_FINGERPRINT_LEN];
                 identity_pk_fingerprint(peer_pk, fp);
-                printf("[WARNING] KEY CHANGED for \"%s\"! Fingerprint: %s\n", name, fp);
+                printf("[WARNING] KEY CHANGED for \"%s\"! Fingerprint: %s\n", announced, fp);
                 fflush(stdout);
             }
 
@@ -1180,57 +2642,89 @@ int recv_and_decrypt(sock_t s, const char *room, const uint8_t *key, const char 
             struct tm *tm = localtime(&now);
             char tbuf[32];
             strftime(tbuf, sizeof tbuf, "%H:%M:%S", tm);
-            printf("[%s] %s %s: %.*s\n", tbuf, prefix, name,
+            /* Signature already verified over the raw bytes above, so it is safe
+             * to neutralise control bytes before display. */
+            sanitize_display_inplace((char*)plain + IDENTITY_PK_BYTES + IDENTITY_SIG_BYTES,
+                                     actual_len);
+            printf("[%s] %s %s: %.*s\n", tbuf, prefix, who,
                    (int)actual_len, (char*)actual_msg);
             fflush(stdout);
         }
     } else if (msg_type == MSG_TYPE_IDENTITY_ANNOUNCE) {
-        /* Identity announcement: [pk(32)][sig_over_name(64)] */
-        if (plen >= IDENTITY_PK_BYTES + IDENTITY_SIG_BYTES) {
+        /* Identity announcement: [pk(32)][sig(64)][name_len(2)][name] */
+        const size_t ann_min = IDENTITY_PK_BYTES + IDENTITY_SIG_BYTES + 2;
+        if (plen >= ann_min) {
             const uint8_t *peer_pk = plain;
             const uint8_t *sig = plain + IDENTITY_PK_BYTES;
-            uint16_t recv_name_len = (uint16_t)strlen(name);
-            int sig_ok = identity_verify((const uint8_t*)name, recv_name_len, sig, peer_pk);
-            if (sig_ok == 0) {
-                tofu_result_t tofu = identity_tofu_check(g_known_keys_path, name, peer_pk);
-                char fp[IDENTITY_FINGERPRINT_LEN];
-                identity_pk_fingerprint(peer_pk, fp);
-                if (tofu == TOFU_NEW_KEY) {
-                    printf("[TOFU] New identity for \"%s\": %s\n", name, fp);
-                } else if (tofu == TOFU_KEY_MATCH) {
-                    printf("[IDENTITY] \"%s\" trusted (TOFU): %s\n", name, fp);
-                } else if (tofu == TOFU_KEY_MATCH_VERIFIED) {
-                    printf("[VERIFIED] \"%s\" verified: %s\n", name, fp);
-                } else if (tofu == TOFU_KEY_CONFLICT) {
-                    printf("[WARNING] KEY CHANGED for \"%s\"! Fingerprint: %s\n", name, fp);
+            uint16_t dlen = rd_u16(plain + IDENTITY_PK_BYTES + IDENTITY_SIG_BYTES);
+            /* Длина пришла по проводу, значит выбрана не нами. Всё, что за
+             * пределами буфера или не влезает в имя, - молча в корзину. */
+            if ((size_t)dlen + ann_min <= (size_t)plen && dlen < MAX_NAME) {
+                char display[MAX_NAME];
+                memcpy(display, plain + ann_min, dlen);
+                display[dlen] = 0;
+                /* Имя показывают людям, а пришло оно снаружи: перевод строки
+                 * внутри него подделал бы целую строку журнала. */
+                sanitize_display_inplace(display, dlen);
+
+                uint8_t signed_bytes[64 + IDENTITY_SESSION_TAG_LEN + MAX_NAME];
+                size_t slen = identity_announce_signed_bytes(name, display,
+                                                             signed_bytes,
+                                                             sizeof signed_bytes);
+                int sig_ok = slen ? identity_verify(signed_bytes, slen, sig, peer_pk) : -1;
+                if (sig_ok == 0 && display[0]) {
+                    tofu_result_t tofu = identity_tofu_check(g_known_keys_path,
+                                                             display, peer_pk);
+                    char fp[IDENTITY_FINGERPRINT_LEN];
+                    identity_pk_fingerprint(peer_pk, fp);
+                    /* Rotation addresses a bundle to identity keys, so it needs
+                     * to know who is here now - the TOFU store is on disk and
+                     * says who was ever seen. A conflicting key is not recorded:
+                     * it is the case where we do not know who this is. */
+                    /* Список участников печатается из реестра, и до этого
+                     * анонса этот участник стоял в нём огрызком метки.
+                     * Перепечатываем - иначе тот, кто объявился после
+                     * списка, так и остался бы неизвестным в окне. */
+                    int was_unnamed = roster_display(name) == NULL;
+                    if (tofu != TOFU_KEY_CONFLICT)
+                        roster_note_identity(name, peer_pk, display);
+                    if (was_unnamed && roster_display(name) != NULL) {
+                        roster_print_users();
+                        /*
+                         * Назовись в ответ.
+                         *
+                         * Вошедший получает ключ комнаты не мгновенно, а
+                         * анонс запечатан ключом-родоначальником: наш анонс,
+                         * посланный на смену состава, приходит к нему раньше
+                         * ключа и открыть его нечем. Второго повода
+                         * объявиться нет - смена состава уже прошла, - и он
+                         * остаётся с огрызком метки вместо имени навсегда.
+                         *
+                         * Услышали незнакомую метку - значит её хозяин уже с
+                         * ключом и наш анонс теперь откроет. Отвечаем ровно
+                         * один раз на метку: was_unnamed бывает истинным
+                         * только при первом её опознании, так что перезвон
+                         * здесь невозможен.
+                         */
+                        send_identity_announce(s, room, myname, key,
+                                               g_identity_sk, g_identity_pk);
+                    }
+                    if (tofu == TOFU_NEW_KEY) {
+                        printf("[TOFU] New identity for \"%s\": %s\n", display, fp);
+                    } else if (tofu == TOFU_KEY_MATCH) {
+                        printf("[IDENTITY] \"%s\" trusted (TOFU): %s\n", display, fp);
+                    } else if (tofu == TOFU_KEY_MATCH_VERIFIED) {
+                        printf("[VERIFIED] \"%s\" verified: %s\n", display, fp);
+                    } else if (tofu == TOFU_KEY_CONFLICT) {
+                        printf("[WARNING] KEY CHANGED for \"%s\"! Fingerprint: %s\n",
+                               display, fp);
+                    }
+                    fflush(stdout);
                 }
-                fflush(stdout);
             }
         }
     } else if (msg_type == MSG_TYPE_USER_LIST) {
-        // Обрабатываем список участников
-        if (plen >= 2) {
-            uint16_t count = rd_u16(plain);
-            const uint8_t *p = plain + 2;
-            size_t remaining = plen - 2;
-
-            printf("[USERS] Room participants (%u):", count);
-            for (uint16_t i = 0; i < count && remaining >= 2; i++) {
-                uint16_t uname_len = rd_u16(p);
-                p += 2;
-                remaining -= 2;
-
-                if (uname_len > remaining) break;
-
-                printf(" %.*s", (int)uname_len, (char*)p);
-                if (i < count - 1) printf(",");
-
-                p += uname_len;
-                remaining -= uname_len;
-            }
-            printf("\n");
-            fflush(stdout);
-        }
+        handle_user_list(s, room, key, myname, plain, (size_t)plen);
     } else if (msg_type >= MSG_TYPE_FILE_START && msg_type <= MSG_TYPE_FILE_END) {
         handle_file_message(plain, (size_t)plen, msg_type, room_in, name, key, myname);
     } else if (msg_type >= MSG_TYPE_SIGNED_FILE_START && msg_type <= MSG_TYPE_SIGNED_FILE_END) {
@@ -1266,10 +2760,11 @@ int recv_and_decrypt(sock_t s, const char *room, const uint8_t *key, const char 
     free(room_in);
     free(name);
     free(cipher);
-    free(ad);
+   
     free(plain);
     return 1;
 }
+
 
 
 void print_local_message(const char *name, const char *msg) {
@@ -1307,6 +2802,10 @@ DWORD WINAPI input_thread(LPVOID param) {
         if (len == 0) continue;
 
         // File transfer commands
+        if (strncmp(line, "/inbox-add ", 11) == 0) {
+            handle_inbox_add(line + 11);
+            continue;
+        }
         if (strncmp(line, "/sendfile ", 10) == 0) {
             handle_file_transfer(line + 10, ctx->key, ctx->room, ctx->name, ctx->s);
             continue;
@@ -1314,6 +2813,11 @@ DWORD WINAPI input_thread(LPVOID param) {
         if (strncmp(line, "/accept", 7) == 0) {
             const char *arg = (strlen(line) > 8) ? line + 8 : NULL;
             handle_accept_command(arg);
+            continue;
+        }
+        if (strncmp(line, "/invite", 7) == 0) {
+            const char *arg = (strlen(line) > 8) ? line + 8 : NULL;
+            handle_invite_command(arg, ctx->s, ctx->room, ctx->name, ctx->key);
             continue;
         }
         if (strcmp(line, "/reject") == 0) {
@@ -1357,10 +2861,168 @@ DWORD WINAPI input_thread(LPVOID param) {
 }
 #endif
 
+/**
+ * AUTO probe: open a short-lived TCP connection and ask the server how many
+ * non-media members are in `room`. See client.h for caller contract.
+ *
+ * The probe runs against a freshly-opened socket because we want to know
+ * the room state *before* dial_tcp() inside run_client() commits us to a
+ * specific JOIN/CREATE flow.
+ */
+int probe_room_info(const char *host, uint16_t port, const char *room,
+                    int timeout_ms) {
+    /*
+     * Спрашивать надо той же меткой, под которой мы потом зарегистрируемся.
+     *
+     * Сервер знает комнату только по метке - названия он не видит. Спроси
+     * проба про «general», он честно ответит «пусто», потому что под таким
+     * именем действительно никого нет: все сидят под хешем. Дальше режим
+     * AUTO решает «комната пуста - создаём» и рисует собственный ключ, а
+     * клиент оказывается в комнате один, рядом с людьми, которых не видит.
+     */
+    char wire[IDENTITY_WIRE_ROOM_LEN];
+    if (identity_wire_room(room, wire) == 0) room = wire;
+
+    sock_t s = dial_tcp(host, port);
+
+    if (s < 0) return -1;
+
+#ifdef _WIN32
+    DWORD tv = (DWORD)timeout_ms;
+#else
+    struct timeval tv;
+    tv.tv_sec = timeout_ms / 1000;
+    tv.tv_usec = (timeout_ms % 1000) * 1000;
+#endif
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tv, sizeof tv);
+
+    if (send_service_frame(s, room, "probe",
+                           MSG_TYPE_ROOM_INFO_REQUEST, NULL, 0) < 0) {
+        close_socket(s);
+        return -1;
+    }
+
+    int result = -1;
+    /* Read up to 8 frames; skip anything that isn't ROOM_INFO_RESULT. */
+    for (int i = 0; i < 8; i++) {
+        uint8_t hdr[2];
+        if (recv_all(s, hdr, 2) < 0) break;
+        uint16_t room_len = rd_u16(hdr);
+        if (room_len > MAX_ROOM) break;
+        char rbuf[MAX_ROOM];
+        if (recv_all(s, rbuf, room_len) < 0) break;
+
+        uint8_t nlb[2];
+        if (recv_all(s, nlb, 2) < 0) break;
+        uint16_t name_len = rd_u16(nlb);
+        if (name_len > MAX_NAME) break;
+        char nbuf[MAX_NAME];
+        if (recv_all(s, nbuf, name_len) < 0) break;
+
+        uint8_t nplb[2];
+        if (recv_all(s, nplb, 2) < 0) break;
+        uint16_t nonce_len = rd_u16(nplb);
+        if (nonce_len != CRYPTO_NPUBBYTES) break;
+        uint8_t nonce[CRYPTO_NPUBBYTES];
+        if (recv_all(s, nonce, nonce_len) < 0) break;
+
+        uint8_t tb;
+        if (recv_all(s, &tb, 1) < 0) break;
+        uint8_t clenbuf[4];
+        if (recv_all(s, clenbuf, 4) < 0) break;
+        uint32_t clen = rd_u32(clenbuf);
+        if (clen > MAX_FRAME) break;
+
+        uint8_t *payload = (uint8_t *)malloc(clen ? clen : 1);
+        if (!payload) break;
+        if (clen > 0 && recv_all(s, payload, clen) < 0) {
+            free(payload); break;
+        }
+        if (tb == MSG_TYPE_ROOM_INFO_RESULT && clen >= 5) {
+            result = (int)rd_u32(payload + 1);
+            free(payload);
+            break;
+        }
+        free(payload);
+    }
+
+    close_socket(s);
+    return result;
+}
+
+/* Background heartbeat: send MSG_TYPE_PING every PING_INTERVAL_SEC while
+ * g_sock matches the socket the thread was started with. Exits as soon as
+ * the socket is replaced (reconnect) or closed. */
+#ifdef _WIN32
+static DWORD WINAPI ping_thread_fn(LPVOID arg) {
+    sock_t my_sock = (sock_t)(intptr_t)arg;
+    while (g_sock == my_sock) {
+        Sleep(PING_INTERVAL_SEC * 1000);
+        if (g_sock != my_sock) break;
+        send_service_frame(my_sock, g_room, g_name, MSG_TYPE_PING, NULL, 0);
+    }
+    return 0;
+}
+#else
+static void *ping_thread_fn(void *arg) {
+    sock_t my_sock = (sock_t)(intptr_t)arg;
+    while (g_sock == my_sock) {
+        sleep(PING_INTERVAL_SEC);
+        if (g_sock != my_sock) break;
+        send_service_frame(my_sock, g_room, g_name, MSG_TYPE_PING, NULL, 0);
+    }
+    return NULL;
+}
+#endif
+
 void run_client(const char *host, uint16_t port, const char *room, const char *name,
                 const uint8_t key[32], const uint8_t *id_pk, const uint8_t *id_sk,
                 int join_mode) {
     if (sodium_init() < 0) { fprintf(stderr, "libsodium init failed\n"); exit(1); }
+
+    /*
+     * Дальше «room» - это метка на проводе, а не название.
+     *
+     * Ретранслятору незачем видеть в своём журнале, кто в какой комнате
+     * сидит: маршрутизировать он может по хешу ровно так же. Заодно
+     * исчезает приставка «pm:», по которой личные комнаты отличались от
+     * общих с одного взгляда.
+     *
+     * Настоящее название остаётся в room_local - оно нужно там, где речь о
+     * нашей собственной стороне: почтовые ящики, история, выбор личной
+     * комнаты.
+     */
+    const char *room_local = room;
+    char wire_room[IDENTITY_WIRE_ROOM_LEN];
+    if (identity_wire_room(room_local, wire_room) != 0) {
+        fprintf(stderr, "[client] cannot derive the wire room\n");
+        return;
+    }
+    room = wire_room;
+    g_wire_room = wire_room;
+
+    /*
+     * Дальше «name» - это метка сессии, а не имя человека.
+     *
+     * В это поле кадра раньше уезжало отображаемое имя, и ретранслятор вёл
+     * из него готовый список: кто, где, откуда. Имена устойчивы между
+     * сеансами, так что по ним складывался и граф знакомств. Теперь там 16
+     * случайных байт, новых на каждое подключение: закрепить кадр за
+     * отправителем ретранслятору этого хватает, связать два сеанса одного
+     * человека - уже нет.
+     *
+     * Настоящее имя остаётся в name_local и уезжает внутрь шифра, анонсом
+     * личности, с подписью, привязывающей его к этой метке.
+     */
+    const char *name_local = name;
+    char session_tag[IDENTITY_SESSION_TAG_LEN];
+    if (identity_session_tag(session_tag) != 0) {
+        fprintf(stderr, "[client] cannot derive the session tag\n");
+        return;
+    }
+    name = session_tag;
+    g_display_name = name_local;
+
 
     /* Store identity in module globals */
     if (id_pk && id_sk) {
@@ -1384,7 +3046,20 @@ void run_client(const char *host, uint16_t port, const char *room, const char *n
         mkdir("Downloads", 0755);
     #endif
     sock_t s = dial_tcp(host, port);
-    printf("[client] connected to %s:%u, Room name: %s\n", host, port, room);
+    /* Своё название, не метка: строку читает хозяин машины, а не
+     * ретранслятор. */
+    printf("[client] connected to %s:%u, Room name: %s\n", host, port, room_local);
+    /*
+     * Метку публикуем наружу намеренно.
+     *
+     * Секрета в ней нет - её и так видит ретранслятор, для него она и
+     * заведена. А вот процессу звонка она нужна: он подключается своим
+     * соединением, и сервер связывает его UDP-адрес с нашим чат-соединением
+     * по паре «комната + метка». Без неё пара не сходится и голос через
+     * ретранслятор не идёт.
+     */
+    printf("[SESSION] %s\n", session_tag);
+    fflush(stdout);
 
     /* Use a local copy of the key so we can overwrite it in join mode */
     uint8_t active_key[CRYPTO_KEYBYTES];
@@ -1405,18 +3080,64 @@ void run_client(const char *host, uint16_t port, const char *room, const char *n
     g_room = room;
     g_name = name;
 
-    // Отправляем пустое сообщение для регистрации на сервере
-    const char *join_msg = "";
-    if (send_ciphertext(s, room, name, active_key, (uint8_t*)join_msg, strlen(join_msg)) < 0) {
-        fprintf(stderr, "[client] failed to register with server\n");
-        close_socket(s);
-        return;
+    g_rot_debug = (getenv("FEAR_ROT_DEBUG") != NULL);
+
+    /* Generation zero: what the room key exchange produced. Everything after
+     * it arrives in a rotation bundle. */
+    rk_init(&g_rk, 0, active_key);
+    g_rk_ready = 1;
+
+    /* Регистрирует нас на сервере первый же отправленный кадр: имя и комнату
+     * он берёт из его заголовка. Годится любой кадр, который сервер
+     * ретранслирует, и анонс личности как раз такой - отдельное пустое
+     * сообщение для этого не нужно. А видно его было всем: сервер раздавал
+     * его в комнату, и у собеседников оставался пустой пузырь. */
+    if (g_has_identity) {
+        roster_note_identity(name, g_identity_pk, name_local);
+        if (send_identity_announce(s, room, name, active_key,
+                                   g_identity_sk, g_identity_pk) < 0) {
+            fprintf(stderr, "[client] failed to register with server\n");
+            close_socket(s);
+            return;
+        }
+    } else {
+        /* Без личности анонса нет, а зарегистрироваться надо: иначе нас не
+         * будет в списке участников, пока мы не заговорим. */
+        const char *join_msg = "";
+        if (send_ciphertext(s, room, name, active_key,
+                            (const uint8_t*)join_msg, strlen(join_msg)) < 0) {
+            fprintf(stderr, "[client] failed to register with server\n");
+            close_socket(s);
+            return;
+        }
     }
 
-    // Send identity announcement if we have an identity
-    if (g_has_identity) {
-        send_identity_announce(s, room, name, active_key, g_identity_sk, g_identity_pk);
+    /* Свой приход, услышанный во время ожидания ключа. Учитываем его первым
+     * списком - ровно так, как его учёл бы основной цикл, приди он позже. */
+    if (g_join_userlist) {
+        handle_user_list(s, room, active_key, name,
+                         g_join_userlist, g_join_userlist_len);
+        free(g_join_userlist);
+        g_join_userlist = NULL;
+        g_join_userlist_len = 0;
     }
+
+    /* Phase B-8: start the heartbeat thread now that g_sock/g_room/g_name
+     * are set. The thread polls g_sock against its captured socket so it
+     * exits cleanly when run_client returns and the caller closes s. */
+#ifdef _WIN32
+    HANDLE hPing = CreateThread(NULL, 0, ping_thread_fn,
+                                (LPVOID)(intptr_t)s, 0, NULL);
+    if (!hPing) fprintf(stderr, "[client] warning: could not start heartbeat thread\n");
+#else
+    pthread_t ping_tid;
+    if (pthread_create(&ping_tid, NULL, ping_thread_fn,
+                       (void *)(intptr_t)s) != 0) {
+        fprintf(stderr, "[client] warning: could not start heartbeat thread\n");
+    } else {
+        pthread_detach(ping_tid);
+    }
+#endif
 
     printf("Commands: /sendfile <path>, /accept [save_path], /reject. Ctrl+C to exit.\n");
 
@@ -1429,11 +3150,23 @@ void run_client(const char *host, uint16_t port, const char *room, const char *n
     HANDLE hThread = CreateThread(NULL, 0, input_thread, &ctx, 0, NULL);
     if (!hThread) { fprintf(stderr, "thread create failed\n"); exit(1); }
     for (;;) {
-        int rc = recv_and_decrypt(ctx.s, ctx.room, ctx.key, ctx.name);
-        if (rc < 0) {
-            printf("[client] disconnected\n");
-            break;
+        /* A timeout rather than a blocking read, so a pending rotation still
+         * fires in a room where nobody is saying anything. */
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(ctx.s, &rfds);
+        struct timeval tv = { 0, 250000 };
+        int r = select(0, &rfds, NULL, NULL, &tv);
+        if (r == SOCKET_ERROR) { printf("[client] disconnected\n"); break; }
+        if (r > 0) {
+            int rc = recv_and_decrypt(ctx.s, ctx.room, ctx.key, ctx.name);
+            if (rc < 0) {
+                printf("[client] disconnected\n");
+                break;
+            }
         }
+        rotation_tick(ctx.s, ctx.room, ctx.name, ctx.key);
+        inbox_tick(ctx.s, ctx.room, ctx.name);
     }
     WaitForSingleObject(hThread, INFINITE);
     CloseHandle(hThread);
@@ -1444,8 +3177,11 @@ void run_client(const char *host, uint16_t port, const char *room, const char *n
         FD_SET(s, &rfds);
         FD_SET(STDIN_FILENO, &rfds);
         int maxfd = (s > STDIN_FILENO ? s : STDIN_FILENO) + 1;
-        int r = select(maxfd, &rfds, NULL, NULL, NULL);
+        struct timeval tv = { 0, 250000 };
+        int r = select(maxfd, &rfds, NULL, NULL, &tv);
         if (r < 0) { if (errno == EINTR) continue; break; }
+        rotation_tick(s, room, name, active_key);
+        inbox_tick(s, room, name);
         if (FD_ISSET(s, &rfds)) {
             int rc = recv_and_decrypt(s, room, active_key, name);
             if (rc < 0) { printf("[client] disconnected\n"); break; }
@@ -1460,9 +3196,19 @@ void run_client(const char *host, uint16_t port, const char *room, const char *n
             if (len == 0) { free(line); continue; }
 
             // File transfer commands
+            if (strncmp(line, "/inbox-add ", 11) == 0) {
+                handle_inbox_add(line + 11);
+                free(line);
+                continue;
+            }
             if (strncmp(line, "/sendfile ", 10) == 0) {
                 handle_file_transfer(line + 10, active_key, room, name, s);
                 free(line);
+                continue;
+            }
+            if (strncmp(line, "/invite", 7) == 0) {
+                const char *arg = (strlen(line) > 8) ? line + 8 : NULL;
+                handle_invite_command(arg, s, room, name, active_key);
                 continue;
             }
             if (strncmp(line, "/accept", 7) == 0) {
@@ -1495,7 +3241,15 @@ void run_client(const char *host, uint16_t port, const char *room, const char *n
             }
 
             int rc;
-            if (g_has_identity) {
+            if (inbox_should_use(room_local)) {
+                /* Ответ сервера скажет, легло ли письмо: он же сообщит, что
+                 * хранение выключено, и тогда пользователь узнает правду, а
+                 * не увидит две галочки. */
+                /* Имя, а не метка: письмо распечатают, когда нас уже не
+                 * будет в комнате, и разворачивать метку будет не по чему. */
+                rc = inbox_send(s, inbox_find_room(room_local), name_local,
+                                (const uint8_t *)line, len);
+            } else if (g_has_identity) {
                 rc = send_signed_ciphertext(s, room, name, active_key,
                                             (uint8_t*)line, len,
                                             g_identity_sk, g_identity_pk);
@@ -1507,7 +3261,8 @@ void run_client(const char *host, uint16_t port, const char *room, const char *n
                 free(line);
                 break;
             }
-            print_local_message(name, line);
+            /* Своё окно - не провод: здесь нужно имя, а не метка. */
+            print_local_message(name_local, line);
             free(line);
         }
     }

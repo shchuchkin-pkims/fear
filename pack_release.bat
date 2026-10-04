@@ -52,11 +52,18 @@ REM Copy all files from build directory
 echo   * Copying all files from build directory...
 xcopy /E /I /Q "build\*" "%TEMP_DIR%\" >nul 2>&1
 
-REM Copy only manual.pdf from documentation
-if exist "doc\manual.pdf" (
-    mkdir "%TEMP_DIR%\doc"
-    copy "doc\manual.pdf" "%TEMP_DIR%\doc\" >nul 2>&1
-    echo   * manual.pdf included
+REM GPL requires shipping the license text with the program
+copy "LICENSE" "%TEMP_DIR%\" >nul 2>&1
+copy "LICENSE.GPL-3.0" "%TEMP_DIR%\" >nul 2>&1
+copy "LICENSING.md" "%TEMP_DIR%\" >nul 2>&1
+
+REM Documentation: the manual and "how it works" (English and Russian)
+if not exist "%TEMP_DIR%\doc" mkdir "%TEMP_DIR%\doc"
+for %%P in (manual.pdf how-it-works.pdf how-it-works.ru.pdf) do (
+    if exist "doc\%%P" (
+        copy "doc\%%P" "%TEMP_DIR%\doc\" >nul 2>&1
+        echo   * %%P included
+    )
 )
 
 REM Create the ZIP archive using PowerShell

@@ -14,6 +14,7 @@
 #define VIDEOCALLMANAGER_H
 
 #include <QObject>
+#include <QHash>
 #include <QProcess>
 #include <QSettings>
 
@@ -121,6 +122,15 @@ public:
     QString getCurrentKey() const;
 
 signals:
+    /**
+     * Процесс звонка узнал свой адрес снаружи.
+     *
+     * Приходит один раз, сразу после того как сокет для голоса занял порт:
+     * спрашивать надо именно с него, иначе NAT назовёт отображение, которого
+     * для голоса не существует.
+     */
+    void candidateDiscovered(const QString &host, quint16 port);
+
     void keyGenerated(const QString &key);
     void callStarted();
     void listeningStarted();
@@ -147,10 +157,32 @@ private:
                           const QString &camera, int audioInput, int audioOutput,
                           bool noVideo, bool noAudio) const;
 
+    /**
+     * @brief Все известные имена - в процесс звонка, следом за ключом.
+     */
+    void sendPeerNames();
+
     QProcess *callProcess;
     QString currentKey;
     QSettings *settings;
+    /** Метка сессии -> имя, из строк «[ROSTER]» клиента чата. */
+    QHash<QString, QString> peerNames;
 public:
+    /**
+     * @brief Имя участника по его метке сессии - для подписей под плитками.
+     *
+     * В HELLO2 звонка едет метка, а не имя: HELLO2 не зашифрован, и имя в нём
+     * прочёл бы ретранслятор. Имя берётся из реестра чата и уходит процессу
+     * звонка по stdin - на провод оно не попадает. Если звонок идёт, имя
+     * отправляется сразу: вошедший посреди звонка получает подпись, как
+     * только объявится.
+     */
+    void setPeerName(const QString &tag, const QString &name);
+
+    /** Per-call identifier from the invite, 32 hex chars. Empty until the
+     *  call is announced; the media binary refuses an all-zero one. */
+    QString callId;
+
     QString identityFilePath; ///< Path to identity key (set by Backend)
 };
 

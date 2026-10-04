@@ -3,8 +3,11 @@
  * @brief Implementation of F.E.A.R. CLI backend
  */
 
+#include <QSettings>
 #include "backend.h"
+#include <sodium.h>
 #include <QFile>
+#include <QFileInfo>
 #include <QDir>
 #include <QDebug>
 #include <QGuiApplication>
@@ -72,21 +75,9 @@ bool Backend::connectToServer(const QString &host, int port, const QString &room
     }
 
     // Check if executable exists
-    if (cliPath.isEmpty() || !QFile::exists(cliPath)) {
-#ifdef Q_OS_WIN
-        QString defaultPath = "./bin/fear.exe";
-        if (!QFile::exists(defaultPath)) {
-            emit error("CLI executable not found. Please set the correct path to fear.exe");
-            return false;
-        }
-#else
-        QString defaultPath = "./bin/fear";
-        if (!QFile::exists(defaultPath)) {
-            emit error("CLI executable not found. Please set the correct path to fear");
-            return false;
-        }
-#endif
-        cliPath = defaultPath;
+    if (!resolveCliPath()) {
+        emit error("CLI executable not found. Please set the correct path in Settings.");
+        return false;
     }
 
     clientProc = new QProcess(this);
@@ -107,12 +98,29 @@ bool Backend::connectToServer(const QString &host, int port, const QString &room
         args << "--create";
     } else if (mode == JOIN_ROOM) {
         args << "--join";
+    } else if (mode == AUTO) {
+        args << "--auto";
     }
     // NOTE: NO --key argument here for security (MANUAL_KEY passes key via stdin)
 
     // Pass identity file if available
     if (identityAvailable) {
         args << "--identity-file" << identityFilePath;
+
+    /*
+     * Внешний слой TLS для связи с ретранслятором.
+     *
+     * Пусто - как раньше, открытым текстом: включённый молча, он оборвал бы
+     * связь со всеми серверами, у которых TLS не настроен.
+     */
+    {
+        QSettings st;
+        if (st.value(QStringLiteral("relay/tls"), false).toBool()) {
+            const QString pin = st.value(QStringLiteral("relay/tlsPin")).toString().trimmed();
+            if (!pin.isEmpty()) args << QStringLiteral("--tls-pin") << pin;
+            else                args << QStringLiteral("--tls");
+        }
+    }
     }
 
     qDebug() << "Starting client:" << cliPath << "client --host" << host
@@ -164,9 +172,10 @@ bool Backend::connectToServer(const QString &host, int port, const QString &room
     currentRoom = room;
     currentName = name;
 
-    // Consider connection successful after process starts
-    isConnected = true;
-    emit connected();
+    /* Audit 2026-07 (UX): "connected" used to fire here, right after the
+     * process started and before any TCP handshake, so failures looked like
+     * successful connects. parseClientOutput() now flips the state when the
+     * CLI prints its definite "[client] connected to ..." line. */
     return true;
 }
 
@@ -177,22 +186,11 @@ bool Backend::createServer(int port, const QString &name) {
         return false;
     }
 
-    // Check if executable exists
-    if (cliPath.isEmpty() || !QFile::exists(cliPath)) {
-#ifdef Q_OS_WIN
-        QString defaultPath = "fear.exe";
-        if (!QFile::exists(defaultPath)) {
-            emit error("CLI executable not found. Please set the correct path to fear.exe");
-            return false;
-        }
-#else
-        QString defaultPath = "fear";
-        if (!QFile::exists(defaultPath)) {
-            emit error("CLI executable not found. Please set the correct path to fear");
-            return false;
-        }
-#endif
-        cliPath = defaultPath;
+    /* Same anchored lookup as connectToServer - the old fallback here
+     * resolved a bare "fear" against the working directory (M23-style). */
+    if (!resolveCliPath()) {
+        emit error("CLI executable not found. Please set the correct path in Settings.");
+        return false;
     }
 
     serverProc = new QProcess(this);
@@ -277,6 +275,8 @@ bool Backend::disconnect() {
     serverPort = 0;
     currentRoom.clear();
     currentName.clear();
+    // Метка живёт ровно столько, сколько соединение: следующее получит новую.
+    currentTag.clear();
     emit disconnected();
     return true;
 }
@@ -314,17 +314,10 @@ QStringList Backend::getRecentMessages(int &outLastId) {
 bool Backend::generateKeypair(const QString &outPath) {
     Q_UNUSED(outPath);  // Not used anymore - genkey writes to room_key.txt
 
-    // Check if executable exists
-    if (cliPath.isEmpty() || !QFile::exists(cliPath)) {
-        QString defaultPath = "./bin/fear";
-        if (!QFile::exists(defaultPath)) {
-            defaultPath = "fear";
-            if (!QFile::exists(defaultPath)) {
-                emit error("CLI executable not found. Please set the correct path to fear");
-                return false;
-            }
-        }
-        cliPath = defaultPath;
+    // Тем же поиском, что везде: от каталога приложения, не от рабочего.
+    if (!resolveCliPath()) {
+        emit error("CLI executable not found. Please set the correct path to fear");
+        return false;
     }
 
     QProcess p;
@@ -450,8 +443,33 @@ void Backend::onServerFinished(int exitCode, QProcess::ExitStatus status) {
     emit newMessages(QStringList() << "[server] stopped");
 }
 
-bool Backend::generateIdentity() {
-    if (cliPath.isEmpty() || !QFile::exists(cliPath)) {
+bool Backend::resolveCliPath() {
+    if (!cliPath.isEmpty() && QFile::exists(cliPath)) return true;
+    /* Anchored to the application directory, never to the working directory:
+     * "./bin/fear" would run whatever binary happens to sit under the
+     * directory the GUI was started from. */
+    const QString appDir = QGuiApplication::applicationDirPath();
+#ifdef Q_OS_WIN
+    const QString exe = QStringLiteral("fear.exe");
+#else
+    const QString exe = QStringLiteral("fear");
+#endif
+    /* bin/ рядом с GUI - раскладка релиза (pack_release, CI). Рядом с самим
+     * GUI - раскладка, в которой CI до 0.6.0 выкладывал архивы: клиент лежал
+     * возле fear_gui, GUI искал его только в bin/ и не находил вовсе. Обе
+     * точки - в каталоге приложения, не в рабочем. isFile: каталог build/fear
+     * при запуске из дерева сборки - не программа. */
+    for (const QString &candidate : { appDir + "/bin/" + exe, appDir + "/" + exe }) {
+        if (QFileInfo(candidate).isFile()) {
+            cliPath = candidate;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool Backend::generateIdentity(bool copyToClipboard) {
+    if (!resolveCliPath()) {
         emit error("CLI executable not found");
         return false;
     }
@@ -482,7 +500,7 @@ bool Backend::generateIdentity() {
 
     // Read public key from stdout
     QString pubKey = QString::fromUtf8(p.readAllStandardOutput()).trimmed();
-    if (!pubKey.isEmpty()) {
+    if (!pubKey.isEmpty() && copyToClipboard) {
         QGuiApplication::clipboard()->setText(pubKey);
     }
 
@@ -506,6 +524,38 @@ bool Backend::hasIdentity() const {
     return identityAvailable;
 }
 
+bool Backend::sendCallInvite(const QString &host, quint16 port, bool video,
+                             const QString &reuseCallId) {
+    if (!clientProc || !isConnected) return false;
+
+    /* Draw the id here rather than letting the CLI draw it and reading it
+     * back: the call would otherwise start before the answer arrived. */
+    QString callId = reuseCallId;
+    if (callId.isEmpty()) {
+        unsigned char raw[16];
+        randombytes_buf(raw, sizeof raw);
+        callId = QByteArray(reinterpret_cast<const char *>(raw), sizeof raw).toHex();
+    }
+
+    /* The media process must use exactly the id the room was told about. */
+    if (video) {
+        if (videoManager) videoManager->callId = callId;
+    } else {
+        if (audioManager) audioManager->callId = callId;
+    }
+
+    QString cmd = QStringLiteral("/invite ") + callId;
+    if (!host.isEmpty()) {
+        cmd += QLatin1Char(' ') + host + QLatin1Char(' ') + QString::number(port);
+    }
+    if (video) cmd += QStringLiteral(" video");
+    cmd += QLatin1Char('\n');
+    if (clientProc->write(cmd.toUtf8()) <= 0) return false;
+
+    emit callInviteSent(callId, host, port, video);
+    return true;
+}
+
 void Backend::parseClientOutput(const QString &s) {
     if (s.isEmpty()) return;
 
@@ -515,6 +565,30 @@ void Backend::parseClientOutput(const QString &s) {
     for (const QString &l : lines) {
         QString t = l.trimmed();
         if (t.isEmpty()) continue;
+
+        // The real connection status comes from the CLI, not from the mere
+        // start of its process.
+        if (!isConnected && t.startsWith("[client] connected to")) {
+            isConnected = true;
+            emit connected();
+        }
+
+        // Метка сессии: единственное, чем нас теперь называет ретранслятор.
+        if (t.startsWith("[SESSION] ")) {
+            currentTag = t.mid(10).trimmed();
+            continue;
+        }
+
+        // Имя по метке - для подписей под плитками видео. Звонок знает
+        // участников только по метке; см. VideoCallManager::setPeerName.
+        if (t.startsWith("[ROSTER] ")) {
+            const QString rest = t.mid(9);
+            const int sp = rest.indexOf(QLatin1Char(' '));
+            if (sp > 0 && videoManager) {
+                videoManager->setPeerName(rest.left(sp), rest.mid(sp + 1).trimmed());
+            }
+            continue;
+        }
 
         // Capture room key from CLI output (CREATE or JOIN mode)
         // [create] Room key generated: <b64>
@@ -530,6 +604,41 @@ void Backend::parseClientOutput(const QString &s) {
                     roomKeyHex = keyBytes.toHex();
                     qDebug() << "Room key captured (" << km.captured(1) << "), hex length:" << roomKeyHex.length();
                 }
+            }
+        }
+
+        // Call signalling. The CLI has already authenticated and validated
+        // these: they arrived inside the room AEAD and the host was checked
+        // at the parse, so what reaches here is safe to act on.
+        {
+            static const QRegularExpression inviteRe(
+                /* Имя, а не метка: с тех пор как клиент разворачивает метку
+                 * сессии в отображаемое имя, здесь бывают пробелы - «Татьяна
+                 * Щучкина». Прежний \\S+ такую строку не разбирал вовсе, и
+                 * приглашение молча пропадало: на телефоне звонок идёт, на
+                 * ПК не происходит ничего.
+                 *
+                 * Жадный (.+) безопасен: всё, что за именем, имеет строгую
+                 * форму - 32 шестнадцатеричных знака, хост, порт, вид
+                 * звонка, - и конец строки закреплён. */
+                QStringLiteral("^\\[CALL_INVITE\\] (.+) ([0-9a-f]{32}) (\\S+) (\\d+) (audio|video)$"));
+            if (auto m = inviteRe.match(t); m.hasMatch()) {
+                const QString hostHint = (m.captured(3) == QStringLiteral("-"))
+                                             ? QString() : m.captured(3);
+                emit callInviteReceived(m.captured(1), m.captured(2), hostHint,
+                                        static_cast<quint16>(m.captured(4).toUInt()),
+                                        m.captured(5) == QStringLiteral("video"));
+                continue;
+            }
+            static const QRegularExpression sentRe(
+                QStringLiteral("^\\[CALL_INVITE_SENT\\] ([0-9a-f]{32}) (\\S+) (\\d+) (audio|video)$"));
+            if (auto m = sentRe.match(t); m.hasMatch()) {
+                const QString hostHint = (m.captured(2) == QStringLiteral("-"))
+                                             ? QString() : m.captured(2);
+                emit callInviteSent(m.captured(1), hostHint,
+                                    static_cast<quint16>(m.captured(3).toUInt()),
+                                    m.captured(4) == QStringLiteral("video"));
+                continue;
             }
         }
 

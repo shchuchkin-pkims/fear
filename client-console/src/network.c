@@ -6,6 +6,7 @@
  * client-server communication in the F.E.A.R. messenger.
  */
 
+#include "tls.h"
 #include "network.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -71,6 +72,42 @@ sock_t dial_tcp(const char *host, uint16_t port) {
 
     if (s < 0) {
         die("connect");
+    }
+
+    /*
+     * Внешний слой TLS - здесь, а не у мест вызова.
+     *
+     * Соединений с ретранслятором в клиенте несколько: одно пробное, чтобы
+     * узнать состояние комнаты, и одно рабочее. Обернув только рабочее, мы
+     * оставили бы пробное открытым и не заметили - оно короткое и молчит.
+     * Один вход в сеть - одно место, где решается вопрос защиты.
+     *
+     * Что слой даёт: наблюдатель на пути - провайдер, хозяин точки доступа -
+     * перестаёт видеть структуру кадров, длины полей и ритм обмена. Этого
+     * хватало, чтобы узнать протокол, не прочитав ни слова.
+     *
+     * Чего не даёт: ничего не прячет от самого ретранслятора, тот на другом
+     * конце туннеля. Против оператора работают хеш вместо названия комнаты
+     * и метка вместо имени, а не это.
+     *
+     * Не сложилось - выходим, а не продолжаем открытым текстом: человек
+     * попросил TLS и вправе считать, что без него разговора не будет.
+     */
+    if (tls_wanted()) {
+        if (!tls_available()) {
+            fprintf(stderr, "[tls] this build has no TLS support\n");
+            close_socket(s);
+            exit(1);
+        }
+        if (tls_client_wrap((int)s, host, tls_wanted_pin()) != 0) {
+            fprintf(stderr, "[tls] %s\n", tls_last_error());
+            close_socket(s);
+            exit(1);
+        }
+        char fp[TLS_FINGERPRINT_LEN];
+        if (tls_peer_fingerprint((int)s, fp) == 0) {
+            fprintf(stderr, "[tls] connected, server certificate %s\n", fp);
+        }
     }
 
     return s;

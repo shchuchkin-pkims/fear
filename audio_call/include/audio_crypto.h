@@ -49,7 +49,7 @@ int audio_encrypt_packet(const uint8_t *opus, size_t opus_len,
 int audio_decrypt_packet(const uint8_t *pkt, size_t pkt_len,
                          const uint8_t key[AUDIO_KEY_SIZE],
                          const uint8_t remote_prefix[4],
-                         uint8_t *opus_out, size_t *opus_len);
+                         uint8_t *opus_out, size_t opus_cap, size_t *opus_len);
 
 /**
  * @brief Generic encrypt (simplified API with random nonce)
@@ -79,7 +79,7 @@ int audio_encrypt(const uint8_t *plaintext, size_t plaintext_len,
  */
 int audio_decrypt(const uint8_t *ciphertext, size_t ciphertext_len,
                   const uint8_t key[AUDIO_KEY_SIZE],
-                  uint8_t *plaintext, size_t *plaintext_len);
+                  uint8_t *plaintext, size_t plaintext_cap, size_t *plaintext_len);
 
 /**
  * @brief Convert hexadecimal string to binary key

@@ -1,0 +1,55 @@
+name: Unit tests
+
+# Fast test-only workflow: builds the CTest suite (identity, encrypted
+# backup, contacts cipher) plus the console client, then runs unit tests
+# and the server+2-clients integration smoke test. Release builds live in
+# linux.yml and windows.yml; this one exists to give every push to dev a
+# quick red/green signal on the crypto core and the chat happy path.
+
+on:
+  push:
+    branches: [main, dev]
+    paths:
+      - 'CMakeLists.txt'
+      - 'tests/**'
+      - 'identity/**'
+      - 'client-console/**'
+      - '.github/workflows/tests.yml'
+  pull_request:
+    branches: [main, dev]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-22.04
+    name: ctest (Linux / GCC)
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build pkg-config \
+            libsodium-dev libsqlite3-dev
+
+      - name: Configure
+        run: |
+          cmake -S . -B build \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DFEAR_GUI_ONLY=ON
+
+      # Build everything rather than an enumerated list: the list went stale
+      # the moment a new test target was added, and ctest then failed on a
+      # missing executable instead of on a real defect.
+      - name: Build
+        run: cmake --build build -j
+
+      - name: Run tests
+        run: ctest --test-dir build --output-on-failure

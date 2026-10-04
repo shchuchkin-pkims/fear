@@ -33,6 +33,12 @@ AudioCallDialog::AudioCallDialog(AudioCallManager *audioManager, Backend *backen
         keyGroup->setVisible(false);
     }
 
+    // If we already have a chat session — default to relay mode through that
+    // server and auto-fill the IP/port. The toggled handler does the fill.
+    if (backend && backend->isConnected) {
+        relayCheck->setChecked(true);
+    }
+
     // Load audio devices list when dialog opens
     refreshAudioDevices();
 
@@ -92,10 +98,20 @@ void AudioCallDialog::onStartCall() {
     int inputDevice = inputDeviceCombo->currentData().toInt();
     int outputDevice = outputDeviceCombo->currentData().toInt();
 
+    /* Announce the call to the room first: the invite carries the call_id
+     * every media key is bound to, and the far side cannot derive a
+     * matching key without it. */
+    /* Только когда звоним сами. Отвечая на приглашение, мы уже держим его
+     * идентификатор - нарисовав новый, разошлись бы в ключах и не услышали
+     * бы друг друга. */
+    if (backend && audioManager && audioManager->callId.isEmpty()) {
+        backend->sendCallInvite(remoteIp, remotePort, /*video=*/false);
+    }
+
     if (relayCheck->isChecked() && backend) {
         // Relay mode: route through server
         if (audioManager->startRelay(remoteIp, remotePort,
-                                      backend->currentRoom, backend->currentName, key,
+                                      backend->currentRoom, backend->currentTag, key,
                                       inputDevice, outputDevice)) {
             statusLabel->setText("Relay call started");
         }
@@ -116,6 +132,10 @@ void AudioCallDialog::onStartListening() {
     // Get selected audio devices
     int inputDevice = inputDeviceCombo->currentData().toInt();
     int outputDevice = outputDeviceCombo->currentData().toInt();
+
+    /* Listening announces too, with no address hint: whoever answers uses
+     * the id from the invite. */
+    if (backend) backend->sendCallInvite(QString(), localPortSpin->value(), /*video=*/false);
 
     if (audioManager->startListening(localPortSpin->value(), key, inputDevice, outputDevice)) {
         statusLabel->setText("Listening started");
@@ -247,6 +267,14 @@ void AudioCallDialog::setupConnections() {
     connect(audioManager, &AudioCallManager::listeningStarted, this, &AudioCallDialog::onCallStarted);
     connect(audioManager, &AudioCallManager::callStopped, this, &AudioCallDialog::onCallStopped);
     connect(audioManager, &AudioCallManager::error, this, &AudioCallDialog::onError);
+    /* Адрес, который процесс звонка узнал у сервера STUN, надо донести до
+     * комнаты вторым приглашением: первое объявило звонок, но адреса тогда
+     * ещё не существовало - сокет для голоса не занял порт. Идентификатор
+     * тот же, иначе собеседник счёл бы это отдельным звонком. */
+    connect(audioManager, &AudioCallManager::candidateDiscovered, this,
+            [this](const QString &h, quint16 p) {
+        if (backend) backend->sendCallInvite(h, p, /*video=*/false, audioManager->callId);
+    });
     connect(audioManager, &AudioCallManager::output, this, &AudioCallDialog::onOutput);
 
     // Connect UI buttons
@@ -384,9 +412,8 @@ QString AudioCallDialog::findAudioCallApp() {
     QStringList possiblePaths = {
         QApplication::applicationDirPath() + "/audio_call",
         QApplication::applicationDirPath() + "/bin/audio_call",
-        QApplication::applicationDirPath() + "/../bin/audio_call",
-        "audio_call",
-        "./audio_call"
+        QApplication::applicationDirPath() + "/../bin/audio_call"
+        /* Без голого имени и "./": см. AudioCallManager::findAudioCallApp. */
     };
 
 #ifdef Q_OS_WIN

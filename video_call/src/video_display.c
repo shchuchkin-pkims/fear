@@ -19,6 +19,26 @@ struct VideoDisplay {
     SDL_Texture *texture;
     int tex_width;
     int tex_height;
+    /* One texture per grid cell. Senders differ in size - a landscape webcam
+     * next to a portrait phone - so a single shared texture would be torn
+     * down and rebuilt on every alternating frame. */
+    struct {
+        SDL_Texture *tex;
+        int w;
+        int h;
+    } tile[VD_MAX_TILES];
+    /* The big view keeps its own texture: it shows the same stream as one of
+     * the cells, and sharing would tear the texture down on every frame. */
+    SDL_Texture *main_tex;
+    int main_w;
+    int main_h;
+
+    /* Where the cells landed last time, so a click can be turned back into a
+     * participant. Kept here rather than recomputed, because the layout
+     * depends on the window size at the moment it was drawn. */
+    SDL_FRect cell_rect[VD_MAX_TILES];
+    int cell_count;
+
     /* Local camera PiP */
     SDL_Texture *local_texture;
     int local_tex_width;
@@ -63,6 +83,331 @@ static void render_rtt_overlay(VideoDisplay *disp) {
     SDL_SetRenderDrawColor(disp->renderer, r, g, b, 255);
     SDL_RenderDebugText(disp->renderer, 8.0f / scale, 8.0f / scale, buf);
     SDL_SetRenderScale(disp->renderer, 1.0f, 1.0f);
+}
+
+/** Draw a participant's caption in the bottom-left of its cell. */
+static void vd_cell_label(VideoDisplay *d, float x, float y, float ch,
+                          const char *text) {
+    if (!text || !text[0]) return;
+    const float scale = 1.5f;
+    float tw = (float)strlen(text) * 8.0f * scale;
+    float th = 8.0f * scale;
+    float pad = 3.0f;
+    float tx = x + 6.0f;
+    float ty = y + ch - th - 6.0f;
+
+    SDL_SetRenderDrawBlendMode(d->renderer, SDL_BLENDMODE_BLEND);
+    SDL_SetRenderDrawColor(d->renderer, 0, 0, 0, 170);
+    SDL_FRect bg = { tx - pad, ty - pad, tw + pad * 2, th + pad * 2 };
+    SDL_RenderFillRect(d->renderer, &bg);
+
+    SDL_SetRenderScale(d->renderer, scale, scale);
+    SDL_SetRenderDrawColor(d->renderer, 235, 235, 235, 255);
+    SDL_RenderDebugText(d->renderer, tx / scale, ty / scale, text);
+    SDL_SetRenderScale(d->renderer, 1.0f, 1.0f);
+}
+
+/**
+ * Upload one participant's frame into its own texture, rebuilding it when
+ * that sender's geometry changes.
+ */
+static SDL_Texture *vd_tile_texture(VideoDisplay *d, int i,
+                                    const uint8_t *yuv, int w, int h) {
+    if (i < 0 || i >= VD_MAX_TILES || !yuv || w <= 0 || h <= 0) return NULL;
+
+    if (!d->tile[i].tex || d->tile[i].w != w || d->tile[i].h != h) {
+        if (d->tile[i].tex) SDL_DestroyTexture(d->tile[i].tex);
+        d->tile[i].tex = SDL_CreateTexture(d->renderer, SDL_PIXELFORMAT_IYUV,
+                                           SDL_TEXTUREACCESS_STREAMING, w, h);
+        if (!d->tile[i].tex) {
+            d->tile[i].w = 0;
+            d->tile[i].h = 0;
+            return NULL;
+        }
+        d->tile[i].w = w;
+        d->tile[i].h = h;
+    }
+
+    int y_size = w * h;
+    int uv_stride = w / 2;
+    if (!SDL_UpdateYUVTexture(d->tile[i].tex, NULL,
+                              yuv, w,
+                              yuv + y_size, uv_stride,
+                              yuv + y_size + y_size / 4, uv_stride)) {
+        return NULL;
+    }
+    return d->tile[i].tex;
+}
+
+/**
+ * Column count that gives the largest picture.
+ *
+ * Trying every count instead of hardcoding a 2x2 is what makes a tall window
+ * stack two participants rather than squeeze them side by side.
+ */
+static int vd_best_cols(int n, int win_w, int win_h, float aspect) {
+    int best = 1;
+    float best_area = -1.0f;
+    for (int cols = 1; cols <= n; cols++) {
+        int rows = (n + cols - 1) / cols;
+        float cw = (float)win_w / (float)cols;
+        float ch = (float)win_h / (float)rows;
+        float w = cw, h = cw / aspect;
+        if (h > ch) { h = ch; w = ch * aspect; }
+        float area = w * h;
+        if (area > best_area) {
+            best_area = area;
+            best = cols;
+        }
+    }
+    return best;
+}
+
+/** Local camera preview, top-right, with a dark border. */
+static void vd_render_local_pip(VideoDisplay *d,
+                                const uint8_t *yuv, int w, int h) {
+    if (!yuv || w <= 0 || h <= 0) return;
+
+    if (w != d->local_tex_width || h != d->local_tex_height) {
+        if (d->local_texture) SDL_DestroyTexture(d->local_texture);
+        d->local_texture = SDL_CreateTexture(d->renderer, SDL_PIXELFORMAT_IYUV,
+                                             SDL_TEXTUREACCESS_STREAMING, w, h);
+        if (!d->local_texture) {
+            d->local_tex_width = 0;
+            d->local_tex_height = 0;
+            return;
+        }
+        d->local_tex_width = w;
+        d->local_tex_height = h;
+    }
+
+    int y_size = w * h;
+    int uv_stride = w / 2;
+    SDL_UpdateYUVTexture(d->local_texture, NULL,
+                         yuv, w,
+                         yuv + y_size, uv_stride,
+                         yuv + y_size + y_size / 4, uv_stride);
+
+    int win_w, win_h;
+    SDL_GetWindowSize(d->window, &win_w, &win_h);
+
+    int pip_w = win_w / 4;
+    int pip_h = (pip_w * h) / w;
+    int margin = 10;
+    int border = 2;
+
+    SDL_FRect border_rect = {
+        (float)(win_w - pip_w - margin - border),
+        (float)(margin - border),
+        (float)(pip_w + border * 2),
+        (float)(pip_h + border * 2)
+    };
+    SDL_SetRenderDrawColor(d->renderer, 32, 32, 32, 255);
+    SDL_RenderFillRect(d->renderer, &border_rect);
+
+    SDL_FRect pip_rect = {
+        (float)(win_w - pip_w - margin),
+        (float)margin,
+        (float)pip_w,
+        (float)pip_h
+    };
+    SDL_RenderTexture(d->renderer, d->local_texture, NULL, &pip_rect);
+}
+
+/** A caption centred under the big view. */
+static void vd_main_label(VideoDisplay *d, float cx, float bottom, const char *text) {
+    if (!text || !text[0]) return;
+    const float scale = 2.0f;
+    float tw = (float)strlen(text) * 8.0f * scale;
+    float th = 8.0f * scale;
+    float pad = 6.0f;
+    float tx = cx - tw / 2.0f;
+    float ty = bottom - th - 10.0f;
+
+    SDL_SetRenderDrawBlendMode(d->renderer, SDL_BLENDMODE_BLEND);
+    SDL_SetRenderDrawColor(d->renderer, 0, 0, 0, 170);
+    SDL_FRect bg = { tx - pad, ty - pad, tw + pad * 2, th + pad * 2 };
+    SDL_RenderFillRect(d->renderer, &bg);
+
+    SDL_SetRenderScale(d->renderer, scale, scale);
+    SDL_SetRenderDrawColor(d->renderer, 255, 255, 255, 255);
+    SDL_RenderDebugText(d->renderer, tx / scale, ty / scale, text);
+    SDL_SetRenderScale(d->renderer, 1.0f, 1.0f);
+}
+
+/** Letterbox a picture inside a rectangle, preserving its shape. */
+static SDL_FRect vd_fit(SDL_FRect box, int vw, int vh) {
+    if (vw <= 0 || vh <= 0) return box;
+    float a = (float)vw / (float)vh;
+    float w = box.w;
+    float h = box.w / a;
+    if (h > box.h) { h = box.h; w = box.h * a; }
+    SDL_FRect r = { box.x + (box.w - w) / 2.0f, box.y + (box.h - h) / 2.0f, w, h };
+    return r;
+}
+
+int video_display_hit_test(VideoDisplay *disp, float x, float y) {
+    if (!disp) return -1;
+    for (int i = 0; i < disp->cell_count && i < VD_MAX_TILES; i++) {
+        SDL_FRect r = disp->cell_rect[i];
+        if (x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h) return i;
+    }
+    return -1;
+}
+
+int video_display_render_speaker(VideoDisplay *disp,
+                                 const VideoTile *main_tile,
+                                 const VideoTile *tiles, int ntiles,
+                                 const uint8_t *local_yuv,
+                                 int local_w, int local_h) {
+    if (!disp || !disp->renderer) return -1;
+    if (ntiles > VD_MAX_TILES) ntiles = VD_MAX_TILES;
+    if (ntiles < 0) ntiles = 0;
+
+    int win_w = 0, win_h = 0;
+    SDL_GetWindowSize(disp->window, &win_w, &win_h);
+    if (win_w <= 0 || win_h <= 0) return -1;
+
+    /* The strip takes a fifth of the height, within reason. Below the floor
+     * the captions stop being readable; above the ceiling it eats the call. */
+    float strip_h = (float)win_h / 5.0f;
+    if (strip_h < 90.0f) strip_h = 90.0f;
+    if (strip_h > 200.0f) strip_h = 200.0f;
+    if (ntiles <= 1) strip_h = 0.0f;
+
+    SDL_SetRenderDrawColor(disp->renderer, 16, 16, 16, 255);
+    SDL_RenderClear(disp->renderer);
+
+    /* ---- the big view ---- */
+    if (main_tile && main_tile->yuv && main_tile->width > 0 && main_tile->height > 0) {
+        if (!disp->main_tex ||
+            disp->main_w != main_tile->width || disp->main_h != main_tile->height) {
+            if (disp->main_tex) SDL_DestroyTexture(disp->main_tex);
+            disp->main_tex = SDL_CreateTexture(disp->renderer, SDL_PIXELFORMAT_IYUV,
+                                               SDL_TEXTUREACCESS_STREAMING,
+                                               main_tile->width, main_tile->height);
+            disp->main_w = disp->main_tex ? main_tile->width : 0;
+            disp->main_h = disp->main_tex ? main_tile->height : 0;
+        }
+        if (disp->main_tex) {
+            int y_size = main_tile->width * main_tile->height;
+            int uv = main_tile->width / 2;
+            SDL_UpdateYUVTexture(disp->main_tex, NULL,
+                                 main_tile->yuv, main_tile->width,
+                                 main_tile->yuv + y_size, uv,
+                                 main_tile->yuv + y_size + y_size / 4, uv);
+            SDL_FRect area = { 0.0f, 0.0f, (float)win_w, (float)win_h - strip_h };
+            SDL_FRect dst = vd_fit(area, main_tile->width, main_tile->height);
+            SDL_RenderTexture(disp->renderer, disp->main_tex, NULL, &dst);
+            vd_main_label(disp, area.w / 2.0f, area.y + area.h, main_tile->label);
+        }
+    }
+
+    /* ---- the strip ---- */
+    disp->cell_count = 0;
+    if (strip_h > 0.0f) {
+        float gap = 8.0f;
+        float cell_w = (strip_h - gap) * 4.0f / 3.0f;
+        float x = gap;
+        float y = (float)win_h - strip_h + gap / 2.0f;
+        float cell_h = strip_h - gap;
+
+        for (int i = 0; i < ntiles; i++) {
+            SDL_FRect cell = { x, y, cell_w, cell_h };
+            disp->cell_rect[i] = cell;
+            disp->cell_count = i + 1;
+
+            /* The outline is the state, and it is the only place a viewer
+             * learns that a click did anything. */
+            if (tiles[i].pinned)        SDL_SetRenderDrawColor(disp->renderer, 255, 193, 7, 255);
+            else if (tiles[i].on_main)  SDL_SetRenderDrawColor(disp->renderer, 33, 150, 243, 255);
+            else if (tiles[i].speaking) SDL_SetRenderDrawColor(disp->renderer, 76, 175, 80, 255);
+            else                        SDL_SetRenderDrawColor(disp->renderer, 64, 64, 64, 255);
+            SDL_RenderFillRect(disp->renderer, &cell);
+
+            SDL_FRect inner = { cell.x + 3.0f, cell.y + 3.0f, cell.w - 6.0f, cell.h - 6.0f };
+            SDL_SetRenderDrawColor(disp->renderer, 0, 0, 0, 255);
+            SDL_RenderFillRect(disp->renderer, &inner);
+
+            SDL_Texture *t = vd_tile_texture(disp, i, tiles[i].yuv,
+                                             tiles[i].width, tiles[i].height);
+            if (t) {
+                SDL_FRect dst = vd_fit(inner, tiles[i].width, tiles[i].height);
+                SDL_RenderTexture(disp->renderer, t, NULL, &dst);
+            }
+            vd_cell_label(disp, cell.x + 3.0f, cell.y, cell.h, tiles[i].label);
+
+            x += cell_w + gap;
+            if (x + cell_w > (float)win_w) break;
+        }
+    }
+
+    vd_render_local_pip(disp, local_yuv, local_w, local_h);
+    render_rtt_overlay(disp);
+    SDL_RenderPresent(disp->renderer);
+    return 0;
+}
+
+int video_display_render_grid(VideoDisplay *disp,
+                              const VideoTile *tiles, int ntiles,
+                              const uint8_t *local_yuv, int local_w, int local_h) {
+    if (!disp || !disp->renderer || !tiles || ntiles <= 0) return -1;
+    if (ntiles > VD_MAX_TILES) ntiles = VD_MAX_TILES;
+
+    int win_w = 0, win_h = 0;
+    SDL_GetWindowSize(disp->window, &win_w, &win_h);
+    if (win_w <= 0 || win_h <= 0) return -1;
+
+    /* Average the senders' aspects, so a portrait phone beside a landscape
+     * webcam does not pick a layout that suits neither. */
+    float aspect = 0.0f;
+    int counted = 0;
+    for (int i = 0; i < ntiles; i++) {
+        if (!tiles[i].yuv || tiles[i].width <= 0 || tiles[i].height <= 0) continue;
+        aspect += (float)tiles[i].width / (float)tiles[i].height;
+        counted++;
+    }
+    aspect = counted ? (aspect / (float)counted) : (4.0f / 3.0f);
+
+    int cols = vd_best_cols(ntiles, win_w, win_h, aspect);
+    int rows = (ntiles + cols - 1) / cols;
+    float cw = (float)win_w / (float)cols;
+    float ch = (float)win_h / (float)rows;
+
+    SDL_SetRenderDrawColor(disp->renderer, 16, 16, 16, 255);
+    SDL_RenderClear(disp->renderer);
+
+    for (int i = 0; i < ntiles; i++) {
+        float cx = (float)(i % cols) * cw;
+        float cy = (float)(i / cols) * ch;
+
+        SDL_Texture *t = vd_tile_texture(disp, i, tiles[i].yuv,
+                                         tiles[i].width, tiles[i].height);
+        if (t) {
+            float ta = (float)tiles[i].width / (float)tiles[i].height;
+            float w = cw, h = cw / ta;
+            if (h > ch) { h = ch; w = ch * ta; }
+            SDL_FRect dst = { cx + (cw - w) / 2.0f, cy + (ch - h) / 2.0f, w, h };
+            SDL_RenderTexture(disp->renderer, t, NULL, &dst);
+        }
+        vd_cell_label(disp, cx, cy, ch, tiles[i].label);
+    }
+
+    /* Separators, so two dark pictures do not read as one. */
+    SDL_SetRenderDrawColor(disp->renderer, 64, 64, 64, 255);
+    for (int c = 1; c < cols; c++) {
+        SDL_FRect v = { (float)c * cw - 1.0f, 0.0f, 2.0f, (float)win_h };
+        SDL_RenderFillRect(disp->renderer, &v);
+    }
+    for (int r = 1; r < rows; r++) {
+        SDL_FRect hz = { 0.0f, (float)r * ch - 1.0f, (float)win_w, 2.0f };
+        SDL_RenderFillRect(disp->renderer, &hz);
+    }
+
+    vd_render_local_pip(disp, local_yuv, local_w, local_h);
+    render_rtt_overlay(disp);
+    SDL_RenderPresent(disp->renderer);
+    return 0;
 }
 
 int video_display_open(VideoDisplay **disp, const char *title,
@@ -242,6 +587,10 @@ int video_display_render_pip(VideoDisplay *disp,
 
 void video_display_close(VideoDisplay *disp) {
     if (!disp) return;
+    for (int i = 0; i < VD_MAX_TILES; i++) {
+        if (disp->tile[i].tex) SDL_DestroyTexture(disp->tile[i].tex);
+    }
+    if (disp->main_tex) SDL_DestroyTexture(disp->main_tex);
     if (disp->local_texture) SDL_DestroyTexture(disp->local_texture);
     if (disp->texture) SDL_DestroyTexture(disp->texture);
     if (disp->renderer) SDL_DestroyRenderer(disp->renderer);

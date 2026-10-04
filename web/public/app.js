@@ -318,26 +318,45 @@
         const boxNonce = payload.slice(off, off + 24); off += 24;
         const boxCipher = payload.slice(off, off + 48); off += 48;
 
-        // Check for identity signature
+        // Identity signature (anti-MITM) - MANDATORY.
+        // A hostile relay, or any room member that answers KEY_REQUEST first,
+        // can otherwise hand us a room key it already knows and transparently
+        // MITM the conversation. This check used to "fail open": a missing or
+        // invalid signature only printed a warning and the key was accepted
+        // anyway. Anything short of a verified signature now aborts the join.
         const remaining = payload.length - off;
         let sigVerified = false;
-        if (remaining >= 96) { // 32 pk + 64 sig
+        if (remaining < 96) { // 32 pk + 64 sig
+            addSystemMessage(`REJECTED: "${senderName}" sent an unsigned key response.`);
+        } else {
             const idPk = payload.slice(off, off + 32);
             const sig = payload.slice(off + 32, off + 96);
-            sigVerified = await FearIdentity.verifyDetached(responderPk, sig, idPk);
-            if (sigVerified) {
+            if (!(await FearIdentity.verifyDetached(responderPk, sig, idPk))) {
+                addSystemMessage(`REJECTED: signature verification FAILED for "${senderName}" - possible MITM.`);
+            } else {
                 const tofu = FearIdentity.tofuCheck(senderName, idPk);
                 const fp = await FearIdentity.getFingerprint(idPk);
-                if (tofu === FearIdentity.TOFU_NEW_KEY) {
-                    addSystemMessage(`New identity for "${senderName}": ${fp} (TOFU)`);
-                } else if (tofu === FearIdentity.TOFU_KEY_CONFLICT) {
-                    addSystemMessage(`WARNING: Key CHANGED for "${senderName}"! Fingerprint: ${fp}`);
+                if (tofu === FearIdentity.TOFU_KEY_CONFLICT) {
+                    // Blocking: a changed identity key is exactly what an active
+                    // MITM looks like, so we must not proceed.
+                    addSystemMessage(`REJECTED: identity key CHANGED for "${senderName}" (${fp}) - possible MITM.`);
+                } else if (tofu === FearIdentity.TOFU_NEW_KEY) {
+                    addSystemMessage(`New identity for "${senderName}": ${fp} (trusted on first use)`);
+                    sigVerified = true;
                 } else {
                     addSystemMessage(`Key exchange verified: ${senderName} [${fp}]`);
+                    sigVerified = true;
                 }
-            } else {
-                addSystemMessage(`WARNING: Signature verification FAILED for "${senderName}"`);
             }
+        }
+
+        if (!sigVerified) {
+            addSystemMessage('Aborting key exchange - room key not accepted.');
+            if (window._ecdhReject) {
+                window._ecdhReject(new Error('Unverified key response rejected'));
+                window._ecdhReject = null;
+            }
+            return;
         }
 
         try {
@@ -345,7 +364,7 @@
             if (decryptedKey.length === 32) {
                 roomKey = new Uint8Array(decryptedKey);
                 keyInput.value = FearCrypto.b64Encode(roomKey);
-                addSystemMessage(`Room key received from "${senderName}"${sigVerified ? ' (verified)' : ' (unsigned)'}`);
+                addSystemMessage(`Room key received from "${senderName}" (identity verified)`);
 
                 if (window._ecdhResolve) {
                     window._ecdhResolve(roomKey);
@@ -604,9 +623,21 @@
         }
 
         if (result.crcMatch) {
-            addFileMessage(`File received: "${result.filename}" (${FearFileTransfer.formatSize(result.size)}) — CRC OK`);
-            // Auto-download
-            FearFileTransfer.triggerDownload(result.filename, result.data);
+            // Strip C0 controls and bidi overrides before showing or saving
+            // the name. A right-to-left override lets an attacker disguise an
+            // executable as an image (the classic "photo\u202Egpj.exe" trick).
+            const safeName = String(result.filename)
+                .replace(/[\u0000-\u001F\u007F\u200E\u200F\u202A-\u202E\u2066-\u2069]/g, '');
+            addFileMessage(`File received: "${safeName}" (${FearFileTransfer.formatSize(result.size)}) — CRC OK`);
+            // Ask first. Any room participant can push a file, and silently
+            // dropping an attacker-named file into Downloads is a malware
+            // delivery path, not a convenience feature.
+            if (confirm(`Save "${safeName}" (${FearFileTransfer.formatSize(result.size)}) to your Downloads folder?\n\n` +
+                        `Only accept files from people you trust.`)) {
+                FearFileTransfer.triggerDownload(safeName, result.data);
+            } else {
+                addSystemMessage(`Download of "${safeName}" declined.`);
+            }
         } else {
             addFileMessage(`File received: "${result.filename}" — CRC MISMATCH (corrupted)`);
         }

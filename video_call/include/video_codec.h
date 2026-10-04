@@ -48,6 +48,18 @@ int video_encoder_encode(VideoEncoder *enc, const uint8_t *yuv_in,
  * @param bitrate_kbps New target bitrate in kbps
  * @return 0 on success, -1 on error
  */
+/**
+ * @brief Make the next encoded frame a keyframe
+ * @param enc Encoder context (safe to pass NULL)
+ *
+ * A stream only becomes decodable at a keyframe, so a participant joining an
+ * established call sees nothing from us until the next one. Waiting for the
+ * GOP to come round is not good enough: gop_size counts frames, so a camera
+ * running below the configured rate stretches that interval by the same
+ * factor.
+ */
+void video_encoder_request_keyframe(VideoEncoder *enc);
+
 int video_encoder_set_bitrate(VideoEncoder *enc, int bitrate_kbps);
 
 /**

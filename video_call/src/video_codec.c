@@ -25,6 +25,7 @@ struct VideoEncoder {
     int width;
     int height;
     int64_t pts;
+    int force_key;   /**< emit a keyframe on the next encode */
 };
 
 int video_encoder_open(VideoEncoder **enc, int width, int height,
@@ -122,6 +123,19 @@ int video_encoder_encode(VideoEncoder *enc, const uint8_t *yuv_in,
 
     enc->frame->pts = enc->pts++;
 
+    /* gop_size counts frames, not seconds, so it cannot be the only source
+     * of keyframes: a camera running slower than the configured rate
+     * stretches the interval by the same factor, and a participant who
+     * joins in the gap decodes nothing at all until it closes. Callers ask
+     * for one when somebody new arrives. */
+    if (enc->force_key) {
+        enc->frame->pict_type = AV_PICTURE_TYPE_I;
+        enc->force_key = 0;
+    } else {
+        /* Left set, every subsequent frame would be a keyframe. */
+        enc->frame->pict_type = AV_PICTURE_TYPE_NONE;
+    }
+
     int ret = avcodec_send_frame(enc->ctx, enc->frame);
     if (ret < 0) return -1;
 
@@ -139,6 +153,10 @@ int video_encoder_encode(VideoEncoder *enc, const uint8_t *yuv_in,
     av_packet_unref(enc->pkt);
 
     return size;
+}
+
+void video_encoder_request_keyframe(VideoEncoder *enc) {
+    if (enc) enc->force_key = 1;
 }
 
 int video_encoder_set_bitrate(VideoEncoder *enc, int bitrate_kbps) {

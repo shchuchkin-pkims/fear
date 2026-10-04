@@ -26,7 +26,7 @@
  * - unzip utility (for archive extraction)
  *
  * @author F.E.A.R. Project contributors
- * @license MIT (free to use)
+ * @license GPL-3.0-or-later (see LICENSING.md)
  * @version 1.0
  */
 
@@ -55,6 +55,7 @@
 #endif
 
 #include <curl/curl.h>
+#include <sodium.h>
 
 #define CONF_PATH_DEFAULT "updater.conf"
 #define GITHUB_API_TPL "https://api.github.com/repos/%s/%s/releases/latest"
@@ -80,6 +81,7 @@ typedef struct {
     char app_path[MAX_PATH_LEN];     /**< Path to application binary to update */
     char version_arg[64];            /**< Command-line argument to get version (e.g., "--version") */
     char asset_prefix[MAX_PREFIX];   /**< Prefix filter for release assets (e.g., "fear-v") */
+    char pubkey[128];                /**< base64 Ed25519 public key that releases must be signed with */
 } Config;
 
 /**
@@ -212,6 +214,7 @@ static void load_config(const char *path, Config *cfg) {
         else if(strcmp(key,"app_path")==0)   strncpy(cfg->app_path,val,sizeof(cfg->app_path)-1);
         else if(strcmp(key,"version_arg")==0) strncpy(cfg->version_arg,val,sizeof(cfg->version_arg)-1);
         else if(strcmp(key,"asset_prefix")==0) strncpy(cfg->asset_prefix,val,sizeof(cfg->asset_prefix)-1);
+        else if(strcmp(key,"pubkey")==0) strncpy(cfg->pubkey,val,sizeof(cfg->pubkey)-1);
     }
     fclose(f);
     if(cfg->repo_owner[0]=='\0' || cfg->repo_name[0]=='\0' ||
@@ -569,6 +572,168 @@ static bool json_find_asset_url_by_name(const char *json, const char *asset_name
     return true;
 }
 
+/**
+ * @brief Find a release asset whose name starts with `prefix` and ends in ".zip".
+ *
+ * The old exact-name lookup demanded "<prefix>-<os>-<arch>.zip", but the release
+ * workflow puts the version in the file name ("fear-linux-x86_64-v0.5.0.zip"),
+ * so the updater could never find its asset and every run died with "Suitable
+ * asset not found". Matching on the prefix keeps the human-readable versioned
+ * names and returns the real name so the ".sig" asset can be located too.
+ */
+static bool json_find_asset_by_prefix(const char *json, const char *prefix,
+                                      char *out_name, size_t name_sz,
+                                      char *out_url, size_t url_sz) {
+    const char *p = json;
+    const size_t plen = strlen(prefix);
+
+    while ((p = strstr(p, "\"name\"")) != NULL) {
+        const char *v = strchr(p, ':');
+        if (!v) return false;
+        v++;
+        while (*v && isspace((unsigned char)*v)) v++;
+        if (*v != '"') { p += 6; continue; }
+        v++;
+
+        char name[512];
+        size_t i = 0;
+        while (*v && *v != '"') {
+            if (*v == '\\' && v[1]) v++;
+            if (i < sizeof(name) - 1) name[i++] = *v;
+            v++;
+        }
+        name[i] = '\0';
+
+        size_t nlen = strlen(name);
+        if (nlen > 4 && strncmp(name, prefix, plen) == 0 &&
+            strcmp(name + nlen - 4, ".zip") == 0) {
+            const char *q = strstr(v, "\"browser_download_url\"");
+            if (!q) return false;
+            q = strchr(q, ':');
+            if (!q) return false;
+            q++;
+            while (*q && isspace((unsigned char)*q)) q++;
+            if (*q != '"') return false;
+            q++;
+            size_t j = 0;
+            while (*q && *q != '"') {
+                if (*q == '\\' && q[1]) q++;
+                if (j + 1 < url_sz) out_url[j++] = *q;
+                q++;
+            }
+            out_url[j] = '\0';
+            strncpy(out_name, name, name_sz - 1);
+            out_name[name_sz - 1] = '\0';
+            return true;
+        }
+        p = v;
+    }
+    return false;
+}
+
+/* ---------- Update authenticity ---------- */
+
+/**
+ * @brief Verify a detached Ed25519 signature over a downloaded file.
+ *
+ * Without this the updater installed whatever the release endpoint served and
+ * then executed it, so anyone able to publish a release - or to tamper with the
+ * artifact - got code execution on every user's machine. TLS only proves we
+ * talked to GitHub; it says nothing about who produced the file.
+ *
+ * @return true only if the signature verifies against pubkey_b64.
+ */
+static bool verify_file_signature(const char *file_path,
+                                  const char *sig_b64,
+                                  const char *pubkey_b64) {
+    unsigned char pk[crypto_sign_PUBLICKEYBYTES];
+    unsigned char sig[crypto_sign_BYTES];
+    size_t pk_len = 0, sig_len = 0;
+
+    if (sodium_base642bin(pk, sizeof(pk), pubkey_b64, strlen(pubkey_b64),
+                          " \t\r\n", &pk_len, NULL,
+                          sodium_base64_VARIANT_ORIGINAL) != 0 ||
+        pk_len != sizeof(pk)) {
+        fprintf(stderr, "Invalid 'pubkey' in config (expected base64 of %d bytes)\n",
+                (int)sizeof(pk));
+        return false;
+    }
+    if (sodium_base642bin(sig, sizeof(sig), sig_b64, strlen(sig_b64),
+                          " \t\r\n", &sig_len, NULL,
+                          sodium_base64_VARIANT_ORIGINAL) != 0 ||
+        sig_len != sizeof(sig)) {
+        fprintf(stderr, "Invalid signature file (expected base64 of %d bytes)\n",
+                (int)sizeof(sig));
+        return false;
+    }
+
+    FILE *f = fopen(file_path, "rb");
+    if (!f) { fprintf(stderr, "Cannot open %s for verification\n", file_path); return false; }
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return false; }
+    long sz = ftell(f);
+    if (sz < 0) { fclose(f); return false; }
+    rewind(f);
+
+    unsigned char *data = (unsigned char *)malloc((size_t)sz ? (size_t)sz : 1);
+    if (!data) { fclose(f); return false; }
+    if (fread(data, 1, (size_t)sz, f) != (size_t)sz) {
+        free(data); fclose(f);
+        fprintf(stderr, "Short read while verifying %s\n", file_path);
+        return false;
+    }
+    fclose(f);
+
+    int ok = crypto_sign_verify_detached(sig, data, (unsigned long long)sz, pk);
+    free(data);
+    return ok == 0;
+}
+
+/**
+ * @brief Reject archives whose entries would escape the extraction directory.
+ *
+ * unzip and Expand-Archive will follow "../" and absolute paths (Zip Slip), and
+ * the extracted tree is afterwards copied over the install directory, so a
+ * crafted archive could drop files anywhere the user can write.
+ */
+static bool zip_entries_are_safe(const char *zip_path) {
+    char cmd[MAX_PATH_LEN + 256];
+#ifdef _WIN32
+    snprintf(cmd, sizeof(cmd),
+        "powershell -NoProfile -Command \"Add-Type -AssemblyName System.IO.Compression.FileSystem; "
+        "[IO.Compression.ZipFile]::OpenRead('%s').Entries | ForEach-Object { $_.FullName }\"",
+        zip_path);
+#else
+    snprintf(cmd, sizeof(cmd), "unzip -Z1 '%s' 2>/dev/null", zip_path);
+#endif
+    FILE *pp = popen(cmd, "r");
+    if (!pp) {
+        fprintf(stderr, "Cannot list archive contents for validation\n");
+        return false;
+    }
+
+    char line[2048];
+    bool safe = true;
+    int entries = 0;
+    while (fgets(line, sizeof(line), pp)) {
+        trim(line);
+        if (line[0] == '\0') continue;
+        entries++;
+        /* Absolute paths, drive letters and any ".." component are refused. */
+        if (line[0] == '/' || line[0] == '\\' ||
+            strstr(line, "..") != NULL || strchr(line, ':') != NULL) {
+            fprintf(stderr, "Refusing archive: unsafe entry '%s'\n", line);
+            safe = false;
+        }
+    }
+    pclose(pp);
+
+    if (entries == 0) {
+        fprintf(stderr, "Refusing archive: entry list could not be read\n");
+        return false;
+    }
+    return safe;
+}
+
 /* ---------- ZIP extraction ---------- */
 
 /**
@@ -656,8 +821,17 @@ int main(int argc, char **argv) {
     printf("Config found\n");
 
     (void)argc; (void)argv;
+    if (sodium_init() < 0) die("libsodium initialisation failed");
+
     Config cfg;
     load_config(CONF_PATH_DEFAULT, &cfg);
+
+    /* Fail closed: an updater that cannot check who signed a release is just a
+     * remote code execution primitive with extra steps. */
+    if (cfg.pubkey[0] == '\0') {
+        die("No 'pubkey' in updater.conf - refusing to install unverified updates.\n"
+            "       Add the release signing public key (see doc/RELEASE_SIGNING.md).");
+    }
 
     printf("== Updater ==\n");
     printf("Repo: %s/%s\n", cfg.repo_owner, cfg.repo_name);
@@ -699,15 +873,29 @@ int main(int argc, char **argv) {
     char osarch[64];
     detect_os_arch(osarch, sizeof(osarch));
 
-    // Compose expected asset name - always use .zip for both platforms
-    char asset_name[256];
-    snprintf(asset_name, sizeof(asset_name), "%s-%s.zip", cfg.asset_prefix, osarch);
-    printf("Looking for asset: %s\n", asset_name);
+    /* Match by prefix: the release workflow appends the version to the file
+     * name, so "<prefix>-<os>-<arch>" is all we can rely on. */
+    char asset_prefix_full[256];
+    snprintf(asset_prefix_full, sizeof(asset_prefix_full), "%s-%s", cfg.asset_prefix, osarch);
+    printf("Looking for asset starting with: %s\n", asset_prefix_full);
 
+    char asset_name[256] = "";
     char dl_url[MAX_URL]="";
-    if(!json_find_asset_url_by_name(mb.data, asset_name, dl_url, sizeof(dl_url))) {
+    if(!json_find_asset_by_prefix(mb.data, asset_prefix_full,
+                                   asset_name, sizeof(asset_name),
+                                   dl_url, sizeof(dl_url))) {
         free(mb.data);
         die("Suitable asset not found in release. Check asset_prefix/os-arch/filename in releases.");
+    }
+    printf("Found asset: %s\n", asset_name);
+
+    /* Detached signature, published next to the archive as <asset>.sig */
+    char sig_asset[320];
+    snprintf(sig_asset, sizeof(sig_asset), "%s.sig", asset_name);
+    char sig_url[MAX_URL]="";
+    if(!json_find_asset_url_by_name(mb.data, sig_asset, sig_url, sizeof(sig_url))) {
+        free(mb.data);
+        dief("Release has no signature asset '%s' - refusing to update.", sig_asset);
     }
     free(mb.data);
 
@@ -716,6 +904,35 @@ int main(int argc, char **argv) {
     snprintf(zip_path, sizeof(zip_path), "update_temp.zip");
     printf("Downloading to: %s\n", zip_path);
     http_download_to_file(dl_url, zip_path);
+
+    /* Authenticate before the archive is allowed to touch anything. */
+    char sig_path[MAX_PATH_LEN];
+    snprintf(sig_path, sizeof(sig_path), "update_temp.sig");
+    printf("Downloading signature...\n");
+    http_download_to_file(sig_url, sig_path);
+
+    char sig_b64[256] = {0};
+    FILE *sf = fopen(sig_path, "r");
+    if (!sf) { remove(zip_path); remove(sig_path); die("Cannot open downloaded signature"); }
+    if (!fgets(sig_b64, sizeof(sig_b64), sf)) {
+        fclose(sf); remove(zip_path); remove(sig_path);
+        die("Signature file is empty");
+    }
+    fclose(sf);
+    trim(sig_b64);
+    remove(sig_path);
+
+    printf("Verifying signature...\n");
+    if (!verify_file_signature(zip_path, sig_b64, cfg.pubkey)) {
+        remove(zip_path);
+        die("SIGNATURE VERIFICATION FAILED - update rejected.");
+    }
+    printf("Signature OK.\n");
+
+    if (!zip_entries_are_safe(zip_path)) {
+        remove(zip_path);
+        die("Archive contains unsafe paths - update rejected.");
+    }
 
     // Extract ZIP to temporary directory
     char extract_dir[MAX_PATH_LEN];

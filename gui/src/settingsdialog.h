@@ -16,6 +16,7 @@
 #include <QTabWidget>
 #include <QSettings>
 #include <QFontComboBox>
+#include <QSlider>
 #include <QSpinBox>
 #include <QComboBox>
 #include <QCheckBox>
@@ -58,11 +59,34 @@ private:
     QSpinBox *fontSizeSpin;
 
     /* Audio tab */
+    /* Микрофон: чувствительность и подавление фона. Микрофоны у людей
+     * разные - гарнитура у рта и микрофон в крышке ноутбука отличаются на
+     * добрый десяток децибел, - а автоматика системы выравнивает это не
+     * всегда. Поэтому руками. */
+    QSlider   *micGainSlider = nullptr;
+    QLabel    *micGainValue  = nullptr;
+    QComboBox *noiseSuppressCombo = nullptr;
+
     QComboBox *audioInputCombo;
     QComboBox *audioOutputCombo;
 
     /* Video tab */
+    /* Сервер STUN: пусто - звонки идут через ретранслятор. */
+    /* Внешний слой TLS для связи с ретранслятором. */
+    QCheckBox *tlsCheck = nullptr;
+    QLineEdit *tlsPinEdit = nullptr;
+
+    QLineEdit *stunServerEdit = nullptr;
+
     QComboBox *videoQualityCombo;
+    /* Ручное качество: готовые наборы покрывают обычные случаи, но не все.
+     * Узкий канал, слабая камера или, наоборот, гигабитная сеть - там нужны
+     * свои числа, а не ближайший из трёх. */
+    QWidget   *manualVideoBox = nullptr;
+    QSpinBox  *videoWidthSpin = nullptr;
+    QSpinBox  *videoHeightSpin = nullptr;
+    QSpinBox  *videoFpsSpin = nullptr;
+    QSpinBox  *videoBitrateSpin = nullptr;
     QComboBox *videoCameraCombo;
 
     /* Privacy tab */

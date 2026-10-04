@@ -1,0 +1,13 @@
+// Артефакты сборки и служебные каталоги — НЕ синхронизируем
+(?d)build
+(?d).git
+(?d)node_modules
+(?d)__pycache__
+(?d)dist
+(?d).next
+(?d).Xil
+*.bit
+// Тяжёлые вендоренные Windows-бинарники и release-архивы (на рабочую сторону не нужны)
+ffmpeg-win64-old
+fear-windows-x86_64.zip
+fear-linux-x86_64.zip

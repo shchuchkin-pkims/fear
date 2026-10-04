@@ -57,12 +57,17 @@ if [ -f "build/fear_gui" ]; then
     echo "  ✓ GUI included"
 fi
 
-# Copy only manual.pdf from documentation
-if [ -f "doc/manual.pdf" ]; then
-    mkdir -p "$TEMP_DIR/doc"
-    cp doc/manual.pdf "$TEMP_DIR/doc/" 2>/dev/null || true
-    echo "  ✓ manual.pdf included"
-fi
+# GPL требует отдавать текст лицензии вместе с программой.
+cp LICENSE LICENSE.GPL-3.0 LICENSING.md "$TEMP_DIR/" 2>/dev/null || true
+
+# Documentation: the manual and "how it works" (English and Russian)
+mkdir -p "$TEMP_DIR/doc"
+for pdf in manual.pdf how-it-works.pdf how-it-works.ru.pdf; do
+    if [ -f "doc/$pdf" ]; then
+        cp "doc/$pdf" "$TEMP_DIR/doc/"
+        echo "  ✓ $pdf included"
+    fi
+done
 
 # Create the ZIP archive
 echo ""

@@ -64,18 +64,72 @@ REM ============================================================================
 
 echo %YELLOW%Checking dependencies...%NC%
 
+REM The old check looked for cmake and gcc, announced "All dependencies found"
+REM and then let CMake fail much later on a missing library. It also never
+REM looked at lib\, which a fresh clone does NOT have: lib\ is in .gitignore,
+REM so the prebuilt Windows libraries are not part of the repository. Collect
+REM everything that is missing and report it in one pass.
+
+set "DEPS_OK=1"
+
 where cmake >nul 2>&1
 if errorlevel 1 (
-    echo %RED%CMake is not installed or not in PATH%NC%
-    echo Please install CMake from https://cmake.org/download/
-    pause
-    exit /b 1
+    echo   command: cmake            - https://cmake.org/download/
+    set "DEPS_OK=0"
 )
 
 where gcc >nul 2>&1
 if errorlevel 1 (
-    echo %RED%GCC/MinGW is not installed or not in PATH%NC%
-    echo Please install MinGW-w64 or add it to PATH
+    echo   command: gcc ^(MinGW-w64^)  - https://winlibs.com/ or MSYS2
+    set "DEPS_OK=0"
+)
+
+REM Qt6 is needed for fear_gui. windeployqt ships with every Qt install and is
+REM what the packaging step below calls, so its absence is the useful signal.
+where windeployqt >nul 2>&1
+if errorlevel 1 (
+    where qmake6 >nul 2>&1
+    if errorlevel 1 (
+        echo   toolkit: Qt6             - https://www.qt.io/download, add its bin\ to PATH
+        set "DEPS_OK=0"
+    )
+)
+
+REM Library directories, with the exact names CMakeLists.txt expects. Renaming
+REM any of these breaks the build with a confusing CMake error instead of this
+REM message, so they are spelled out rather than globbed.
+if not exist "%PROJECT_ROOT%\lib\libsodium-win64\include\sodium.h" (
+    echo   library: lib\libsodium-win64             - libsodium
+    set "DEPS_OK=0"
+)
+if not exist "%PROJECT_ROOT%\lib\curl-8.15.0_5-win64-mingw" (
+    echo   library: lib\curl-8.15.0_5-win64-mingw   - libcurl ^(updater^)
+    set "DEPS_OK=0"
+)
+if not exist "%PROJECT_ROOT%\lib\opus-1.5.2" (
+    echo   library: lib\opus-1.5.2                  - Opus ^(audio calls^)
+    set "DEPS_OK=0"
+)
+if not exist "%PROJECT_ROOT%\lib\portaudio" (
+    echo   library: lib\portaudio                   - PortAudio ^(audio I/O^)
+    set "DEPS_OK=0"
+)
+if not exist "%PROJECT_ROOT%\lib\ffmpeg-win64" (
+    echo   library: lib\ffmpeg-win64                - FFmpeg ^(video calls^)
+    set "DEPS_OK=0"
+)
+if not exist "%PROJECT_ROOT%\lib\SDL3-win64" (
+    echo   library: lib\SDL3-win64                  - SDL3 ^(video display^)
+    set "DEPS_OK=0"
+)
+
+if "%DEPS_OK%"=="0" (
+    echo.
+    echo %RED%Missing dependencies - the build would fail later, stopping here.%NC%
+    echo See doc\BUILD.md for exactly where each library goes and where to get it.
+    echo.
+    echo Note: lib\ is not part of the git repository, so a fresh clone always
+    echo needs the libraries above to be placed there once.
     pause
     exit /b 1
 )

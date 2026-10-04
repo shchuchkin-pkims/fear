@@ -37,8 +37,10 @@ class Backend : public QObject {
     Q_OBJECT
 
 public:
-    /** Connection mode for key exchange */
-    enum ConnectMode { MANUAL_KEY, CREATE_ROOM, JOIN_ROOM };
+    /** Connection mode for key exchange. AUTO probes the server first
+     *  (MSG_TYPE_ROOM_INFO_REQUEST) and resolves to CREATE_ROOM for an
+     *  empty room or JOIN_ROOM for a populated one — no blind 5s wait. */
+    enum ConnectMode { MANUAL_KEY, CREATE_ROOM, JOIN_ROOM, AUTO };
 
     /**
      * @brief Constructs a new backend
@@ -62,6 +64,15 @@ public:
     int serverPort;               ///< Server port from last connection
     QString currentRoom;          ///< Current room name
     QString currentName;          ///< Current user name
+    /**
+     * Метка этой сессии на проводе.
+     *
+     * Имя ретранслятор больше не видит, поэтому там, где раньше подошло бы
+     * имя - регистрация звонка на сервере, - теперь нужна метка. Приходит
+     * строкой [SESSION] из консольного клиента; пока её нет, звонок через
+     * ретранслятор регистрировать не по чему.
+     */
+    QString currentTag;
 
     /**
      * @brief Sets the path to the CLI executable
@@ -144,7 +155,26 @@ public:
      * @brief Generates a new Ed25519 identity keypair
      * @return true if identity generated successfully
      */
-    bool generateIdentity();
+    /**
+     * @brief Announce a call to the room over the encrypted chat channel.
+     *
+     * The CLI draws the call_id and reports it back, which arrives as
+     * callInviteSent(). Host and port are an optional hint for a direct
+     * connection; leave them empty for a relayed or group call.
+     */
+    /**
+     * Позвать комнату в звонок.
+     *
+     * @param reuseCallId непусто - взять этот идентификатор вместо нового.
+     *        Нужно для второго приглашения: первое объявляет звонок, а адрес
+     *        становится известен позже, когда процесс звонка спросит его у
+     *        сервера STUN. Нарисуй мы там новый идентификатор - собеседник
+     *        счёл бы это вторым, отдельным звонком.
+     */
+    bool sendCallInvite(const QString &host, quint16 port, bool video,
+                        const QString &reuseCallId = QString());
+
+    bool generateIdentity(bool copyToClipboard = true);
 
     /**
      * @brief Check if identity key is available
@@ -156,6 +186,21 @@ signals:
     /**
      * @brief Emitted when client successfully connects
      */
+    /**
+     * @brief A room member announced a call.
+     * @param sender who is calling
+     * @param callId 32 hex chars; every media key of that call is bound to it
+     * @param host   direct-connection hint, empty when the call is relayed
+     * @param port   direct-connection hint, 0 when the call is relayed
+     * @param video  true when the invite offers video
+     */
+    void callInviteReceived(const QString &sender, const QString &callId,
+                            const QString &host, quint16 port, bool video);
+
+    /** @brief Our own invite went out; carries the id we must now use. */
+    void callInviteSent(const QString &callId, const QString &host,
+                        quint16 port, bool video);
+
     void connected();
 
     /**
@@ -234,6 +279,15 @@ private slots:
     void onServerFinished(int exitCode, QProcess::ExitStatus status);
 
 private:
+    /**
+     * @brief Ensure cliPath points at an existing binary.
+     *
+     * Falls back to <applicationDirPath>/bin/fear(.exe) when the configured
+     * path is empty or stale. Never resolves against the working directory.
+     * @return true if cliPath is usable after the call
+     */
+    bool resolveCliPath();
+
     /**
      * @brief Parses client output for messages and status updates
      * @param s Output string from client

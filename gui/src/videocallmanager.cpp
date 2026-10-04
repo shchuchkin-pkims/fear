@@ -3,6 +3,7 @@
  * @brief Implementation of video call process manager
  */
 
+#include <QSettings>
 #include "videocallmanager.h"
 #include <QApplication>
 #include <QFile>
@@ -80,6 +81,36 @@ QStringList VideoCallManager::buildArgs(const QString &quality, bool adaptive,
     if (noVideo) args << "--no-video";
     if (noAudio) args << "--no-audio";
 
+    /*
+     * Настройки микрофона из общих настроек программы.
+     *
+     * Читаются здесь, а не запоминаются при старте: человек может открыть
+     * настройки и подвинуть ползунок между звонками, и следующий звонок
+     * должен пойти уже с новым значением, без перезапуска программы.
+     */
+    {
+        QSettings st;
+        const int gain = st.value(QStringLiteral("audio/micGainDb"), 0).toInt();
+        const QString ns = st.value(QStringLiteral("audio/noiseSuppress"),
+                                    QStringLiteral("medium")).toString();
+        if (gain != 0) args << QStringLiteral("--mic-gain") << QString::number(gain);
+        args << QStringLiteral("--noise-suppress") << ns;
+    }
+
+    /*
+     * Сервер, у которого спросить свой адрес снаружи.
+     *
+     * Пусто - не спрашивать. Так по умолчанию, и это осознанно: прямой
+     * звонок раскрывает ваш адрес собеседнику, чего ретранслятор не делает.
+     * Выигрыш - меньше задержка и оператор ретранслятора не видит потока;
+     * цена - собеседник видит, откуда вы. Решать это за человека нельзя.
+     */
+    {
+        QSettings st;
+        const QString stun = st.value(QStringLiteral("call/stunServer")).toString().trimmed();
+        if (!stun.isEmpty()) args << QStringLiteral("--stun") << stun;
+    }
+
     return args;
 }
 
@@ -109,6 +140,9 @@ bool VideoCallManager::startCall(const QString &remoteIp, quint16 remotePort, co
 
     QStringList args;
     args << "call" << remoteIp << QString::number(remotePort);
+    if (!callId.isEmpty()) {
+        args << "--call-id" << callId;
+    }
     args << buildArgs(quality, adaptive, width, height, fps, bitrate,
                       camera, audioInput, audioOutput, noVideo, noAudio);
     // Pass identity file if available
@@ -139,7 +173,8 @@ bool VideoCallManager::startCall(const QString &remoteIp, quint16 remotePort, co
         callProcess = nullptr;
         return false;
     }
-    callProcess->closeWriteChannel();
+    /* Канал не закрываем: за ключом по нему идут имена участников. */
+    sendPeerNames();
 
     emit callStarted();
     return true;
@@ -171,6 +206,9 @@ bool VideoCallManager::startListening(quint16 localPort, const QString &key,
 
     QStringList args;
     args << "listen" << QString::number(localPort);
+    if (!callId.isEmpty()) {
+        args << "--call-id" << callId;
+    }
     args << buildArgs(quality, adaptive, width, height, fps, bitrate,
                       camera, audioInput, audioOutput, noVideo, noAudio);
     // Pass identity file if available
@@ -198,7 +236,8 @@ bool VideoCallManager::startListening(quint16 localPort, const QString &key,
         callProcess = nullptr;
         return false;
     }
-    callProcess->closeWriteChannel();
+    /* Канал не закрываем: за ключом по нему идут имена участников. */
+    sendPeerNames();
 
     emit listeningStarted();
     return true;
@@ -232,6 +271,9 @@ bool VideoCallManager::startRelay(const QString &serverIp, quint16 serverPort,
     QStringList args;
     args << "relay" << serverIp << QString::number(serverPort)
          << "--room" << room << "--name" << name;
+    if (!callId.isEmpty()) {
+        args << "--call-id" << callId;
+    }
     args << buildArgs(quality, adaptive, width, height, fps, bitrate,
                       camera, audioInput, audioOutput, noVideo, noAudio);
     if (!identityFilePath.isEmpty() && QFile::exists(identityFilePath)) {
@@ -258,7 +300,8 @@ bool VideoCallManager::startRelay(const QString &serverIp, quint16 serverPort,
         callProcess = nullptr;
         return false;
     }
-    callProcess->closeWriteChannel();
+    /* Канал не закрываем: за ключом по нему идут имена участников. */
+    sendPeerNames();
 
     emit callStarted();
     return true;
@@ -285,9 +328,20 @@ QString VideoCallManager::getCurrentKey() const {
 }
 
 void VideoCallManager::onProcessOutput() {
-    if (callProcess) {
-        QString out = QString::fromUtf8(callProcess->readAllStandardOutput());
-        emit this->output(out);
+    if (!callProcess) return;
+    const QString out = QString::fromUtf8(callProcess->readAllStandardOutput());
+    emit this->output(out);
+
+    /* Свой адрес снаружи - см. AudioCallManager. */
+    for (const QString &line : out.split(QLatin1Char('\n'), Qt::SkipEmptyParts)) {
+        const QString t = line.trimmed();
+        if (!t.startsWith(QStringLiteral("[CANDIDATE] "))) continue;
+        const QStringList parts = t.mid(12).split(QLatin1Char(' '), Qt::SkipEmptyParts);
+        if (parts.size() != 2) continue;
+        bool ok = false;
+        const uint prt = parts[1].toUInt(&ok);
+        if (!ok || prt == 0 || prt > 65535) continue;
+        emit candidateDiscovered(parts[0], (quint16)prt);
     }
 }
 
@@ -310,9 +364,10 @@ QString VideoCallManager::findVideoCallApp() {
     QStringList possiblePaths = {
         QApplication::applicationDirPath() + "/video_call",
         QApplication::applicationDirPath() + "/bin/video_call",
-        QApplication::applicationDirPath() + "/../bin/video_call",
-        "video_call",
-        "./video_call"
+        QApplication::applicationDirPath() + "/../bin/video_call"
+        /* No bare name and no "./" fallback - see AudioCallManager: those resolve
+         * through PATH or the working directory and would run an attacker's
+         * binary if the GUI is started from a writable directory. */
     };
 
 #ifdef Q_OS_WIN
@@ -328,4 +383,26 @@ QString VideoCallManager::findVideoCallApp() {
     }
 
     return QString();
+}
+
+static QByteArray peerNameLine(const QString &tag, QString name) {
+    // Одна строка на имя: перевод строки внутри имени разорвал бы протокол.
+    name.replace(QLatin1Char('\n'), QLatin1Char(' ')).replace(QLatin1Char('\r'), QLatin1Char(' '));
+    return QStringLiteral("name %1 %2\n").arg(tag, name).toUtf8();
+}
+
+void VideoCallManager::sendPeerNames() {
+    if (!callProcess) return;
+    for (auto it = peerNames.cbegin(); it != peerNames.cend(); ++it) {
+        callProcess->write(peerNameLine(it.key(), it.value()));
+    }
+}
+
+void VideoCallManager::setPeerName(const QString &tag, const QString &name) {
+    if (tag.isEmpty() || name.isEmpty() || tag.contains(QLatin1Char(' '))) return;
+    if (peerNames.value(tag) == name) return;
+    peerNames.insert(tag, name);
+    if (callProcess && callProcess->state() == QProcess::Running) {
+        callProcess->write(peerNameLine(tag, name));
+    }
 }

@@ -19,7 +19,11 @@ set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib")
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")  # Статическая линковка для MSVC
 set(CMAKE_POSITION_INDEPENDENT_CODE OFF)  # Отключаем PIC для статической линковки
 
-find_package(Qt6 REQUIRED COMPONENTS Widgets)
+find_package(Qt6 REQUIRED COMPONENTS Widgets Network Sql Concurrent)
+
+# Bake version into GUI for the auto-update check (must match PROGRAM_VERSION in
+# client-console/src/main.c).
+add_compile_definitions(FEAR_VERSION="0.6.0")
 
 # Получаем путь к windeployqt (только для Windows)
 if(WIN32)
@@ -28,66 +32,32 @@ if(WIN32)
     find_program(WINDEPLOYQT_EXECUTABLE windeployqt HINTS "${QT_BIN_DIR}")
 endif()
 
-# Конфигурация libsodium для разных платформ
-if(WIN32)
-    # Для Windows используем прямые слеши для путей
-    set(LIBSODIUM_PATH "${CMAKE_SOURCE_DIR}/../../lib/libsodium-win64" CACHE PATH "Path to libsodium directory (should contain include/ and lib/ folders)")
+# Конфигурация libsodium для разных платформ.
+#
+# Под Windows исторически использовался prebuilt-архив libsodium-win64
+# в каталоге `lib/`. Если его нет — пробуем pkg-config (это работает в
+# CI через MSYS2 / pacman -S mingw-w64-x86_64-libsodium). На Linux всегда
+# идём через pkg-config.
+set(LIBSODIUM_PATH "${CMAKE_SOURCE_DIR}/../../lib/libsodium-win64" CACHE PATH
+    "Optional path to a libsodium prebuilt directory (Windows)")
 
-    if(LIBSODIUM_PATH)
-        message(STATUS "Using libsodium from: ${LIBSODIUM_PATH}")
+if(WIN32 AND EXISTS "${LIBSODIUM_PATH}/include/sodium.h")
+    message(STATUS "Using libsodium from: ${LIBSODIUM_PATH}")
+    set(LIBSODIUM_INCLUDE_DIRS ${LIBSODIUM_PATH}/include)
 
-        # Проверяем существование директории
-        if(NOT EXISTS ${LIBSODIUM_PATH})
-            message(FATAL_ERROR "Libsodium directory not found: ${LIBSODIUM_PATH}")
-        endif()
-
-        # Include директории
-        if(EXISTS ${LIBSODIUM_PATH}/include)
-            set(LIBSODIUM_INCLUDE_DIRS ${LIBSODIUM_PATH}/include)
-            message(STATUS "Found include directory: ${LIBSODIUM_INCLUDE_DIRS}")
-        else()
-            message(FATAL_ERROR "Cannot find include directory in ${LIBSODIUM_PATH}")
-        endif()
-
-        # Проверяем наличие заголовочного файла
-        if(NOT EXISTS ${LIBSODIUM_INCLUDE_DIRS}/sodium.h)
-            message(FATAL_ERROR "sodium.h not found in ${LIBSODIUM_INCLUDE_DIRS}")
-        endif()
-
-        # Принудительно используем статическую библиотеку
-        # В первую очередь ищем статическую библиотеку libsodium.a
-        if(EXISTS ${LIBSODIUM_PATH}/lib/libsodium.a)
-            set(LIBSODIUM_LIBRARIES ${LIBSODIUM_PATH}/lib/libsodium.a)
-            message(STATUS "Using static libsodium.a: ${LIBSODIUM_LIBRARIES}")
-        # Затем ищем libsodium.lib (статическая для MSVC)
-        elseif(EXISTS ${LIBSODIUM_PATH}/lib/libsodium.lib)
-            set(LIBSODIUM_LIBRARIES ${LIBSODIUM_PATH}/lib/libsodium.lib)
-            message(STATUS "Using static libsodium.lib: ${LIBSODIUM_LIBRARIES}")
-        # Если статических нет, только тогда используем динамические
-        elseif(EXISTS ${LIBSODIUM_PATH}/lib/libsodium.dll.a)
-            set(LIBSODIUM_LIBRARIES ${LIBSODIUM_PATH}/lib/libsodium.dll.a)
-            message(STATUS "WARNING: Using dynamic libsodium.dll.a (static not found): ${LIBSODIUM_LIBRARIES}")
-        else()
-            # Выводим список файлов в lib директории для отладки
-            file(GLOB LIB_FILES "${LIBSODIUM_PATH}/lib/*")
-            message(STATUS "Files in lib directory: ${LIB_FILES}")
-            message(FATAL_ERROR "Cannot find libsodium library in ${LIBSODIUM_PATH}/lib/")
-        endif()
+    if(EXISTS ${LIBSODIUM_PATH}/lib/libsodium.a)
+        set(LIBSODIUM_LIBRARIES ${LIBSODIUM_PATH}/lib/libsodium.a)
+    elseif(EXISTS ${LIBSODIUM_PATH}/lib/libsodium.lib)
+        set(LIBSODIUM_LIBRARIES ${LIBSODIUM_PATH}/lib/libsodium.lib)
+    elseif(EXISTS ${LIBSODIUM_PATH}/lib/libsodium.dll.a)
+        set(LIBSODIUM_LIBRARIES ${LIBSODIUM_PATH}/lib/libsodium.dll.a)
     else()
-        message(FATAL_ERROR "Please set LIBSODIUM_PATH to the libsodium directory")
+        message(FATAL_ERROR "Cannot find libsodium library in ${LIBSODIUM_PATH}/lib/")
     endif()
 else()
-    # Для Linux/Unix используем системную библиотеку
     find_package(PkgConfig REQUIRED)
     pkg_check_modules(LIBSODIUM REQUIRED libsodium)
-
-    if(LIBSODIUM_FOUND)
-        message(STATUS "Using system libsodium")
-        message(STATUS "  Include dirs: ${LIBSODIUM_INCLUDE_DIRS}")
-        message(STATUS "  Libraries: ${LIBSODIUM_LIBRARIES}")
-    else()
-        message(FATAL_ERROR "libsodium not found. Install it with: sudo apt-get install libsodium-dev")
-    endif()
+    message(STATUS "Using libsodium via pkg-config: ${LIBSODIUM_LIBRARIES}")
 endif()
 
 # Qt setup (compatible with Qt 6.2+)
@@ -112,7 +82,33 @@ set(SOURCES
     updatedialog.cpp
     settingsdialog.cpp
     knownkeysdialog.cpp
-    mainwindow.cpp
+    # New Telegram-style UI (Phase 1)
+    chatwindow.cpp
+    connectiondialog.cpp
+    registerhandledialog.cpp
+    identitybackupdialog.cpp
+    qrshowdialog.cpp
+    history.cpp
+    searchdialog.cpp
+    profilesettings.cpp
+    profiledialog.cpp
+    contactsdialog.cpp
+    contactsstore.cpp
+    peerprofiledialog.cpp
+    groupparticipantsdialog.cpp
+    # Phase B-2/B-3 wire helpers — handle registry + per-user blob store
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../identity/server_proto.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../identity/contacts_cipher.c
+    theme/theme.cpp
+    widgets/avatar.cpp
+    widgets/icons.cpp
+    widgets/chatlistitem.cpp
+    widgets/sidebar.cpp
+    widgets/chatarea.cpp
+    # Phase A: identity backup (encrypted .fbk + QR blob)
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../identity/identity.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../identity/identity_at_rest.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../identity/identity_backup.c
 )
 
 set(HEADERS
@@ -125,13 +121,36 @@ set(HEADERS
     updatedialog.h
     settingsdialog.h
     knownkeysdialog.h
-    mainwindow.h
+    chatwindow.h
+    connectiondialog.h
+    registerhandledialog.h
+    identitybackupdialog.h
+    qrshowdialog.h
+    history.h
+    searchdialog.h
+    profilesettings.h
+    profiledialog.h
+    contactsdialog.h
+    contactsstore.h
+    peerprofiledialog.h
+    groupparticipantsdialog.h
+    theme/theme.h
+    widgets/avatar.h
+    widgets/icons.h
+    widgets/chatlistitem.h
+    widgets/sidebar.h
+    widgets/chatarea.h
 )
 
 add_executable(${PROJECT_NAME}
     ${SOURCES}
     ${RESOURCES_FILES}
 )
+# Хранилище секретов платформы для ключа личности. GUI собирается и как
+# отдельный проект, поэтому цель определяется здесь же, если её ещё нет.
+include(${CMAKE_CURRENT_SOURCE_DIR}/../../cmake/FearSecretStore.cmake)
+target_link_libraries(${PROJECT_NAME} PRIVATE fear_secret_store)
+
 
 if(WIN32)
     set_target_properties(${PROJECT_NAME} PROPERTIES WIN32_EXECUTABLE TRUE)
@@ -145,7 +164,12 @@ endif()
 
 target_link_libraries(fear_gui PRIVATE
     Qt6::Widgets
+    Qt6::Network
+    Qt6::Sql
+    Qt6::Concurrent
     ${LIBSODIUM_LIBRARIES}
+    qrencode
+    zbar
 )
 
 if(WIN32)
@@ -154,6 +178,9 @@ else()
     target_include_directories(fear_gui PRIVATE ${LIBSODIUM_INCLUDE_DIRS})
     target_link_directories(fear_gui PRIVATE ${LIBSODIUM_LIBRARY_DIRS})
 endif()
+
+# identity.c / identity_backup.c live in ../../identity, expose their headers
+target_include_directories(fear_gui PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../identity)
 
 # Дополнительные флаги компиляции для статической линковки
 if(WIN32)

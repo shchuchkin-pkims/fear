@@ -1,0 +1,208 @@
+# Юнит-тесты чистой крипто-логики: identity, encrypted backup, contacts cipher.
+# Собираются только на POSIX - харнесс использует mkdtemp/stat, а CI гоняет
+# тесты на Linux (Windows-сборка идёт с FEAR_GUI_ONLY и тесты не строит).
+if(WIN32)
+    return()
+endif()
+
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(LIBSODIUM libsodium)
+if(LIBSODIUM_FOUND)
+    set(TEST_SODIUM_LIBS ${LIBSODIUM_LIBRARIES})
+    set(TEST_SODIUM_INCLUDE ${LIBSODIUM_INCLUDE_DIRS})
+else()
+    find_library(SODIUM_LIB sodium)
+    find_path(SODIUM_INCLUDE_DIR sodium.h PATH_SUFFIXES sodium)
+    if(NOT SODIUM_LIB)
+        message(FATAL_ERROR "libsodium is required for tests. Install with: sudo apt-get install libsodium-dev")
+    endif()
+    set(TEST_SODIUM_LIBS ${SODIUM_LIB})
+    set(TEST_SODIUM_INCLUDE ${SODIUM_INCLUDE_DIR})
+endif()
+
+set(IDENTITY_DIR ${CMAKE_SOURCE_DIR}/identity)
+
+function(add_fear_test name)
+    add_executable(${name} ${ARGN})
+    target_include_directories(${name} PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${IDENTITY_DIR}
+        ${TEST_SODIUM_INCLUDE})
+    target_link_libraries(${name} PRIVATE ${TEST_SODIUM_LIBS})
+    target_link_libraries(${name} PRIVATE fear_secret_store)
+    add_test(NAME ${name} COMMAND ${name})
+endfunction()
+
+add_fear_test(test_identity test_identity.c ${IDENTITY_DIR}/identity.c ${IDENTITY_DIR}/identity_at_rest.c)
+add_fear_test(test_backup   test_backup.c   ${IDENTITY_DIR}/identity_backup.c ${IDENTITY_DIR}/identity.c ${IDENTITY_DIR}/identity_at_rest.c)
+add_fear_test(test_contacts test_contacts.c ${IDENTITY_DIR}/contacts_cipher.c)
+add_fear_test(test_key_schedule test_key_schedule.c ${IDENTITY_DIR}/key_schedule.c)
+add_fear_test(test_rotation     test_rotation.c     ${IDENTITY_DIR}/rotation.c)
+add_fear_test(test_media_keys   test_media_keys.c   ${IDENTITY_DIR}/media_keys.c)
+add_fear_test(test_media_hello  test_media_hello.c  ${IDENTITY_DIR}/media_hello.c ${IDENTITY_DIR}/media_keys.c)
+add_fear_test(test_media_senders test_media_senders.c ${IDENTITY_DIR}/media_senders.c ${IDENTITY_DIR}/media_keys.c)
+add_fear_test(test_call_invite  test_call_invite.c  ${IDENTITY_DIR}/call_invite.c ${IDENTITY_DIR}/media_keys.c)
+add_fear_test(test_media_packet test_media_packet.c ${IDENTITY_DIR}/media_packet.c ${IDENTITY_DIR}/media_keys.c)
+add_fear_test(test_mic_dsp test_mic_dsp.c ${IDENTITY_DIR}/mic_dsp.c)
+add_fear_test(test_stun test_stun.c ${IDENTITY_DIR}/stun.c)
+# Обработка микрофона считает в плавающей точке - нужна libm там, где она
+# не входит в libc.
+if(NOT WIN32)
+    target_link_libraries(test_mic_dsp PRIVATE m)
+endif()
+add_fear_test(test_chat_frame   test_chat_frame.c   ${IDENTITY_DIR}/chat_frame.c ${IDENTITY_DIR}/key_schedule.c)
+add_fear_test(test_room_keys    test_room_keys.c    ${IDENTITY_DIR}/room_keys.c ${IDENTITY_DIR}/chat_frame.c ${IDENTITY_DIR}/key_schedule.c ${IDENTITY_DIR}/identity.c ${IDENTITY_DIR}/identity_at_rest.c)
+add_fear_test(test_rotation_bundle test_rotation_bundle.c ${IDENTITY_DIR}/rotation_bundle.c ${IDENTITY_DIR}/rotation.c)
+
+# Разборщики, которые видят сеть до всякой аутентификации. Санитайзеры
+# включены только для этой цели: собирать под ними весь проект дорого, а
+# ловить нечего - остальное не читает чужие байты вслепую.
+add_fear_test(fuzz_parsers fuzz_parsers.c
+    ${IDENTITY_DIR}/media_hello.c ${IDENTITY_DIR}/media_keys.c
+    ${IDENTITY_DIR}/media_packet.c ${IDENTITY_DIR}/call_invite.c
+    ${IDENTITY_DIR}/chat_frame.c ${IDENTITY_DIR}/key_schedule.c
+    ${IDENTITY_DIR}/rotation_bundle.c ${IDENTITY_DIR}/rotation.c
+    ${CMAKE_SOURCE_DIR}/client-console/src/common.c
+    # common.c спрашивает у слоя TLS, обёрнуто ли соединение. Фаззеру TLS не
+    # нужен, поэтому берём модуль без FEAR_HAVE_TLS - он собирается
+    # заглушкой и не тянет за собой OpenSSL.
+    ${IDENTITY_DIR}/tls.c)
+target_include_directories(fuzz_parsers PRIVATE ${CMAKE_SOURCE_DIR}/client-console/include)
+# check_c_compiler_flag only compiles, and these flags need the runtime at
+# link time - it reported success while the binary came out without a trace
+# of a sanitizer in it.
+include(CheckCSourceCompiles)
+set(CMAKE_REQUIRED_FLAGS "-fsanitize=address,undefined")
+set(CMAKE_REQUIRED_LINK_OPTIONS "-fsanitize=address,undefined")
+check_c_source_compiles("int main(void){return 0;}" HAVE_ASAN_UBSAN)
+unset(CMAKE_REQUIRED_FLAGS)
+unset(CMAKE_REQUIRED_LINK_OPTIONS)
+if(HAVE_ASAN_UBSAN)
+    target_compile_options(fuzz_parsers PRIVATE -fsanitize=address,undefined -fno-omit-frame-pointer)
+    target_link_options(fuzz_parsers PRIVATE -fsanitize=address,undefined)
+endif()
+set_tests_properties(fuzz_parsers PROPERTIES TIMEOUT 120)
+
+# Интеграционный smoke-тест: сервер + два консольных клиента (ECDH create/join,
+# доставка сообщений в обе стороны). Требует собранного таргета fear.
+# Чёрный список ключей и витрина живых сессий: то, чем управляет утилита
+# администрирования, и то, по чему сервер отказывает в обслуживании.
+# Офлайн-ящик: квоты, срок хранения и то, что удалить письмо можно только
+# зная его адрес.
+add_fear_test(test_inbox test_inbox.c
+              ${CMAKE_SOURCE_DIR}/client-console/src/server_db.c)
+target_include_directories(test_inbox PRIVATE
+                           ${CMAKE_SOURCE_DIR}/client-console/include)
+target_link_libraries(test_inbox PRIVATE ${SQLITE3_LIBRARIES} sqlite3)
+
+add_fear_test(test_server_admin test_server_admin.c
+              ${CMAKE_SOURCE_DIR}/client-console/src/server_db.c)
+target_include_directories(test_server_admin PRIVATE
+                           ${CMAKE_SOURCE_DIR}/client-console/include)
+target_link_libraries(test_server_admin PRIVATE ${SQLITE3_LIBRARIES} sqlite3)
+
+add_test(NAME integration_smoke
+         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/smoke_chat.sh $<TARGET_FILE:fear>)
+set_tests_properties(integration_smoke PROPERTIES TIMEOUT 60)
+
+# Ключ комнаты следует за составом: три участника входят, один выходит, и
+# каждая смена состава должна дать ровно одно новое поколение - от того
+# участника, которого комната выбрала. Модульные тесты покрывают части
+# (test_room_keys, test_rotation_bundle); этот ловит неверную сборку их
+# вместе - ротацию, которую начали двое, или конверт, который никто кроме
+# отправителя не открывает.
+add_test(NAME integration_rotation
+         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/smoke_rotation.sh $<TARGET_FILE:fear>)
+set_tests_properties(integration_rotation PROPERTIES TIMEOUT 120)
+
+# Тот же выбор ротатора, но через ECDH-вход, которого smoke_rotation не
+# делает: там ключ раздаётся всем заранее. Вошедший по ECDH терял список о
+# собственном приходе и следующий вход принимал за свой - а избранным
+# ротатором тогда не ротировал никто.
+add_test(NAME integration_join_rotation
+         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/smoke_join_rotation.sh $<TARGET_FILE:fear>)
+set_tests_properties(integration_join_rotation PROPERTIES TIMEOUT 120)
+
+# Трёхсторонний медиа-loopback: три процесса через hub, каждый расшифровывает
+# двух других. Единственный тест, способный поймать инверсию ролей или
+# несогласованную соль - модульные тесты живут внутри одного процесса.
+#
+# Регистрируются только когда соответствующие таргеты вообще собираются.
+# При FEAR_GUI_ONLY=ON подпроекты audio_call/video_call пропускаются, и
+# безусловный $<TARGET_FILE:audio_call> валит не тест, а саму генерацию
+# сборки - то есть все четыре пайплайна разом, ещё до компиляции.
+if(TARGET audio_call)
+    add_test(NAME media_loopback
+             COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/media_loopback.sh $<TARGET_FILE:audio_call>)
+    set_tests_properties(media_loopback PROPERTIES TIMEOUT 120)
+endif()
+
+# То же для video_call: три процесса, аудио-тракт через пер-отправительские
+# декодеры и микшер. Видео здесь не проверяется - на машине без камеры и
+# дисплея VP8 не кодируется вовсе, и тест об этом честно молчит.
+if(TARGET video_call)
+    add_test(NAME video_loopback
+             COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/video_loopback.sh $<TARGET_FILE:video_call>)
+    set_tests_properties(video_loopback PROPERTIES TIMEOUT 120)
+endif()
+
+# Нагрузочный инструмент и регрессия на лимиты подключений. Пропускная
+# способность меряется вручную (см. tests/load_server.c), а тестом проверяется
+# только то, что детерминировано: сколько соединений переживает лимит.
+add_executable(load_server load_server.c)
+if(TARGET fear)
+    add_test(NAME server_caps
+             COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/server_caps.sh
+                     $<TARGET_FILE:fear> $<TARGET_FILE:load_server>)
+    set_tests_properties(server_caps PROPERTIES TIMEOUT 90)
+endif()
+
+# Личное письмо через офлайн-ящик - адресату и только ему: не отправителю
+# обратно и не третьему в общей комнате. pm_keys выводит ключ пары и
+# идентификатор личной комнаты так же, как GUI.
+add_executable(pm_keys pm_keys.c ${IDENTITY_DIR}/identity.c ${IDENTITY_DIR}/identity_at_rest.c)
+target_include_directories(pm_keys PRIVATE ${IDENTITY_DIR} ${TEST_SODIUM_INCLUDE})
+target_link_libraries(pm_keys PRIVATE ${TEST_SODIUM_LIBS} fear_secret_store)
+if(TARGET fear)
+    add_test(NAME inbox_direction
+             COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/inbox_direction.sh
+                     $<TARGET_FILE:fear> $<TARGET_FILE:pm_keys>)
+    set_tests_properties(inbox_direction PROPERTIES TIMEOUT 90)
+endif()
+
+# Звонок обязан завершаться по SIGINT и SIGTERM, даже если в нём тихо: в
+# режиме relay поток приёма висел в recv без таймаута, и процесс не выходил.
+if(NOT WIN32 AND TARGET fear AND TARGET video_call)
+    add_test(NAME call_quit
+             COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/call_quit.sh
+                     $<TARGET_FILE:fear> $<TARGET_FILE:video_call>)
+    set_tests_properties(call_quit PROPERTIES TIMEOUT 60)
+endif()
+
+# Кому релей рассылает медиа. Медиа уходило во все соединения комнаты, кроме
+# сокета отправителя, - в чаты и обратно в чат самого отправителя. Ни один
+# тест этого не видел: media_loopback ходит через собственный хаб, а не через
+# fear server.
+if(NOT WIN32 AND TARGET fear)
+    add_executable(test_media_routing test_media_routing.c)
+    add_test(NAME media_routing
+             COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/media_routing.sh
+                     $<TARGET_FILE:fear> $<TARGET_FILE:test_media_routing>)
+    set_tests_properties(media_routing PROPERTIES TIMEOUT 60)
+endif()
+
+# Протокольный тест M10: BLOB_GET доступен только владельцу pk (подписанный
+# challenge). Бинарь ходит на живой сервер через реальные sp_*-функции;
+# сервер поднимает обёртка blob_auth.sh.
+add_executable(test_blob_auth test_blob_auth.c
+    ${IDENTITY_DIR}/identity.c ${IDENTITY_DIR}/identity_at_rest.c
+    ${IDENTITY_DIR}/server_proto.c)
+target_include_directories(test_blob_auth PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${IDENTITY_DIR}
+    ${TEST_SODIUM_INCLUDE})
+target_link_libraries(test_blob_auth PRIVATE ${TEST_SODIUM_LIBS})
+add_test(NAME blob_auth
+         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/blob_auth.sh
+                 $<TARGET_FILE:fear> $<TARGET_FILE:test_blob_auth>)
+set_tests_properties(blob_auth PROPERTIES TIMEOUT 60)

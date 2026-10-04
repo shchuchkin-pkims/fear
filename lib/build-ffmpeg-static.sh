@@ -33,16 +33,21 @@ echo "Install: ${INSTALL_DIR}"
 echo ""
 
 # ---- Install build tools ----
+# FEAR_NO_PACMAN=1 - пакеты уже стоят (CI ставит их через setup-msys2).
+# pkgconf, а не pkg-config: MSYS2 заменил одно другим, и старое имя
+# конфликтует с уже установленным pkgconf.
+if [ -z "${FEAR_NO_PACMAN:-}" ]; then
 echo "=== Installing build dependencies ==="
 pacman -S --noconfirm --needed \
     make \
     mingw-w64-x86_64-gcc \
     mingw-w64-x86_64-yasm \
     mingw-w64-x86_64-nasm \
-    mingw-w64-x86_64-pkg-config \
+    mingw-w64-x86_64-pkgconf \
     mingw-w64-x86_64-libvpx \
     mingw-w64-x86_64-zlib
 echo ""
+fi
 
 # ---- Clean previous build ----
 rm -rf "${BUILD_DIR}" "${INSTALL_DIR}"
@@ -63,6 +68,8 @@ cd "${BUILD_DIR}"
     --disable-podpages \
     --disable-txtpages \
     --disable-everything \
+    --disable-autodetect \
+    --enable-w32threads \
     --enable-avdevice \
     --enable-avformat \
     --enable-avcodec \

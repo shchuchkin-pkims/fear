@@ -16,10 +16,21 @@ set(SOURCES
     src/audio_crypto.c
     src/audio_hub.c
     ${CMAKE_SOURCE_DIR}/identity/identity.c
+    ${CMAKE_SOURCE_DIR}/identity/identity_at_rest.c
+    ${CMAKE_SOURCE_DIR}/identity/media_keys.c
+    ${CMAKE_SOURCE_DIR}/identity/media_hello.c
+    ${CMAKE_SOURCE_DIR}/identity/media_senders.c
+    ${CMAKE_SOURCE_DIR}/identity/media_packet.c
+    ${CMAKE_SOURCE_DIR}/identity/mic_dsp.c
+    ${CMAKE_SOURCE_DIR}/identity/stun.c
+    ${CMAKE_SOURCE_DIR}/identity/stun_net.c
 )
 
 # Создание исполняемого файла
 add_executable(audio_call ${SOURCES})
+
+# Хранилище секретов платформы для ключа личности (см. корневой CMakeLists).
+target_link_libraries(audio_call PRIVATE fear_secret_store)
 
 # Добавляем include директорию для наших заголовков
 target_include_directories(audio_call PRIVATE include ${CMAKE_SOURCE_DIR}/identity)

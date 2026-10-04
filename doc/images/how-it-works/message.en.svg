@@ -1,0 +1,51 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="800" height="250" viewBox="0 0 800 250"><defs><marker id="ah" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#475569"/></marker></defs><rect x="0" y="0" width="800" height="250" fill="#ffffff"/>
+<rect x="5" y="40" width="138" height="160" rx="14" fill="#eff6ff" stroke="#2563eb" stroke-width="2"/>
+<circle cx="74.0" cy="40" r="14" fill="#2563eb"/>
+<text x="74.0" y="45" font-family="'DejaVu Sans','Segoe UI','Helvetica Neue',Arial,sans-serif" font-size="14" font-weight="bold" fill="#ffffff" text-anchor="middle">1</text>
+<path d="M 38.400000000000006 68 h 71.19999999999999 v 26 h -49.19999999999999 l -8 9 v -9 h -14 z" fill="#ffffff" stroke="#2563eb" stroke-width="2" stroke-linejoin="round"/>
+<text x="74.0" y="86" font-family="'DejaVu Sans','Segoe UI','Helvetica Neue',Arial,sans-serif" font-size="13" font-weight="bold" fill="#1e3a8a" text-anchor="middle">Hello!</text>
+<text x="74.0" y="130" font-family="'DejaVu Sans','Segoe UI','Helvetica Neue',Arial,sans-serif" font-size="13" font-weight="bold" fill="#1e3a8a" text-anchor="middle">You write</text>
+<text x="74.0" y="148" font-family="'DejaVu Sans','Segoe UI','Helvetica Neue',Arial,sans-serif" font-size="13" font-weight="bold" fill="#1e3a8a" text-anchor="middle">a message</text>
+<line x1="147" y1="120.0" x2="163" y2="120.0" stroke="#475569" stroke-width="2.5" marker-end="url(#ah)"/>
+<rect x="168" y="40" width="138" height="160" rx="14" fill="#ecfdf5" stroke="#059669" stroke-width="2"/>
+<circle cx="237.0" cy="40" r="14" fill="#059669"/>
+<text x="237.0" y="45" font-family="'DejaVu Sans','Segoe UI','Helvetica Neue',Arial,sans-serif" font-size="14" font-weight="bold" fill="#ffffff" text-anchor="middle">2</text>
+<path d="M 228.6 73.8 v -7.199999999999999 a 8.4 8.4 0 0 1 16.8 0 v 7.199999999999999" fill="none" stroke="#059669" stroke-width="3.12"/>
+<rect x="223.8" y="73.8" width="26.4" height="20.4" rx="3.5999999999999996" fill="#059669"/>
+<circle cx="237.0" cy="85.2" r="2.88" fill="#ffffff"/>
+<text x="237.0" y="130" font-family="'DejaVu Sans','Segoe UI','Helvetica Neue',Arial,sans-serif" font-size="13" font-weight="bold" fill="#065f46" text-anchor="middle">Encrypted</text>
+<text x="237.0" y="148" font-family="'DejaVu Sans','Segoe UI','Helvetica Neue',Arial,sans-serif" font-size="13" font-weight="bold" fill="#065f46" text-anchor="middle">on your</text>
+<text x="237.0" y="166" font-family="'DejaVu Sans','Segoe UI','Helvetica Neue',Arial,sans-serif" font-size="13" font-weight="bold" fill="#065f46" text-anchor="middle">device</text>
+<text x="237.0" y="190" font-family="'DejaVu Sans','Segoe UI','Helvetica Neue',Arial,sans-serif" font-size="10" font-weight="normal" fill="#475569" text-anchor="middle">AES-256-GCM</text>
+<line x1="310" y1="120.0" x2="326" y2="120.0" stroke="#475569" stroke-width="2.5" marker-end="url(#ah)"/>
+<rect x="331" y="40" width="138" height="160" rx="14" fill="#f1f5f9" stroke="#64748b" stroke-width="2"/>
+<circle cx="400.0" cy="40" r="14" fill="#64748b"/>
+<text x="400.0" y="45" font-family="'DejaVu Sans','Segoe UI','Helvetica Neue',Arial,sans-serif" font-size="14" font-weight="bold" fill="#ffffff" text-anchor="middle">3</text>
+<rect x="348.0" y="70" width="104" height="26" rx="6" fill="#1e293b"/>
+<text x="400.0" y="88" font-family="'DejaVu Sans Mono',Consolas,'Courier New',monospace" font-size="13" font-weight="normal" fill="#a7f3d0" text-anchor="middle">8f3a…c91e</text>
+<text x="400.0" y="130" font-family="'DejaVu Sans','Segoe UI','Helvetica Neue',Arial,sans-serif" font-size="13" font-weight="bold" fill="#334155" text-anchor="middle">Only ciphertext</text>
+<text x="400.0" y="148" font-family="'DejaVu Sans','Segoe UI','Helvetica Neue',Arial,sans-serif" font-size="13" font-weight="bold" fill="#334155" text-anchor="middle">crosses the</text>
+<text x="400.0" y="166" font-family="'DejaVu Sans','Segoe UI','Helvetica Neue',Arial,sans-serif" font-size="13" font-weight="bold" fill="#334155" text-anchor="middle">internet</text>
+<text x="400.0" y="190" font-family="'DejaVu Sans','Segoe UI','Helvetica Neue',Arial,sans-serif" font-size="10" font-weight="normal" fill="#475569" text-anchor="middle">+ optional TLS</text>
+<line x1="473" y1="120.0" x2="489" y2="120.0" stroke="#475569" stroke-width="2.5" marker-end="url(#ah)"/>
+<rect x="494" y="40" width="138" height="160" rx="14" fill="#f1f5f9" stroke="#64748b" stroke-width="2"/>
+<circle cx="563.0" cy="40" r="14" fill="#64748b"/>
+<text x="563.0" y="45" font-family="'DejaVu Sans','Segoe UI','Helvetica Neue',Arial,sans-serif" font-size="14" font-weight="bold" fill="#ffffff" text-anchor="middle">4</text>
+<rect x="539.0" y="63" width="48" height="12" rx="3" fill="#ffffff" stroke="#64748b" stroke-width="2.2"/>
+<circle cx="578.0" cy="69" r="2" fill="#64748b"/>
+<rect x="539.0" y="78" width="48" height="12" rx="3" fill="#ffffff" stroke="#64748b" stroke-width="2.2"/>
+<circle cx="578.0" cy="84" r="2" fill="#64748b"/>
+<rect x="539.0" y="93" width="48" height="12" rx="3" fill="#ffffff" stroke="#64748b" stroke-width="2.2"/>
+<circle cx="578.0" cy="99" r="2" fill="#64748b"/>
+<text x="563.0" y="130" font-family="'DejaVu Sans','Segoe UI','Helvetica Neue',Arial,sans-serif" font-size="13" font-weight="bold" fill="#334155" text-anchor="middle">The relay</text>
+<text x="563.0" y="148" font-family="'DejaVu Sans','Segoe UI','Helvetica Neue',Arial,sans-serif" font-size="13" font-weight="bold" fill="#334155" text-anchor="middle">forwards it</text>
+<text x="563.0" y="166" font-family="'DejaVu Sans','Segoe UI','Helvetica Neue',Arial,sans-serif" font-size="13" font-weight="bold" fill="#334155" text-anchor="middle">unopened</text>
+<line x1="636" y1="120.0" x2="652" y2="120.0" stroke="#475569" stroke-width="2.5" marker-end="url(#ah)"/>
+<rect x="657" y="40" width="138" height="160" rx="14" fill="#eff6ff" stroke="#2563eb" stroke-width="2"/>
+<circle cx="726.0" cy="40" r="14" fill="#2563eb"/>
+<text x="726.0" y="45" font-family="'DejaVu Sans','Segoe UI','Helvetica Neue',Arial,sans-serif" font-size="14" font-weight="bold" fill="#ffffff" text-anchor="middle">5</text>
+<path d="M 690.4 68 h 71.19999999999999 v 26 h -49.19999999999999 l -8 9 v -9 h -14 z" fill="#ffffff" stroke="#2563eb" stroke-width="2" stroke-linejoin="round"/>
+<text x="726.0" y="86" font-family="'DejaVu Sans','Segoe UI','Helvetica Neue',Arial,sans-serif" font-size="13" font-weight="bold" fill="#1e3a8a" text-anchor="middle">Hello!</text>
+<text x="726.0" y="130" font-family="'DejaVu Sans','Segoe UI','Helvetica Neue',Arial,sans-serif" font-size="13" font-weight="bold" fill="#1e3a8a" text-anchor="middle">Your contact</text>
+<text x="726.0" y="148" font-family="'DejaVu Sans','Segoe UI','Helvetica Neue',Arial,sans-serif" font-size="13" font-weight="bold" fill="#1e3a8a" text-anchor="middle">decrypts it</text>
+<text x="400" y="235" font-family="'DejaVu Sans','Segoe UI','Helvetica Neue',Arial,sans-serif" font-size="13" font-weight="normal" fill="#475569" text-anchor="middle" font-style="italic">Files, voice and video travel the same way</text></svg>
