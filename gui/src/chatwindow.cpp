@@ -167,7 +167,13 @@ ChatWindow::ChatWindow(QWidget *parent) : QMainWindow(parent) {
             this, &ChatWindow::onDeleteChatRequested);
     connect(ContactsStore::instance(), &ContactsStore::contactsChanged,
             this, &ChatWindow::rebuildSidebarChats);
-    /* Новый контакт - новый ящик, за которым надо следить. */
+    /* Новый контакт - новый ящик, за которым надо следить, и сразу новый
+     * идентификатор личной комнаты: до следующего подключения строка его
+     * чата иначе жила бы под старым, а письма - под новым. Перенос сам
+     * сохраняет список, только если что-то заполнил, так что по кругу это
+     * не ходит. */
+    connect(ContactsStore::instance(), &ContactsStore::contactsChanged,
+            this, &ChatWindow::migrateDmRooms);
     connect(ContactsStore::instance(), &ContactsStore::contactsChanged,
             this, &ChatWindow::registerInboxWatches);
 
@@ -1291,9 +1297,11 @@ void ChatWindow::rebuildSidebarChats() {
                 ? QString("@%1@%2").arg(c.handle, c.server) : QString();
             e.kind         = ChatKind::Dm;
             e.peerPkB64    = c.pk;
+            /* Переписки ещё не было - и времени нет: «сейчас» поднимало
+             * такие контакты наверх списка и показывало время, когда ничего
+             * не происходило. */
             const auto ts = historyTs.value(e.id, 0);
-            e.lastActivity = ts ? QDateTime::fromMSecsSinceEpoch(ts)
-                                : QDateTime::currentDateTime();
+            e.lastActivity = ts ? QDateTime::fromMSecsSinceEpoch(ts) : QDateTime();
             e.unread       = m_unread.value(e.id, 0);
             chats.append(e);
         }

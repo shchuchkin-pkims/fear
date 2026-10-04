@@ -252,6 +252,15 @@ void ContactsDialog::renderJson(const QString &json) {
         m_status->setText(tr("No contacts yet."));
         return;
     }
+    /* В блобе на сервере только то, что нужно на другом устройстве.
+     * Идентификатор личной комнаты и отметка «проверен» живут лишь здесь -
+     * их берём из того, что уже лежит в кэше. Иначе каждое открытие этого
+     * окна стирало их у всех контактов: строка чата в списке получала
+     * старый идентификатор, а письма и счётчик непрочитанных лежали под
+     * новым, и ни то ни другое в списке не показывалось. */
+    QHash<QString, ContactsStore::Record> local;
+    for (const auto &r : ContactsStore::instance()->all()) local.insert(r.pk, r);
+
     QVector<ContactsStore::Record> cached;
     for (const auto &v : arr) {
         const auto o = v.toObject();
@@ -268,7 +277,12 @@ void ContactsDialog::renderJson(const QString &json) {
             it->setData(Qt::UserRole, pk);
             m_list->addItem(it);
         }
-        cached.append({ name, handle, server, pk, false });
+        ContactsStore::Record rec{ name, handle, server, pk, false };
+        if (const auto it = local.constFind(pk); it != local.constEnd()) {
+            rec.verified = it->verified;
+            rec.dmRoom   = it->dmRoom;
+        }
+        cached.append(rec);
     }
     // Phase B-5: persist for sidebar use across restarts.
     ContactsStore::instance()->replaceAll(cached);

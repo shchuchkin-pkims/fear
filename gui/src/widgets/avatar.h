@@ -23,6 +23,7 @@ protected:
 private:
     QString m_seed;
     QString m_initials;
+    bool    m_explicitInitials = false;
     int m_diameter = 42;
 };
 

@@ -15,7 +15,10 @@ Avatar::Avatar(QWidget *parent) : QWidget(parent) {
 void Avatar::setSeed(const QString &seed) {
     if (seed == m_seed) return;
     m_seed = seed;
-    if (m_initials.isEmpty() && !seed.isEmpty()) {
+    /* Инициалы - от каждого нового имени, а не только от первого: шапка чата
+     * одна на все чаты, и в ней навсегда оставалось «GE» от general, хотя
+     * цвет уже был собеседника. Заданные явно (setInitials) не трогаем. */
+    if (!m_explicitInitials && !seed.isEmpty()) {
         const QStringList parts = seed.split(QRegularExpression("\\s+"), Qt::SkipEmptyParts);
         QString s;
         if (parts.size() >= 2) {
@@ -30,6 +33,7 @@ void Avatar::setSeed(const QString &seed) {
 
 void Avatar::setInitials(const QString &initials) {
     m_initials = initials.toUpper();
+    m_explicitInitials = !initials.isEmpty();
     update();
 }
 
