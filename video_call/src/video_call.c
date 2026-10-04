@@ -1385,6 +1385,21 @@ static VidSlot *vid_acquire(VideoCall *vc, int slot) {
     return chosen;
 }
 
+/* Whether this participant has a picture worth the big view: one that is
+ * still arriving. Somebody who hung up keeps their slot until it is reused,
+ * so being in vid[] says nothing about being in the call - and choosing them
+ * left the big view black for the rest of it. */
+static int vc_has_picture(const VideoCall *vc, int slot, uint64_t now) {
+    if (slot < 0) return 0;
+    for (int i = 0; i < VC_MAX_VIDEO; i++) {
+        const VidSlot *v = &vc->vid[i];
+        if (v->slot != slot) continue;
+        if (!v->yuv || v->w <= 0 || v->h <= 0) return 0;
+        return !(v->pic_ms && (now - v->pic_ms) > VC_TILE_STALE_MS);
+    }
+    return 0;
+}
+
 /**
  * Paint every participant we are decoding, tiled, with our own camera in the
  * corner.
@@ -1418,23 +1433,23 @@ static void vc_render_frame(VideoCall *vc) {
     uint64_t now = video_time_ms();
 
     /* Whoever the user chose outranks the speaker: the point of choosing
-     * somebody is that they stay chosen while other people talk. */
+     * somebody is that they stay chosen while other people talk. While their
+     * picture is not coming the speaker has the view, and it goes back to
+     * them when it does. */
     int want = -1;
     if (vc->pinned_slot >= 0) {
+        int present = 0;
         for (int i = 0; i < VC_MAX_VIDEO; i++) {
-            if (vc->vid[i].slot == vc->pinned_slot) { want = vc->pinned_slot; break; }
+            if (vc->vid[i].slot == vc->pinned_slot) { present = 1; break; }
         }
-        if (want < 0) vc->pinned_slot = -1;   /* they left */
+        if (!present) vc->pinned_slot = -1;   /* their slot was reused */
+        else if (vc_has_picture(vc, vc->pinned_slot, now)) want = vc->pinned_slot;
     }
 
     if (want < 0) {
         /* Somebody with no camera would take the big view and leave it
          * empty, so the choice is between the pictures that exist. */
-        int holder_alive = 0;
-        for (int i = 0; i < VC_MAX_VIDEO; i++) {
-            if (vc->vid[i].slot >= 0 && vc->vid[i].slot == vc->main_slot) holder_alive = 1;
-        }
-        if (!holder_alive) vc->main_slot = -1;
+        if (!vc_has_picture(vc, vc->main_slot, now)) vc->main_slot = -1;
 
         int loudest = -1;
         double loudest_e = 0.0, holder_e = 0.0;
@@ -1442,18 +1457,17 @@ static void vc_render_frame(VideoCall *vc) {
         for (int i = 0; i < VC_MAX_MIX; i++) {
             MixSlot *m = &vc->mix[i];
             if (m->slot < 0) continue;
-            int has_video = 0;
-            for (int k = 0; k < VC_MAX_VIDEO; k++) {
-                if (vc->vid[k].slot == m->slot) { has_video = 1; break; }
-            }
-            if (!has_video) continue;
+            if (!vc_has_picture(vc, m->slot, now)) continue;
             if (m->slot == vc->main_slot) { holder_e = m->energy; holder_voice = m->voice_ms; }
             if (m->energy > loudest_e) { loudest_e = m->energy; loudest = m->slot; }
         }
 
         if (vc->main_slot < 0) {
             for (int i = 0; i < VC_MAX_VIDEO; i++) {
-                if (vc->vid[i].slot >= 0) { vc->main_slot = vc->vid[i].slot; break; }
+                if (vc_has_picture(vc, vc->vid[i].slot, now)) {
+                    vc->main_slot = vc->vid[i].slot;
+                    break;
+                }
             }
             vc->last_switch_ms = now;
         } else if (loudest >= 0 && loudest != vc->main_slot &&
