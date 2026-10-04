@@ -34,6 +34,7 @@ on:
       - 'updater/**'
       - 'key-exchange/**'
       - 'doc/manual.pdf'
+      - 'doc/how-it-works*.pdf'
       - 'tests/call_quit.sh'
       - '.github/scripts/linux-media-deps.sh'
       - '.github/workflows/linux.yml'
@@ -119,14 +120,14 @@ jobs:
             cp "build/bin/$p" "$R/bin/"
           done
           cp updater/updater.conf updater/cacert.pem "$R/bin/"
-          cp doc/manual.pdf "$R/doc/"
+          cp doc/manual.pdf doc/how-it-works.pdf doc/how-it-works.ru.pdf "$R/doc/"
           # GPL требует отдавать текст лицензии вместе с программой.
           cp LICENSE LICENSE.GPL-3.0 LICENSING.md "$R/"
           strip --strip-unneeded "$R/fear_gui" "$R"/bin/fear "$R"/bin/audio_call \
             "$R"/bin/video_call "$R"/bin/updater "$R"/bin/key-exchange
           chmod 755 "$R/fear_gui" "$R"/bin/fear "$R"/bin/audio_call \
             "$R"/bin/video_call "$R"/bin/updater "$R"/bin/key-exchange
-          chmod 644 "$R"/bin/updater.conf "$R"/bin/cacert.pem "$R"/doc/manual.pdf \
+          chmod 644 "$R"/bin/updater.conf "$R"/bin/cacert.pem "$R"/doc/*.pdf \
             "$R"/LICENSE "$R"/LICENSE.GPL-3.0 "$R"/LICENSING.md
 
           # The packages behind the libraries the programs link directly
@@ -153,7 +154,8 @@ jobs:
             echo
             echo "Run ./fear_gui to start the graphical client. The programs it"
             echo "starts are in bin/: fear (console client and relay), audio_call,"
-            echo "video_call, updater, key-exchange. The manual is doc/manual.pdf."
+            echo "video_call, updater, key-exchange. The manual is doc/manual.pdf;"
+            echo "how it works, in plain words: doc/how-it-works.pdf (also .ru.pdf)."
             echo
             echo "Keep the layout as it is: the GUI looks for its programs in bin/,"
             echo "and the updater unpacks a new release over this directory."

@@ -36,6 +36,7 @@ on:
       - 'updater/**'
       - 'key-exchange/**'
       - 'doc/manual.pdf'
+      - 'doc/how-it-works*.pdf'
       - 'lib/build-ffmpeg-static.sh'
       - '.github/scripts/windows-stage-deps.sh'
       - '.github/workflows/windows.yml'
@@ -165,7 +166,7 @@ jobs:
             cp "build/bin/$p.exe" "$R/bin/"
           done
           cp updater/updater.conf updater/cacert.pem "$R/bin/"
-          cp doc/manual.pdf "$R/doc/"
+          cp doc/manual.pdf doc/how-it-works.pdf doc/how-it-works.ru.pdf "$R/doc/"
           # GPL требует отдавать текст лицензии вместе с программой.
           cp LICENSE LICENSE.GPL-3.0 LICENSING.md "$R/"
 
@@ -216,7 +217,8 @@ jobs:
             printf '\n'
             printf '%s\n' "Run fear_gui.exe to start the graphical client. The programs it starts"
             printf '%s\n' "are in bin\\: fear.exe (console client and relay), audio_call.exe,"
-            printf '%s\n' "video_call.exe, updater.exe, key-exchange.exe. The manual is doc\\manual.pdf."
+            printf '%s\n' "video_call.exe, updater.exe, key-exchange.exe. The manual is doc\\manual.pdf;"
+            printf '%s\n' "how it works, in plain words: doc\\how-it-works.pdf (also .ru.pdf)."
             printf '\n'
             printf '%s\n' "Keep the layout as it is: the GUI looks for its programs in bin\\,"
             printf '%s\n' "and the updater unpacks a new release over this folder."

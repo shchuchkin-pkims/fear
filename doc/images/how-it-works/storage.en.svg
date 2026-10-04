@@ -1,0 +1,53 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="800" height="400" viewBox="0 0 800 400"><defs><marker id="ah" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#475569"/></marker></defs><rect x="0" y="0" width="800" height="400" fill="#ffffff"/>
+<rect x="12" y="15" width="244" height="370" rx="14" fill="#ffffff" stroke="#2563eb" stroke-width="2"/>
+<path d="M 12 61 v -32 a 14 14 0 0 1 14 -14 h 216 a 14 14 0 0 1 14 14 v 32 z" fill="#2563eb"/>
+<text x="134.0" y="45" font-family="'DejaVu Sans','Segoe UI','Helvetica Neue',Arial,sans-serif" font-size="16" font-weight="bold" fill="#ffffff" text-anchor="middle">Your devices</text>
+<rect x="278" y="15" width="244" height="370" rx="14" fill="#ffffff" stroke="#64748b" stroke-width="2"/>
+<path d="M 278 61 v -32 a 14 14 0 0 1 14 -14 h 216 a 14 14 0 0 1 14 14 v 32 z" fill="#64748b"/>
+<text x="400.0" y="45" font-family="'DejaVu Sans','Segoe UI','Helvetica Neue',Arial,sans-serif" font-size="16" font-weight="bold" fill="#ffffff" text-anchor="middle">Relay</text>
+<rect x="544" y="15" width="244" height="370" rx="14" fill="#ffffff" stroke="#d97706" stroke-width="2"/>
+<path d="M 544 61 v -32 a 14 14 0 0 1 14 -14 h 216 a 14 14 0 0 1 14 14 v 32 z" fill="#d97706"/>
+<text x="666.0" y="45" font-family="'DejaVu Sans','Segoe UI','Helvetica Neue',Arial,sans-serif" font-size="16" font-weight="bold" fill="#ffffff" text-anchor="middle">Network</text>
+<text x="26" y="91" font-family="'DejaVu Sans','Segoe UI','Helvetica Neue',Arial,sans-serif" font-size="13" font-weight="bold" fill="#065f46" text-anchor="start">Kept here:</text>
+<path d="M 25 109 l 4 4 l 7 -8" fill="none" stroke="#059669" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/>
+<text x="46" y="113" font-family="'DejaVu Sans','Segoe UI','Helvetica Neue',Arial,sans-serif" font-size="13" font-weight="normal" fill="#1e293b" text-anchor="start">Identity key – its secret</text>
+<text x="46" y="131" font-family="'DejaVu Sans','Segoe UI','Helvetica Neue',Arial,sans-serif" font-size="13" font-weight="normal" fill="#1e293b" text-anchor="start">part encrypted</text>
+<path d="M 25 151 l 4 4 l 7 -8" fill="none" stroke="#059669" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/>
+<text x="46" y="155" font-family="'DejaVu Sans','Segoe UI','Helvetica Neue',Arial,sans-serif" font-size="13" font-weight="normal" fill="#1e293b" text-anchor="start">Message history</text>
+<path d="M 25 175 l 4 4 l 7 -8" fill="none" stroke="#059669" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/>
+<text x="46" y="179" font-family="'DejaVu Sans','Segoe UI','Helvetica Neue',Arial,sans-serif" font-size="13" font-weight="normal" fill="#1e293b" text-anchor="start">Trusted keys of</text>
+<text x="46" y="197" font-family="'DejaVu Sans','Segoe UI','Helvetica Neue',Arial,sans-serif" font-size="13" font-weight="normal" fill="#1e293b" text-anchor="start">your contacts</text>
+<path d="M 25 217 l 4 4 l 7 -8" fill="none" stroke="#059669" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/>
+<text x="46" y="221" font-family="'DejaVu Sans','Segoe UI','Helvetica Neue',Arial,sans-serif" font-size="13" font-weight="normal" fill="#1e293b" text-anchor="start">Received files</text>
+<text x="26" y="333" font-family="'DejaVu Sans','Segoe UI','Helvetica Neue',Arial,sans-serif" font-size="12" font-weight="normal" fill="#475569" text-anchor="start" font-style="italic">Protected by the device:</text>
+<text x="26" y="349" font-family="'DejaVu Sans','Segoe UI','Helvetica Neue',Arial,sans-serif" font-size="12" font-weight="normal" fill="#475569" text-anchor="start" font-style="italic">screen lock,</text>
+<text x="26" y="365" font-family="'DejaVu Sans','Segoe UI','Helvetica Neue',Arial,sans-serif" font-size="12" font-weight="normal" fill="#475569" text-anchor="start" font-style="italic">disk encryption</text>
+<text x="292" y="91" font-family="'DejaVu Sans','Segoe UI','Helvetica Neue',Arial,sans-serif" font-size="13" font-weight="bold" fill="#065f46" text-anchor="start">Keeps:</text>
+<path d="M 291 109 l 4 4 l 7 -8" fill="none" stroke="#059669" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/>
+<text x="312" y="113" font-family="'DejaVu Sans','Segoe UI','Helvetica Neue',Arial,sans-serif" font-size="13" font-weight="normal" fill="#1e293b" text-anchor="start">Handle and public key –</text>
+<text x="312" y="131" font-family="'DejaVu Sans','Segoe UI','Helvetica Neue',Arial,sans-serif" font-size="13" font-weight="normal" fill="#1e293b" text-anchor="start">if you registered them</text>
+<path d="M 291 151 l 4 4 l 7 -8" fill="none" stroke="#059669" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/>
+<text x="312" y="155" font-family="'DejaVu Sans','Segoe UI','Helvetica Neue',Arial,sans-serif" font-size="13" font-weight="normal" fill="#1e293b" text-anchor="start">Contact list –</text>
+<text x="312" y="173" font-family="'DejaVu Sans','Segoe UI','Helvetica Neue',Arial,sans-serif" font-size="13" font-weight="normal" fill="#1e293b" text-anchor="start">encrypted</text>
+<path d="M 291 193 l 4 4 l 7 -8" fill="none" stroke="#059669" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/>
+<text x="312" y="197" font-family="'DejaVu Sans','Segoe UI','Helvetica Neue',Arial,sans-serif" font-size="13" font-weight="normal" fill="#1e293b" text-anchor="start">Mail for those offline –</text>
+<text x="312" y="215" font-family="'DejaVu Sans','Segoe UI','Helvetica Neue',Arial,sans-serif" font-size="13" font-weight="normal" fill="#1e293b" text-anchor="start">sealed, up to 30 days</text>
+<text x="292" y="247" font-family="'DejaVu Sans','Segoe UI','Helvetica Neue',Arial,sans-serif" font-size="13" font-weight="bold" fill="#991b1b" text-anchor="start">Does not keep:</text>
+<path d="M 291 260 l 9 9 M 300 260 l -9 9" stroke="#dc2626" stroke-width="2.4" stroke-linecap="round"/>
+<text x="312" y="269" font-family="'DejaVu Sans','Segoe UI','Helvetica Neue',Arial,sans-serif" font-size="13" font-weight="normal" fill="#1e293b" text-anchor="start">Messages, calls, files</text>
+<path d="M 291 284 l 9 9 M 300 284 l -9 9" stroke="#dc2626" stroke-width="2.4" stroke-linecap="round"/>
+<text x="312" y="293" font-family="'DejaVu Sans','Segoe UI','Helvetica Neue',Arial,sans-serif" font-size="13" font-weight="normal" fill="#1e293b" text-anchor="start">Encryption keys</text>
+<path d="M 291 308 l 9 9 M 300 308 l -9 9" stroke="#dc2626" stroke-width="2.4" stroke-linecap="round"/>
+<text x="312" y="317" font-family="'DejaVu Sans','Segoe UI','Helvetica Neue',Arial,sans-serif" font-size="13" font-weight="normal" fill="#1e293b" text-anchor="start">Room or display names</text>
+<text x="558" y="91" font-family="'DejaVu Sans','Segoe UI','Helvetica Neue',Arial,sans-serif" font-size="13" font-weight="bold" fill="#92400e" text-anchor="start">Visible:</text>
+<circle cx="562" cy="109" r="3.6" fill="#d97706"/>
+<text x="578" y="113" font-family="'DejaVu Sans','Segoe UI','Helvetica Neue',Arial,sans-serif" font-size="13" font-weight="normal" fill="#1e293b" text-anchor="start">That a connection exists</text>
+<circle cx="562" cy="133" r="3.6" fill="#d97706"/>
+<text x="578" y="137" font-family="'DejaVu Sans','Segoe UI','Helvetica Neue',Arial,sans-serif" font-size="13" font-weight="normal" fill="#1e293b" text-anchor="start">IP addresses</text>
+<circle cx="562" cy="157" r="3.6" fill="#d97706"/>
+<text x="578" y="161" font-family="'DejaVu Sans','Segoe UI','Helvetica Neue',Arial,sans-serif" font-size="13" font-weight="normal" fill="#1e293b" text-anchor="start">Timing and volume</text>
+<text x="558" y="193" font-family="'DejaVu Sans','Segoe UI','Helvetica Neue',Arial,sans-serif" font-size="13" font-weight="bold" fill="#991b1b" text-anchor="start">Not visible:</text>
+<path d="M 557 206 l 9 9 M 566 206 l -9 9" stroke="#dc2626" stroke-width="2.4" stroke-linecap="round"/>
+<text x="578" y="215" font-family="'DejaVu Sans','Segoe UI','Helvetica Neue',Arial,sans-serif" font-size="13" font-weight="normal" fill="#1e293b" text-anchor="start">Content – only ciphertext</text>
+<text x="558" y="345" font-family="'DejaVu Sans','Segoe UI','Helvetica Neue',Arial,sans-serif" font-size="12" font-weight="normal" fill="#475569" text-anchor="start" font-style="italic">With TLS, the shape of</text>
+<text x="558" y="361" font-family="'DejaVu Sans','Segoe UI','Helvetica Neue',Arial,sans-serif" font-size="12" font-weight="normal" fill="#475569" text-anchor="start" font-style="italic">the traffic is hidden too</text></svg>

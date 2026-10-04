@@ -224,6 +224,7 @@ build/
 - [Quick Start Guide](doc/QUICKSTART.md)
 - [Build Instructions](doc/BUILD.md)
 - [Code Structure](doc/CODE_STRUCTURE.md)
+- [How it works, in plain words](doc/how-it-works.md) ([на русском](doc/how-it-works.ru.md))
 - [User Manual](doc/manual.md)
 - [Roadmap](doc/TODO.md)
 - [Security Audit](doc/SECURITY_AUDIT_2026-07.md)

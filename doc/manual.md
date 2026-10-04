@@ -69,15 +69,11 @@
 
 ## How F.E.A.R. Protects You
 
-### What the relay sees and what it does not
+> A short illustrated overview for non-specialists – what is encrypted, where data is kept, what the relay can and cannot see – is in **doc/how-it-works.pdf** (English) and **doc/how-it-works.ru.pdf** (Russian).
 
-```
-[You] ──encrypted──> [Relay] ──encrypted──> [Others in the room]
-                       │
-          sees: IP addresses, timing, sizes,
-          a hash of the room name, a random tag per connection
-          never: content, keys, room names, display names
-```
+![Overview](./images/how-it-works/architecture.en.svg)
+
+### What the relay sees and what it does not
 
 | The relay sees | The relay does not see |
 |----------------|------------------------|
