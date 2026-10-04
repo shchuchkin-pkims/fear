@@ -174,6 +174,32 @@ static inbox_watch_t g_inbox[INBOX_MAX_WATCH];
 static int g_inbox_count = 0;
 static uint64_t g_inbox_next_poll = 0;
 
+/*
+ * Письма, которые уже показаны, - по номеру, который им дал ретранслятор.
+ * Удалить письмо мы просим только после показа, а запросов в полёте может
+ * быть несколько (GUI шлёт /inbox-add на каждый контакт подряд), и одно
+ * письмо приходило в каждом ответе: на живом тесте одно сообщение
+ * показалось трижды. Номера - одного сервера: процесс клиента живёт на
+ * одном соединении.
+ */
+#define INBOX_SEEN_MAX 256
+static int64_t g_inbox_seen[INBOX_SEEN_MAX];
+static int g_inbox_seen_n = 0;
+static int g_inbox_seen_pos = 0;
+
+static int inbox_seen(int64_t id) {
+    for (int i = 0; i < g_inbox_seen_n; i++) {
+        if (g_inbox_seen[i] == id) return 1;
+    }
+    return 0;
+}
+
+static void inbox_mark_seen(int64_t id) {
+    g_inbox_seen[g_inbox_seen_pos] = id;
+    g_inbox_seen_pos = (g_inbox_seen_pos + 1) % INBOX_SEEN_MAX;
+    if (g_inbox_seen_n < INBOX_SEEN_MAX) g_inbox_seen_n++;
+}
+
 /** Срок хранения, о котором сказал сервер: 0 - не хранит ничего. */
 static uint32_t g_inbox_ttl = 0;
 static int g_inbox_ttl_known = 0;
@@ -1654,9 +1680,12 @@ static int inbox_watch(const char *room, const uint8_t k_pm[KS_KEY_BYTES],
     memcpy(w->k_pm, k_pm, KS_KEY_BYTES);
     memcpy(w->addr_in, in, sizeof in);
     memcpy(w->addr_out, out, sizeof out);
-    /* Спросить сразу, а не через двадцать секунд: человек только что открыл
-     * приложение и ждёт свою почту, а не отсчёта таймера. */
-    g_inbox_next_poll = 0;
+    /* Спросить вскоре, а не через двадцать секунд: человек только что открыл
+     * приложение и ждёт свою почту. «Вскоре», а не «сразу»: GUI регистрирует
+     * ящики пачкой, и пачка должна дать один запрос, а не по запросу на
+     * контакт. */
+    const uint64_t soon = rot_now_ms() + 300;
+    if (g_inbox_next_poll == 0 || g_inbox_next_poll > soon) g_inbox_next_poll = soon;
     return 0;
 }
 
@@ -1787,6 +1816,10 @@ static void inbox_handle_result(sock_t s, const char *myname,
         inbox_watch_t *w = inbox_find_addr(addr);
         if (!w) continue;                       /* не наш ящик */
         if (clen < CRYPTO_NPUBBYTES) continue;
+        if (inbox_seen(id)) {                   /* уже показано - пришло вторым ответом */
+            inbox_ack(s, myname, w, &id, 1);
+            continue;
+        }
 
         const uint8_t *nonce = cipher;
         const uint8_t *sealed = cipher + CRYPTO_NPUBBYTES;
@@ -1819,6 +1852,7 @@ static void inbox_handle_result(sock_t s, const char *myname,
          * положить. */
         printf("[INBOX] %s %s: %.*s\n", w->room, sender, (int)tlen, (const char *)text);
         fflush(stdout);
+        inbox_mark_seen(id);
 
         sodium_memzero(plain, slen);
         free(plain);
